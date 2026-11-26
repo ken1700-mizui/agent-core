@@ -234,6 +234,21 @@ def test_cycle_between_layers_breaks_the_real_contract(tmp_path: Path) -> None:
         ),
         ("agent_core.tool.planted", "import sqlite3", "agent_core.tool.planted -> sqlite3"),
         (
+            "agent_core.observability.planted",
+            "from agent_core.runtime import service",
+            "agent_core.observability.planted -> agent_core.runtime.service",
+        ),
+        (
+            "agent_core.observability.planted",
+            "from agent_core.adapters import jsonl_log",
+            "agent_core.observability.planted -> agent_core.adapters.jsonl_log",
+        ),
+        (
+            "agent_core.observability.planted",
+            "from agent_core.tool import registry",
+            "agent_core.observability.planted -> agent_core.tool.registry",
+        ),
+        (
             "agent_core.ports.planted",
             "from agent_core.adapters import fake_model",
             "agent_core.ports.planted -> agent_core.adapters.fake_model",

@@ -347,3 +347,37 @@ class ToolOutputError(_ToolDataError):
     """Tool output does not match the output schema or size limit."""
 
     code = "TOOL_OUTPUT_INVALID"
+
+
+# ---------------------------------------------------------------- observability (WP-11)
+
+
+class LogWriteError(AgentCoreError):
+    """An observation log record could not be written. Not a Journal error: the
+    Journal's state is unaffected. Observation logs are not audit records."""
+
+    code = "LOG_WRITE_FAILED"
+
+
+class LogCapacityError(LogWriteError):
+    """The log storage cap was reached; nothing was written."""
+
+    code = "LOG_CAPACITY_REACHED"
+
+
+class LogRecordTooLargeError(LogWriteError):
+    code = "LOG_RECORD_TOO_LARGE"
+
+
+class AuditWriteError(AgentCoreError):
+    """An audit record could not be written. The operation that needs it must stop
+    (C2 4.5): audit is never skipped. Full enforcement is WP-09."""
+
+    code = "AUDIT_WRITE_FAILED"
+    fatal = True
+
+
+class AuditRecursionError(AuditWriteError):
+    """The audit writer was entered again while writing (C2.X25: no recursion)."""
+
+    code = "AUDIT_RECURSION"

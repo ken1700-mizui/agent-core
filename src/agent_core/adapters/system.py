@@ -20,3 +20,10 @@ class OsRandomSource:
         if type(n) is not int or n <= 0:
             raise ValueError("n must be a positive int")
         return os.urandom(n)
+
+
+class SystemMonotonicClock:
+    """``time.monotonic_ns``: for durations only; never for human time."""
+
+    def monotonic_ns(self) -> int:
+        return time.monotonic_ns()

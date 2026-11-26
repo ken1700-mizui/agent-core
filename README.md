@@ -11,7 +11,7 @@ Agent Core は、オーナー自身が使うための、専用の AI エージ�
 
 ## 今の状態
 
-- Phase 1 の WP-01（プロジェクトの構成と CI）、WP-02（共通の型と Ports）、WP-03（SQLite の Journal）、WP-04（状態機械）、WP-05（Fake Provider と ModelPort）を実装した。Engine の機能は、まだない（設計の記録は `docs/design/phase-1/`）。
+- Phase 1 の WP-01（プロジェクトの構成と CI）、WP-02（共通の型と Ports）、WP-03（SQLite の Journal）、WP-04（状態機械）、WP-05（Fake Provider と ModelPort）、WP-07（Tool Registry）、WP-11（構造化ログ）を実装した。Engine の機能は、まだない（設計の記録は `docs/design/phase-1/`）。
 - Phase 1 は、合成のデータだけを使う。実 API、認証情報、外部への通信は使わない（費用は 0 ドル）。
 
 ## 開発の環境（Linux）
@@ -92,7 +92,9 @@ src/agent_core/
   ports/             接続口（Clock、RandomSource、IdRegistry、JournalPort、EvidenceVerifier、ModelPort）
   identity/          ID の生成
   runtime/           Task、Run、Step、Attempt の状態機械（純粋な判断と、Journal への記録）
-  adapters/          接続口の実装（システムの時計、OS の乱数、SQLite の Journal、OS のロック、合成の Fake Provider）
+  tool/              Tool Registry（オーナーが承認したツールの登録と、提案の検証）
+  observability/     構造化ログと、監査の書き込み
+  adapters/          接続口の実装（システムの時計、OS の乱数、SQLite の Journal、OS のロック、合成の Fake Provider、JSON Lines のログ）
 tests/support/       試験だけで使う、合成の偽の実装
 tests/unit/          単体の試験（合成のデータだけ。Python の通信は試験の中で遮断する）
 tools/secret_scan.py 秘密情報の検査（標準ライブラリだけ）

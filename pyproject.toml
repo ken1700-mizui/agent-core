@@ -89,14 +89,14 @@ include_external_packages = true
 
 [[tool.importlinter.contracts]]
 id = "ports-and-adapters-layers"
-name = "Ports & Adapters layers: runtime -> (adapters | identity | tool) -> ports -> types"
+name = "Ports & Adapters layers: runtime -> (adapters | identity | tool | observability) -> ports -> types"
 type = "layers"
 # Higher layers may import lower ones, never the reverse. Siblings separated by
 # "|" are independent: adapters and identity never import each other.
 # Cycles between layers are reported because one direction is always upward.
 layers = [
     "agent_core.runtime",
-    "agent_core.adapters | agent_core.identity | agent_core.tool",
+    "agent_core.adapters | agent_core.identity | agent_core.tool | agent_core.observability",
     "agent_core.ports",
     "agent_core.types",
 ]
@@ -111,6 +111,7 @@ source_modules = [
     "agent_core.identity",
     "agent_core.runtime",
     "agent_core.tool",
+    "agent_core.observability",
 ]
 forbidden_modules = ["sqlite3", "fcntl", "agent_core.adapters"]
 
