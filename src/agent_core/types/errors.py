@@ -401,3 +401,12 @@ class AuditRecursionError(AuditWriteError):
     """The audit writer was entered again while writing (C2.X25: no recursion)."""
 
     code = "AUDIT_RECURSION"
+
+
+# ---------------------------------------------------------------- replay (WP-06)
+
+
+class ReplayBlobNotFoundError(AgentCoreError):
+    """A replay blob store has no blob for this tenant and reference."""
+
+    code = "REPLAY_BLOB_NOT_FOUND"

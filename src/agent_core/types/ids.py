@@ -59,6 +59,7 @@ class IdKind(StrEnum):
     TENANT = "tnt"
     RUN_GRANT = "grt"
     MODEL_REQUEST = "mrq"
+    REPLAY_RECORD = "rpl"
 
 
 def _check_int(value: object, maximum: int, what: str) -> int:
@@ -237,6 +238,11 @@ class ModelRequestId(EntityId):
     KIND = IdKind.MODEL_REQUEST
 
 
+class ReplayRecordId(EntityId):
+    __slots__ = ()
+    KIND = IdKind.REPLAY_RECORD
+
+
 _ID_TYPES: dict[str, type[EntityId]] = {
     t.KIND.value: t
     for t in (
@@ -252,6 +258,7 @@ _ID_TYPES: dict[str, type[EntityId]] = {
         TenantId,
         RunGrantId,
         ModelRequestId,
+        ReplayRecordId,
     )
 }
 _KINDS = frozenset(_ID_TYPES)
