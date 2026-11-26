@@ -16,7 +16,7 @@
 | B1 | Context Engine（Memory との接続仕様を含む） | **設計段階として条件付き合格（95/100）**。実装の前に、必須解決事項 B1-P01〜P04 を解決すること | `docs/design/phase-0/B1_CONTEXT.md` |
 | B2 | Memory Engine の詳細設計 | **設計段階として条件付き合格（96/100）**。実装の前に、必須解決事項 B2-P01〜P05 を解決すること。B1 の接続仕様の変更案 P-1〜P-5 は、基本方針として採用された（最終的な統一は E） | `docs/design/phase-0/B2_MEMORY.md` |
 | C1 | 権限管理・ツール実行・Sandbox・外部通信 | **設計段階として条件付き合格（95/100）**。実装の前に、C1-P01〜P05 を解決すること（C1-P01 は C1 の中で修正済み） | `docs/design/phase-0/C1_SAFETY.md` |
-| C2 | 機密情報・暗号化・削除・監査・評価環境の隔離 | **DRAFT 第1版。独立審査待ち** | `docs/design/phase-0/C2_DATA_SECURITY.md` |
+| C2 | 機密情報・暗号化・削除・監査・評価環境の隔離 | **DRAFT 第2版。独立再審査待ち**。第1版は 88/100 点。指摘 C2-R01〜R08 に対応した | `docs/design/phase-0/C2_DATA_SECURITY.md` |
 | D | Evaluation Engine・統計設計・Cost Engine | 未着手 | — |
 | E | ロードマップ・性能追跡・全体の整合性 | 未着手 | — |
 
@@ -84,11 +84,12 @@
 
 ## 次の作業
 
-1. **独立審査：** 設計C2（`C2_DATA_SECURITY.md`）の第1版を審査する。C2 は、審査が終わるまで DRAFT のままにする。
+1. **独立再審査：** 設計C2（`C2_DATA_SECURITY.md`）の第2版を審査する。C2 は、再審査が終わるまで DRAFT のままにする。
 2. **設計D（評価・統計・費用）：** C2 の審査が終わってから始める。引き継ぎ事項は、`C2_DATA_SECURITY.md` の17章などにある。
 3. **holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：** まだ作らず、接続もしていない。開発用の Claude Code のセッションには、接続しない方針。
 4. **設計E で統一するもの：** 次の変更案を、設計E でまとめて統一する。
    - CP-1〜CP-8（`C1_SAFETY.md` の15章）
+   - CP-9〜CP-12（`C2_DATA_SECURITY.md` の18章）
    - P-1〜P-5（`B2_MEMORY.md` の8.2）
    - **CP-6：** 進捗の正本を、この `STATUS.md` にする。`AGENTS.md` の7章の進捗の表は古くなっているので、参照だけを残す形に、E で整理する。
 5. **Draft PR #1 の確認：** オーナーが確認する。マージはしない。
