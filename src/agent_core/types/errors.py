@@ -417,3 +417,41 @@ class ReplayBlobNotFoundError(AgentCoreError):
     """A replay blob store has no blob for this tenant and reference."""
 
     code = "REPLAY_BLOB_NOT_FOUND"
+
+
+# ---------------------------------------------------------------- safety (WP-09A)
+
+
+class SafetyError(AgentCoreError):
+    """A safety check refused an operation. ``reasons`` are fixed codes, never text
+    from the operation itself."""
+
+    code = "SAFETY_REFUSED"
+
+    def __init__(self, *reasons: str) -> None:
+        if not reasons:
+            raise ValueError("a refusal names at least one reason")
+        super().__init__(", ".join(reasons))
+        self.reasons: tuple[str, ...] = tuple(reasons)
+
+
+class ActionDescriptorError(SafetyError):
+    """The operation's content cannot be fixed into a valid ActionDescriptor."""
+
+    code = "ACTION_DESCRIPTOR_INVALID"
+
+
+class PolicyDeniedError(SafetyError):
+    code = "POLICY_DENIED"
+
+
+class ApprovalRejectedError(SafetyError):
+    """The approval is forged, expired, revoked, used, or for another action."""
+
+    code = "APPROVAL_REJECTED"
+
+
+class StorageAdmissionError(SafetyError):
+    """The minimal Phase 1 storage admission gate refused the data."""
+
+    code = "STORAGE_ADMISSION_REFUSED"

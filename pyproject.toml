@@ -89,7 +89,7 @@ include_external_packages = true
 
 [[tool.importlinter.contracts]]
 id = "ports-and-adapters-layers"
-name = "Ports & Adapters layers: runtime -> (adapters | identity | tool | observability) -> ports -> types"
+name = "Ports & Adapters layers: runtime -> (adapters | identity | tool | observability) -> (safety | cost) -> ports -> types"
 type = "layers"
 # Higher layers may import lower ones, never the reverse. Siblings separated by
 # "|" are independent: adapters and identity never import each other.
@@ -97,6 +97,9 @@ type = "layers"
 layers = [
     "agent_core.runtime",
     "agent_core.adapters | agent_core.identity | agent_core.tool | agent_core.observability",
+    # Pure safety and cost rules (WP-09): no I/O. The SQLite ledger that runs them
+    # inside the Journal transaction is an adapter.
+    "agent_core.safety | agent_core.cost",
     "agent_core.ports",
     "agent_core.types",
 ]
@@ -112,6 +115,8 @@ source_modules = [
     "agent_core.runtime",
     "agent_core.tool",
     "agent_core.observability",
+    "agent_core.safety",
+    "agent_core.cost",
 ]
 forbidden_modules = ["sqlite3", "fcntl", "agent_core.adapters"]
 

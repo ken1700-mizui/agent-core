@@ -200,6 +200,28 @@ def test_cycle_between_layers_breaks_the_real_contract(tmp_path: Path) -> None:
     [
         ("agent_core.types.planted", "import sqlite3", "agent_core.types.planted -> sqlite3"),
         ("agent_core.ports.planted", "import sqlite3", "agent_core.ports.planted -> sqlite3"),
+        ("agent_core.safety.planted", "import sqlite3", "agent_core.safety.planted -> sqlite3"),
+        ("agent_core.cost.planted", "import sqlite3", "agent_core.cost.planted -> sqlite3"),
+        (
+            "agent_core.safety.planted",
+            "from agent_core.adapters import sqlite_journal",
+            "agent_core.safety.planted -> agent_core.adapters.sqlite_journal",
+        ),
+        (
+            "agent_core.safety.planted",
+            "from agent_core.tool import registry",
+            "agent_core.safety.planted -> agent_core.tool.registry",
+        ),
+        (
+            "agent_core.safety.planted",
+            "import agent_core.cost",
+            "agent_core.safety.planted -> agent_core.cost",
+        ),
+        (
+            "agent_core.cost.planted",
+            "from agent_core.runtime import service",
+            "agent_core.cost.planted -> agent_core.runtime.service",
+        ),
         ("agent_core.identity.planted", "import fcntl", "agent_core.identity.planted -> fcntl"),
         ("agent_core.runtime.planted", "import sqlite3", "agent_core.runtime.planted -> sqlite3"),
         (
