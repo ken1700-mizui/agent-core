@@ -1,6 +1,6 @@
 # ADR-0001：モジュラーモノリスと、Ports & Adapters
 
-- **状態：** PROPOSED
+- **状態：** **ACCEPTED**（Phase 1 の開始の承認。`docs/decisions/PHASE_1_APPROVAL.md`）。プロセスの分離（P1〜P4）の具体的な実装は、それぞれの Phase で確かめる
 - **日付：** 2026-11-26
 
 > 出典：独立審査者が確かめた、初回 Phase 0 報告書の予定（7件の ADR）。初回報告書の全文は、Claude Code の側では受け取っていない（A-P6 は未完了）。

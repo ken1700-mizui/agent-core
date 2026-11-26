@@ -1,6 +1,6 @@
 # ADR-0002：SQLite とイベントログ
 
-- **状態：** PROPOSED
+- **状態：** SQLite（WAL）と標準ライブラリの `sqlite3` を使うことは **ACCEPTED**（`docs/decisions/PHASE_1_APPROVAL.md`）。Journal の詳しい形と FTS5 は **PROPOSED**（WP-03 と Phase 5 で確かめる）
 - **日付：** 2026-11-26
 
 > 出典：独立審査者が確かめた、初回 Phase 0 報告書の予定（7件の ADR）。初回報告書の全文は、Claude Code の側では受け取っていない（A-P6 は未完了）。

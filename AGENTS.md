@@ -45,10 +45,13 @@ This file intentionally contains no progress table. Progress lives only in
 
 1. Never push directly to `main`. Never merge any branch or pull request. Never
    force-push.
-2. Do not implement production code until the owner starts Phase 1 (see
-   `docs/STATUS.md`). Until then, design documents only.
-3. Do not install dependencies (no package manager installs of any kind)
-   without owner approval.
+2. The owner approved the start of Phase 1 on 2026-11-26
+   (`docs/decisions/PHASE_1_APPROVAL.md`). Implement only the work packages the
+   current instruction authorizes, on the implementation branch (section 9).
+3. Install only the dependencies the owner approved (direct dependencies in
+   `docs/decisions/PHASE_1_APPROVAL.md`, versions locked in `uv.lock` and
+   recorded in `docs/adr/0006-toolchain.md`, plus their normal transitive
+   dependencies). Anything else requires owner approval.
 4. Paid APIs:
    - **Now: prohibited.** Real-API cost is $0 through Phase 3A (owner decision
      D1; see the D1 note wording proposal in `E_INTEGRATION.md` section 31.3).
@@ -69,7 +72,7 @@ This file intentionally contains no progress table. Progress lives only in
 8. Do not mark an issue as resolved by moving it to a future phase. Distinguish
    design resolution from implementation verification.
 
-## 4. Development rules (apply from Phase 1; owner approval of Phase 1 start is still required)
+## 4. Development rules (apply now; Phase 1 has started)
 
 1. Test-driven development: write or update the test first.
 2. Never disable, skip or delete a test to make a build pass.
@@ -91,7 +94,8 @@ This file intentionally contains no progress table. Progress lives only in
 
 ## 5. Current operating constraints (until the owner lifts them)
 
-- No external technical research unless the owner asks for it.
+- Technical research is part of Claude Code's role, limited to what the current
+  task needs. Never send private project data to outside services.
 - No subagents.
 - Keep tool output small; fetch only the parts needed.
 - If information cannot be obtained, record it as an **unverified item**
@@ -132,8 +136,13 @@ document label.
 
 ## 9. Git workflow
 
-- Work on the dedicated branch the owner approved (currently
-  `docs/phase-0-design`; Draft PR #1).
+- Design documents: `docs/phase-0-design` (Draft PR #1, never merged).
+- Phase 1 code: `impl/phase-1-foundation`, created from the commit that records
+  the Phase 1 approval. A draft PR for it, if created, targets
+  `docs/phase-0-design`.
+- Roles: Claude Code researches, designs, implements, tests, fixes, commits and
+  pushes; ChatGPT instructs and reviews; Codex only audits at key stages (never
+  delegate implementation or fixes to Codex); the owner decides and approves.
 - Before working, confirm the remote HEAD matches the SHA the owner gives.
-- Commit only what the current task allows (currently design documents only).
-- Push only to the approved working branch with a normal push.
+- Commit only what the current task allows.
+- Push only to the approved branches with a normal push.

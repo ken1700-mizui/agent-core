@@ -1,6 +1,6 @@
 # ADR-0006：ツールチェーン
 
-- **状態：** PROPOSED（オーナーの承認を待っている）
+- **状態：** Phase 1 の部分（Python 3.12、uv、Pydantic v2、sqlite3、pytest、ruff、mypy、import-linter、GitHub Actions の無料の枠）は **ACCEPTED**（`docs/decisions/PHASE_1_APPROVAL.md`）。Docker、FastAPI、Next.js は **PROPOSED**
 - **日付：** 2026-11-26
 
 > 出典：独立審査者が確かめた、初回 Phase 0 報告書の予定（7件の ADR）。初回報告書の全文は、Claude Code の側では受け取っていない（A-P6 は未完了）。
@@ -20,7 +20,7 @@
 
 ## 影響と、注意すること
 
-- 版の指定と、互いに合うかどうかは、確かめていない。
+- 版の指定と、互いに合うかどうかは、WP-01 で確かめて、この ADR に記録する。
 
 ## 参照
 

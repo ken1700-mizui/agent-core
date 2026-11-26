@@ -11,12 +11,12 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Codex による Phase 0.5 の独立監査が終わった（`e533c4c`、CONDITIONAL_PASS。MEDIUM が4件）。その4件の修正を提出し、確認を待っている。** Phase 1 の開始、技術の構成の確定、依存関係の導入は、**承認されていない** |
-| 次の作業 | AUDIT-01〜04 の修正の確認（`docs/reviews/CODEX_PHASE_0_AUDIT.md`）。その後、オーナーによる Phase 1 の開始の承認（技術の構成、依存関係、対応する OS などを含む）。Claude Code は、承認があるまで、実装に進まない |
-| Phase 1 の開始の条件 | 次のすべてを満たすこと。<br>- Phase 0.5 に合格する。<br>- 「Phase 1 を始める前に必要」な事項を、オーナーが承認する（`RESOLUTION_MATRIX.md` の9章）。対象は、対応する OS、実装の言語とツール、依存関係の方針、CI。<br>- オーナーが、Phase 1 を始めると、はっきり指示する |
-| 作業ブランチ | `docs/phase-0-design`（Draft PR #1）。`main` は、空の初期コミットだけ |
-| 禁止事項（変わらない） | 本番コードの実装、依存関係のインストール、有料 API、外部調査、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
-| 参照する資料 | `AGENTS.md`、`docs/decisions/OWNER_DECISIONS.md`、`ROADMAP.md`、`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`docs/reviews/PHASE_0_REVIEW.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md`、`docs/reviews/CODEX_PHASE_0_AUDIT.md` |
+| 今の段階 | **Phase 1 の開始を、オーナーが承認した**（2026-11-26。`docs/decisions/PHASE_1_APPROVAL.md`）。今の作業は **WP-01（プロジェクトの構成と CI）だけ**。WP-02 以降は、まだ認められていない |
+| 次の作業 | WP-01 を `impl/phase-1-foundation` で実装し、ChatGPT による独立したレビューを待つ |
+| Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
+| 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
+| 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
+| 参照する資料 | `AGENTS.md`、`docs/decisions/OWNER_DECISIONS.md`、`docs/decisions/PHASE_1_APPROVAL.md`、`ROADMAP.md`、`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`docs/reviews/PHASE_0_REVIEW.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md`、`docs/reviews/CODEX_PHASE_0_AUDIT.md` |
 
 ## 2. 作業単位の進捗
 
@@ -52,7 +52,7 @@
 
 | 時期 | 事項 |
 |---|---|
-| Phase 1 を始める前 | 対応する OS、技術の候補（Python 3.12 以上、uv、Pydantic v2、sqlite3、pytest、ruff、mypy、import-linter。PHASE_1 の0.1）、ADR の 0001〜0004・0006、依存関係の方針、CI |
+| Phase 1 を始める前 | **承認済み**（`docs/decisions/PHASE_1_APPROVAL.md`）。ADR-0003・0004 と、Docker、FastAPI、Next.js は、承認されていない |
 | 実 API を使う前 | 次の事項。<br>- 予算の管理に使うタイムゾーン（AUDIT-02）<br>- D1 の補足の書き換え（循環を解く。文案は `E_INTEGRATION.md` の31.3）<br>- D5（Run ごとの承認と、月額の上限。文案は同じ）<br>- I10 の書き換え<br>- LiveProvider を有効にする条件<br>- 費用の照合の許容誤差<br>- Anthropic のデータの扱いの方針の確認<br>- 評価の基準と、候補の値<br>- 評価の側の環境 |
 | Memory を実装する前 | バックアップの保存の期間、RPO、RTO、独立した複製と証人の置き場所、暗号のライブラリ |
 
@@ -66,10 +66,11 @@
   - 第7章の Engine の一覧
   - Planning、Model Gateway、Improvement、Orchestration の方針
   - Run ごとの承認と、月額の上限についての、オーナーの決定
-- **全文との照合は、行っていない**（A-P6。未解決）。
+- **全文との照合は、行っていない**（A-P6。未完了。延期をオーナーが承認した）。
 
 ## 6. リポジトリの状況
 
 - `main`：空の初期コミットだけ（`aa089ae`）。GitHub の既定のブランチ。
 - `docs/phase-0-design`：設計資料の作業ブランチ。Draft PR #1 で、`main` への変更として提案している。マージはしない。
+- `impl/phase-1-foundation`：Phase 1 の実装のブランチ。Phase 1 の承認の記録を含む、設計のコミットから作る。
 - holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：作っておらず、接続もしていない。
