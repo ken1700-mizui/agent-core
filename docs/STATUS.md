@@ -11,8 +11,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1 の開始を、オーナーが承認した**（2026-11-26。`docs/decisions/PHASE_1_APPROVAL.md`）。今の作業は **WP-01（プロジェクトの構成と CI）だけ**。WP-02 以降は、まだ認められていない |
-| 次の作業 | WP-01 を `impl/phase-1-foundation` で実装し、ChatGPT による独立したレビューを待つ |
+| 今の段階 | **Phase 1 の WP-01（プロジェクトの構成と CI）を、`impl/phase-1-foundation` で実装した。ChatGPT による独立したレビューを待っている。** WP-02 以降は、まだ認められていない |
+| 次の作業 | WP-01 のレビュー。WP-02 には、指示があるまで進まない |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
@@ -38,6 +38,16 @@
 
 - 合格は、どれも設計段階についてのものである。実装、実 API への接続、マージを承認したものではない。
 - 「実装による検証待ち」の課題は、実装して試験するまでは、解決したとは言わない。
+
+### 2.1 Phase 1 の進捗
+
+| WP | 状態 | 確かめたこと | 確かめていないこと |
+|---|---|---|---|
+| WP-01 プロジェクトの構成と CI | 実装した。レビューを待っている（`impl/phase-1-foundation`） | 手元の環境（Ubuntu 24.04、Python 3.12.3、uv 0.11.32、SQLite 3.45.1）で、`uv lock --check`、`uv sync --locked --check`、ruff check、ruff format --check、mypy（strict）、import-linter、pytest（56 件）、秘密情報の検査が、すべて成功した | **GitHub Actions の上での CI の実行**（pull request と手動の実行だけで動く設定にした。まだ動かしていない）。GitHub Actions の無料の枠の条件 |
+| WP-02〜WP-15 | 始めていない | — | — |
+
+- 依存関係の版とライセンスは、`docs/adr/0006-toolchain.md` に記録した。
+- AUDIT-01（WP-09）、AUDIT-02・04（Phase 3A まで）、AUDIT-03（削除の機能の前）は、それぞれの必須の条件のまま残っている。
 
 ## 3. オーナーの方針（2026-11-26）
 

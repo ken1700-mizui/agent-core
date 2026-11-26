@@ -1,0 +1,108 @@
+[project]
+name = "agent-core"
+version = "0.0.0"
+description = "Agent Core: a private AI agent platform for the owner's own use (Phase 1 foundation)."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+# Approved runtime dependency (docs/decisions/PHASE_1_APPROVAL.md, docs/adr/0006-toolchain.md).
+dependencies = [
+    "pydantic>=2.12,<3",
+]
+
+[dependency-groups]
+# Approved development dependencies only. Exact versions are locked in uv.lock.
+dev = [
+    "pytest>=9,<10",
+    "ruff>=0.14,<1",
+    "mypy>=1.18,<2",
+    "import-linter>=2.5,<3",
+]
+
+[tool.uv]
+# No build backend is used (no extra, unapproved build dependency).
+# The project is not installed; src/ is put on the path by each tool's config.
+package = false
+required-version = ">=0.11"
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+pythonpath = ["src", "tools"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+filterwarnings = ["error"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tools", "tests"]
+# Python sources only. Design documents in docs/ and *.md are never rewritten by tools.
+extend-exclude = ["docs", "*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes (includes F401 unused imports)
+    "I",       # import sorting
+    "B",       # bugbear
+    "UP",      # pyupgrade
+    "S",       # bandit (security)
+    "SIM",     # simplify
+    "N",       # naming
+    "PT",      # pytest style
+    "RUF",     # ruff-specific
+    "BLE",     # blind except (never swallow exceptions, AGENTS.md 4.6)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use assert, and run the approved dev tools (ruff, mypy, lint-imports, git)
+# as subprocesses with fixed argument lists and no shell.
+"tests/**" = ["S101", "S603", "S607"]
+# The secret scanner runs `git ls-files` with a fixed argument list and no shell.
+"tools/secret_scan.py" = ["S603", "S607"]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+mypy_path = ["src", "tools"]
+files = ["src", "tools", "tests"]
+explicit_package_bases = true
+
+# ---------------------------------------------------------------- import-linter
+# Run with src/ on the path: `PYTHONPATH=src uv run lint-imports`.
+# WP-01 sets only contracts that apply to modules that exist now. Layer contracts
+# for each Engine are added by the work package that creates the modules.
+[tool.importlinter]
+root_package = "agent_core"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "phase1-no-network-or-process"
+name = "Phase 1: agent_core has no network, provider SDK or process-spawning code path"
+type = "forbidden"
+source_modules = ["agent_core"]
+forbidden_modules = [
+    # Network (PHASE_1_IMPLEMENTATION_PLAN.md section 2, item 5)
+    "socket",
+    "ssl",
+    "http",
+    "urllib",
+    "ftplib",
+    "smtplib",
+    "imaplib",
+    "poplib",
+    "xmlrpc",
+    "requests",
+    "httpx",
+    "aiohttp",
+    # Provider SDKs are not approved in Phase 1
+    "anthropic",
+    "openai",
+    # No arbitrary command execution in Phase 1 (ROADMAP 0.1)
+    "subprocess",
+]
