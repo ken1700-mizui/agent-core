@@ -43,6 +43,7 @@ import fcntl
 import hashlib
 import os
 import re
+import secrets
 import stat
 import sys
 from collections.abc import Iterator, Mapping
@@ -80,6 +81,8 @@ from agent_core.types.safety import (
     DispatchAuthorization,
     Policy,
     SecretKey,
+    WriteChange,
+    WriteOp,
 )
 from agent_core.types.serialization import StrictJsonError, dump_json, parse_strict_json
 from agent_core.types.tools import ResourceAccess
@@ -89,6 +92,8 @@ SAFE_RESOLUTION_ADOPTED: Final = True
 MAX_FILE_BYTES: Final = 1_048_576
 # The read_file output holds at most this many bytes of content (its schema).
 MAX_READ_BYTES: Final = 65_536
+# The write_file content argument holds at most this many characters (its schema).
+MAX_WRITE_BYTES: Final = 65_536
 
 # WP08-R04: the builtin file tools this broker runs, with the access each one has.
 # Their trusted registry entries must pin ``builtin_artifact_hash()``.
@@ -433,8 +438,97 @@ class PreparedWorkspace:
         redeem: Redeem,
         content: bytes,
     ) -> None:
+        """One CREATE or REPLACE (WP08-R05). The ticket is used first, for the change
+        computed from the actual bytes. Then: the expected state is checked, the
+        bytes go to a new temporary file in the same directory (unpredictable name,
+        O_CREAT | O_EXCL), are written in full and fsynced; the commit is ``link``
+        (CREATE, refuses an existing target) or ``rename`` (REPLACE, atomic within
+        the directory); the directory is fsynced and the result verified.
+
+        Failures before the commit leave the target unchanged (effect NONE; the
+        temporary file is removed). A failing commit, or any failure after it, is
+        UNKNOWN: nothing is restored and nothing is retried."""
         self._check_still_safe(authorization)
-        _none("WRITE_NOT_ENABLED")
+        change = self._descriptor.apply_change
+        targets = self._descriptor.target_resources
+        if change is None or [t.access for t in targets] != [ResourceAccess.WRITE]:
+            _none("NOT_A_WRITE")
+        if type(content) is not bytes or len(content) > MAX_WRITE_BYTES:
+            _none("WRITE_TOO_LARGE")
+        actual = WriteChange(
+            op=change.op,
+            path=change.path,
+            expected_pre=change.expected_pre,
+            content_digest=file_digest(content),
+            content_size=len(content),
+        )
+        self._redeem(
+            ticket,
+            redeem,
+            FileOperation(
+                access=ResourceAccess.WRITE,
+                path=change.path,
+                change=actual,
+                workspace_ref=self._digest,
+            ),
+        )
+        with self.resolve_parent(change.path) as (parent, name):
+            self._check_expected(parent, name, change)
+            temp = _write_temporary(parent, content)
+            self._commit(parent, name, temp, change, content)
+
+    def _check_expected(self, parent: int, name: str, change: WriteChange) -> None:
+        if change.op is WriteOp.CREATE:
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            except OSError:
+                _none("TARGET_UNSAFE")
+            _none("TARGET_EXISTS")
+        try:
+            fd, _info = _open_regular(parent, name, device=self._device, limit=MAX_FILE_BYTES)
+        except LookupError as exc:
+            _none(_LOOKUP_REASONS.get(str(exc.args[0]), "TARGET_UNSAFE"))
+        except OSError:
+            _none("TARGET_UNSAFE")
+        try:
+            current = _read_bounded(fd, MAX_FILE_BYTES)
+        except (LookupError, OSError):
+            _none("TARGET_UNSAFE")
+        finally:
+            os.close(fd)
+        if file_digest(current) != change.expected_pre:
+            _none("EXPECTED_STATE_MISMATCH")
+
+    def _commit(
+        self, parent: int, name: str, temp: str, change: WriteChange, content: bytes
+    ) -> None:
+        try:
+            if change.op is WriteOp.CREATE:
+                os.link(temp, name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
+            else:
+                os.rename(temp, name, src_dir_fd=parent, dst_dir_fd=parent)
+        except FileExistsError:
+            _discard(parent, temp)
+            _none("TARGET_EXISTS")  # another writer created it; nothing of ours landed
+        except OSError:
+            raise FileOperationFailedError("COMMIT_FAILED", effect=FileEffect.UNKNOWN) from None
+        try:
+            if change.op is WriteOp.CREATE:
+                os.unlink(temp, dir_fd=parent)
+            os.fsync(parent)
+            fd, info = _open_regular(parent, name, device=self._device, limit=MAX_FILE_BYTES)
+            try:
+                written = _read_bounded(fd, MAX_FILE_BYTES)
+            finally:
+                os.close(fd)
+        except (OSError, LookupError):
+            raise FileOperationFailedError(
+                "AFTER_COMMIT_FAILED", effect=FileEffect.UNKNOWN
+            ) from None
+        if written != content or info.st_size != change.content_size:
+            raise FileOperationFailedError("VERIFY_FAILED", effect=FileEffect.UNKNOWN)
 
 
 def _check_artifact(descriptor: ActionDescriptor) -> None:
@@ -453,6 +547,41 @@ def _check_artifact(descriptor: ActionDescriptor) -> None:
         raise FileOperationRefusedError("ARTIFACT_MISMATCH")
 
 
+def _write_temporary(parent: int, content: bytes) -> str:
+    """A new temporary file in ``parent`` holding ``content``, written in full and
+    fsynced. On failure it is removed again (the target was never touched)."""
+    temp = TEMP_FILE_PREFIX + secrets.token_hex(16)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        fd = os.open(temp, flags, 0o600, dir_fd=parent)
+    except OSError:
+        _none("TEMP_CREATE_FAILED")
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            _write_all(fd, content)
+            os.fsync(fd)
+            if os.fstat(fd).st_size != len(content):
+                raise OSError("temporary file size differs")
+        finally:
+            os.close(fd)
+    except OSError:
+        _discard(parent, temp)
+        _none("TEMP_WRITE_FAILED")
+    return temp
+
+
+def _discard(parent: int, temp: str) -> None:
+    """Remove our temporary file; if that fails, recovery removes it later."""
+    try:
+        os.unlink(temp, dir_fd=parent)
+    except OSError:
+        return
+
+
+_TEMP_NAME: Final = re.compile(re.escape(TEMP_FILE_PREFIX) + r"[0-9a-f]{32}")
+
+
 class SyntheticFileBroker:
     def __init__(self, *, area: Path | str, workspace_id: str, key: SecretKey) -> None:
         if type(key) is not SecretKey:
@@ -468,6 +597,54 @@ class SyntheticFileBroker:
 
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("the file broker is not extended (its code is the pinned artifact)")
+
+    def recover_temporaries(self) -> tuple[str, ...]:
+        """Remove the broker's temporary files left by a stopped process. Only names
+        of the exact form (the prefix and 32 hex digits) that are regular files of
+        ours are removed; targets, links and anything else are left alone. Runs
+        under the writer lock (refused while an operation holds it), after the
+        same root and manifest checks as ``prepare``. It never writes or retries."""
+        _require_safe_resolution()
+        area_fd = _open_area(self._area)
+        try:
+            root_fd = self._open_root(area_fd)
+            try:
+                device = os.fstat(root_fd).st_dev
+                manifest = self._manifest(root_fd, device)
+                root = os.fstat(root_fd)
+                if manifest.root_path != f"{self._area}/{self._workspace_id}" or (
+                    manifest.root_device,
+                    manifest.root_inode,
+                ) != (root.st_dev, root.st_ino):
+                    raise WorkspaceRejectedError("ROOT_IDENTITY_MISMATCH")
+                removed: list[str] = []
+                _sweep(root_fd, "", device, removed)
+                return tuple(sorted(removed))
+            finally:
+                os.close(root_fd)
+        finally:
+            os.close(area_fd)
+
+    def _open_root(self, area_fd: int) -> int:
+        """The root fd (ours, 0700, the area's device), locked for this writer."""
+        try:
+            root_fd = os.open(self._workspace_id, _dir_flags(), dir_fd=area_fd)
+        except OSError:
+            raise WorkspaceRejectedError("ROOT_UNUSABLE") from None
+        try:
+            root = os.fstat(root_fd)
+            if not _private_dir(root):
+                raise WorkspaceRejectedError("ROOT_PERMISSIONS")
+            if root.st_dev != os.fstat(area_fd).st_dev:
+                raise WorkspaceRejectedError("MOUNT_BOUNDARY")
+            try:
+                fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise FileOperationRefusedError("WORKSPACE_BUSY") from None
+        except BaseException:
+            os.close(root_fd)
+            raise
+        return root_fd
 
     def prepare(self, descriptor: ActionDescriptor, policy: Policy | None) -> PreparedWorkspace:
         """Before the start: S19, the policy's trust, the area, the root, the lock and
@@ -490,20 +667,8 @@ class SyntheticFileBroker:
         area_fd = _open_area(self._area)
         root_fd = -1
         try:
-            try:
-                root_fd = os.open(self._workspace_id, _dir_flags(), dir_fd=area_fd)
-            except OSError:
-                raise WorkspaceRejectedError("ROOT_UNUSABLE") from None
-            area = os.fstat(area_fd)
+            root_fd = self._open_root(area_fd)
             root = os.fstat(root_fd)
-            if not _private_dir(root):
-                raise WorkspaceRejectedError("ROOT_PERMISSIONS")
-            if root.st_dev != area.st_dev:
-                raise WorkspaceRejectedError("MOUNT_BOUNDARY")
-            try:
-                fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise FileOperationRefusedError("WORKSPACE_BUSY") from None
             manifest = self._manifest(root_fd, root.st_dev)
             if manifest.root_path != f"{self._area}/{self._workspace_id}":
                 raise WorkspaceRejectedError("ROOT_MISMATCH")
@@ -539,6 +704,27 @@ class SyntheticFileBroker:
         except (StrictJsonError, ValidationError):
             raise WorkspaceRejectedError("MANIFEST_INVALID") from None
         return verify_manifest(self._key, signed)
+
+
+def _sweep(dir_fd: int, prefix: str, device: int, removed: list[str]) -> None:
+    for entry in sorted(os.scandir(dir_fd), key=lambda e: e.name):
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISDIR(info.st_mode):
+            if info.st_uid != os.geteuid() or info.st_dev != device:
+                continue  # not ours or another file system: never descended into
+            child = os.open(entry.name, _dir_flags(), dir_fd=dir_fd)
+            try:
+                _sweep(child, f"{prefix}{entry.name}/", device, removed)
+            finally:
+                os.close(child)
+        elif (
+            _TEMP_NAME.fullmatch(entry.name)
+            and stat.S_ISREG(info.st_mode)
+            and info.st_uid == os.geteuid()
+        ):
+            os.unlink(entry.name, dir_fd=dir_fd)
+            removed.append(prefix + entry.name)
+    os.fsync(dir_fd)
 
 
 # ---------------------------------------------------------------- creating a managed tree

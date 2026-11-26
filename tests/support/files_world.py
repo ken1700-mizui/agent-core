@@ -103,8 +103,10 @@ def install(root: Path, signed: SignedWorkspaceManifest) -> None:
     target.chmod(0o600)
 
 
-def snapshot(root: Path) -> dict[str, Any]:
-    """Every entry under ``root`` (links not followed): kind, bytes, inode, times, mode."""
+def snapshot(root: Path, *, dir_times: bool = True) -> dict[str, Any]:
+    """Every entry under ``root`` (links not followed): kind, bytes, inode, times, mode.
+    ``dir_times=False`` leaves out directory times: a temporary file that was created
+    and removed again changes its directory's times, not its listing."""
     result: dict[str, Any] = {}
     for current, dirs, names in os.walk(root, followlinks=False):
         for name in sorted(dirs + names):
@@ -116,12 +118,13 @@ def snapshot(root: Path) -> dict[str, Any]:
                 data = sorted(os.listdir(path))
             else:
                 data = None
+            timed = dir_times or not stat.S_ISDIR(info.st_mode)
             result[str(path.relative_to(root))] = (
                 stat.S_IFMT(info.st_mode),
                 data,
                 info.st_ino,
-                info.st_mtime_ns,
-                info.st_ctime_ns,
+                info.st_mtime_ns if timed else None,
+                info.st_ctime_ns if timed else None,
                 info.st_mode,
                 info.st_nlink,
             )
