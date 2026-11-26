@@ -17,6 +17,7 @@ from agent_core.types.errors import (
     ToolAlreadyRegisteredError,
     ToolInputError,
     ToolKindNotAllowedError,
+    ToolManifestError,
     ToolNotApprovedError,
     ToolOutputError,
     UnknownToolError,
@@ -123,7 +124,14 @@ def test_catalog_rejects_two_entries_for_one_id_and_version() -> None:
 
 @pytest.mark.parametrize("kind", [ToolKind.SANDBOXED_COMMAND, ToolKind.MCP, ToolKind.MODEL_CALL])
 def test_only_builtin_tools_are_allowed_in_phase_1(kind: ToolKind) -> None:
-    sealed = t.manifest(kind=kind)
+    extra: dict[str, Any] = {}
+    if kind is ToolKind.MODEL_CALL:
+        extra = {
+            "effect_class": ToolEffectClass.MODEL_CALL,
+            "required_permissions": (),
+            "resources": (),
+        }
+    sealed = t.manifest(kind=kind, **extra)
     registry = ToolRegistry(t.catalog(sealed))
     with pytest.raises(ToolKindNotAllowedError):
         registry.register(sealed, artifact_hash=t.ARTIFACT)
@@ -317,3 +325,121 @@ def test_model_tool_request_alone_cannot_register_or_authorize() -> None:
     )
     proposal = _propose(registry, request.arguments, tool_id=request.name)
     assert isinstance(proposal, ToolProposal)
+
+
+# ---------------------------------------------------------------- WP07-R01: size before parsing
+
+
+@pytest.mark.parametrize(
+    ("arguments", "issue"),
+    [
+        ('{"path":"a"' + " " * 5_000 + "}", "too_large"),
+        ('{"path":"' + "x" * 50_000 + '"}', "too_large"),
+        ("1" * 6_000, "too_large"),
+        ('{"path":"a","max_bytes":' + "9" * 30 + "}", "int_out_of_range"),
+        ('{"path":"\ud800"}', "json_invalid_string"),
+    ],
+    ids=["whitespace", "large-string", "huge-number-text", "huge-number", "lone-surrogate"],
+)
+def test_raw_input_is_limited_before_parsing(arguments: str, issue: str) -> None:
+    registry = _registry(t.manifest())
+    with pytest.raises(ToolInputError) as excinfo:
+        _propose(registry, arguments)
+    assert issue in {i.type for i in excinfo.value.issues}
+
+
+def test_raw_limit_is_checked_before_the_parser_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agent_core.tool import registry as registry_module
+
+    def must_not_parse(_data: Any) -> Any:
+        raise AssertionError("parsed an oversized input")
+
+    registry = _registry(t.manifest())
+    monkeypatch.setattr(registry_module, "parse_strict_json", must_not_parse)
+    with pytest.raises(ToolInputError):
+        _propose(registry, '{"path":"' + "x" * 50_000 + '"}')
+
+
+def test_characters_and_utf8_bytes_are_limited_separately() -> None:
+    schema = t.body().input_schema.model_copy(update={"max_bytes": 200})
+    registry = _registry(t.manifest(input_schema=schema))
+    # 70 characters fit max_length=256, but 70 x 3 UTF-8 bytes (plus the
+    # 11 bytes of '{"path":""}') exceed max_bytes=200.
+    with pytest.raises(ToolInputError) as excinfo:
+        _propose(registry, json.dumps({"path": "あ" * 70}, ensure_ascii=False))
+    assert "too_large" in {i.type for i in excinfo.value.issues}
+    ok = _propose(registry, json.dumps({"path": "あ" * 40}, ensure_ascii=False))
+    assert len(ok.canonical_input.encode("utf-8")) <= 200
+
+
+def test_non_string_arguments_are_a_typed_error() -> None:
+    registry = _registry(t.manifest())
+    with pytest.raises(ToolInputError) as excinfo:
+        _propose(registry, b'{"path":"a"}')  # type: ignore[arg-type]  # runtime check
+    assert "string_required" in {i.type for i in excinfo.value.issues}
+
+
+def test_output_raw_size_is_limited_before_parsing() -> None:
+    registry = _registry(t.manifest(max_output_bytes=100))
+    registration = registry.get("read_file", "1.0.0")
+    with pytest.raises(ToolOutputError) as excinfo:
+        registry.validate_output(registration, '{"content":"x","truncated":false}' + " " * 1_000)
+    assert "too_large" in {i.type for i in excinfo.value.issues}
+
+
+# ---------------------------------------------------------------- WP07-R02: permissions and kinds
+
+
+def test_write_resources_and_write_permission_go_together() -> None:
+    write_resource = t.WRITE_BODY["resources"]
+    with pytest.raises(ValidationError):
+        t.body(**{**t.WRITE_BODY, "required_permissions": ()})
+    with pytest.raises(ValidationError):
+        t.body(**{**t.WRITE_BODY, "resources": ()})
+    with pytest.raises(ValidationError):
+        t.body(
+            effect_class=ToolEffectClass.IDEMPOTENT,
+            required_permissions=(),
+            resources=write_resource,
+        )
+
+
+def test_read_resources_need_read_permission() -> None:
+    with pytest.raises(ValidationError):
+        t.body(required_permissions=())
+
+
+def test_on_write_applies_to_declared_writes_only() -> None:
+    idempotent_read = t.manifest(
+        tool_id="list_dir",
+        effect_class=ToolEffectClass.IDEMPOTENT,
+        approval_conditions=(t.ApprovalCondition.ON_WRITE,),
+    )
+    registry = _registry(idempotent_read)
+    proposal = _propose(registry, '{"path":"workspace"}', tool_id="list_dir")
+    assert proposal.requires_approval is False  # no write declared
+    write = t.manifest(**{**t.WRITE_BODY, "effect_class": ToolEffectClass.IDEMPOTENT})
+    registry = _registry(write)
+    proposal = _propose(registry, '{"path":"workspace/a"}', tool_id="write_file")
+    assert proposal.requires_approval is True
+
+
+def test_builtin_tools_cannot_claim_the_model_call_effect() -> None:
+    with pytest.raises(ValidationError):
+        t.body(effect_class=ToolEffectClass.MODEL_CALL, required_permissions=(), resources=())
+
+
+def test_forged_manifest_is_a_typed_error() -> None:
+    genuine = t.manifest()
+    forged = ToolManifest.model_construct(**{**dict(genuine), "timeout_ms": 1})
+    registry = ToolRegistry(t.catalog(genuine))
+    with pytest.raises(ToolManifestError):
+        registry.register(forged, artifact_hash=t.ARTIFACT)
+
+
+def test_forged_catalog_is_revalidated() -> None:
+    genuine = t.manifest()
+    entry = t.entry(genuine)
+    forged = TrustedToolCatalog.model_construct(entries=(entry, entry))
+    with pytest.raises(ToolManifestError):
+        ToolRegistry(forged)

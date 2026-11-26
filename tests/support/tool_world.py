@@ -84,3 +84,5 @@ WRITE_BODY: dict[str, Any] = {
     "resources": (ResourceSpec(path_pattern="workspace/**", access=ResourceAccess.WRITE),),
     "approval_conditions": (ApprovalCondition.ON_WRITE,),
 }
+
+__all__ = ["ApprovalCondition", "ResourceAccess", "ResourceSpec"]

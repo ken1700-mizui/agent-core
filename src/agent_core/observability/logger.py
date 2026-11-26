@@ -60,6 +60,8 @@ class StructuredLogger:
         max_record_bytes: int = DEFAULT_MAX_RECORD_BYTES,
         labels: tuple[LogLabel, ...] = (LogLabel.SYNTHETIC,),
     ) -> None:
+        if type(max_record_bytes) is not int or not 0 < max_record_bytes <= 1_048_576:
+            raise LogWriteError("max_record_bytes must be an int in [1, 1 MiB]")
         self._sink = sink
         self._clock = clock
         self._monotonic = monotonic
@@ -165,6 +167,7 @@ class StructuredLogger:
             self._sink.write(line)
         except LogWriteError:
             raise
-        except Exception as exc:
-            raise LogWriteError("log sink failed") from exc
+        except Exception as exc:  # noqa: BLE001 (re-raised as a typed error below)
+            # Only the error type is kept: a sink message could carry anything.
+            raise LogWriteError(f"log sink failed ({type(exc).__name__})") from None
         return record

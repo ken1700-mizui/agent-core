@@ -22,13 +22,14 @@ from __future__ import annotations
 from types import MappingProxyType
 from typing import Any, Self
 
-from pydantic import model_validator
+from pydantic import ValidationError, model_validator
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.errors import (
     ToolAlreadyRegisteredError,
     ToolInputError,
     ToolKindNotAllowedError,
+    ToolManifestError,
     ToolNotApprovedError,
     ToolOutputError,
     UnknownToolError,
@@ -42,7 +43,6 @@ from agent_core.types.tools import (
     ExternalGuarantee,
     FieldType,
     ObjectSchema,
-    ResourceAccess,
     ToolEffectClass,
     ToolKind,
     ToolManifest,
@@ -57,6 +57,8 @@ from agent_core.types.tools import (
 from agent_core.types.values import Digest, Identifier
 
 UNKNOWN_FIELD = "<unknown>"
+# Raw text may carry whitespace beyond the canonical form, but only this much.
+RAW_SIZE_FACTOR = 2
 # Phase 1 allows builtin tools only (PHASE_1_IMPLEMENTATION_PLAN WP-07).
 ALLOWED_KINDS = frozenset({ToolKind.BUILTIN})
 
@@ -96,10 +98,9 @@ def _check_phase(manifest: ToolManifest) -> None:
 
 
 def _requires_approval(manifest: ToolManifest) -> bool:
+    """Derived from the declaration only: a hint for the PDP, never a decision."""
     conditions = set(manifest.approval_conditions)
-    writes = any(r.access is ResourceAccess.WRITE for r in manifest.resources) or (
-        manifest.effect_class is not ToolEffectClass.READ_ONLY
-    )
+    writes = manifest.declares_writes
     return (
         ApprovalCondition.ALWAYS in conditions
         or (ApprovalCondition.ON_WRITE in conditions and writes)
@@ -110,8 +111,29 @@ def _requires_approval(manifest: ToolManifest) -> bool:
     )
 
 
-def _validate_object(schema: ObjectSchema, raw: str) -> tuple[bytes, list[ValidationIssue]]:
-    """Validate ``raw`` JSON against ``schema``; issues never contain input values."""
+def _validate_object(
+    schema: ObjectSchema, raw: object, *, max_bytes: int | None = None
+) -> tuple[bytes, list[ValidationIssue]]:
+    """Validate ``raw`` JSON against ``schema``; issues never contain input values.
+
+    Sizes are checked before parsing (WP07-R01): the raw text may use at most
+    ``RAW_SIZE_FACTOR`` times the canonical limit, counted first in characters
+    (cheap, and never more than the bytes) and then in UTF-8 bytes. After
+    parsing, the canonical UTF-8 bytes must fit the limit. ``max_length`` of a
+    string counts Unicode characters.
+    """
+    limit = schema.max_bytes if max_bytes is None else min(schema.max_bytes, max_bytes)
+    raw_limit = limit * RAW_SIZE_FACTOR
+    if type(raw) is not str:
+        return b"", [ValidationIssue(location="$", type="string_required")]
+    if len(raw) > raw_limit:
+        return b"", [ValidationIssue(location="$", type="too_large")]
+    try:
+        encoded_size = len(raw.encode("utf-8"))
+    except UnicodeEncodeError:
+        return b"", [ValidationIssue(location="$", type="json_invalid_string")]
+    if encoded_size > raw_limit:
+        return b"", [ValidationIssue(location="$", type="too_large")]
     issues: list[ValidationIssue] = []
     try:
         data: Any = parse_strict_json(raw)
@@ -136,6 +158,8 @@ def _validate_object(schema: ObjectSchema, raw: str) -> tuple[bytes, list[Valida
         elif spec.type is FieldType.INTEGER:
             if type(value) is not int:
                 issues.append(ValidationIssue(location=name, type="int_type"))
+            elif not -(2**63) <= value <= 2**63 - 1:
+                issues.append(ValidationIssue(location=name, type="int_out_of_range"))
             elif spec.minimum is not None and value < spec.minimum:
                 issues.append(ValidationIssue(location=name, type="greater_than_equal"))
             elif spec.maximum is not None and value > spec.maximum:
@@ -143,14 +167,18 @@ def _validate_object(schema: ObjectSchema, raw: str) -> tuple[bytes, list[Valida
         elif type(value) is not bool:
             issues.append(ValidationIssue(location=name, type="bool_type"))
     canonical = canonical_json(data)
-    if len(canonical) > schema.max_bytes:
+    if len(canonical) > limit:
         issues.append(ValidationIssue(location="$", type="too_large"))
     return canonical, issues
 
 
 class ToolRegistry:
     def __init__(self, catalog: TrustedToolCatalog) -> None:
-        self._catalog = catalog
+        try:
+            # Re-validated: a catalog built without validation is not trusted.
+            self._catalog = TrustedToolCatalog.model_validate(catalog)
+        except ValidationError:
+            raise ToolManifestError("trusted tool catalog is invalid") from None
         self._registrations: dict[tuple[str, str], ToolRegistration] = {}
 
     @property
@@ -160,7 +188,10 @@ class ToolRegistry:
     def register(self, manifest: ToolManifest, *, artifact_hash: str) -> ToolRegistration:
         if type(manifest) is not ToolManifest:
             raise ToolNotApprovedError("a sealed ToolManifest is required")
-        manifest = ToolManifest.model_validate(manifest)  # re-checks manifest_hash
+        try:
+            manifest = ToolManifest.model_validate(manifest)  # re-checks manifest_hash
+        except ValidationError:
+            raise ToolManifestError("tool manifest is invalid") from None
         _check_phase(manifest)
         entry = self._catalog.find(manifest.tool_id, manifest.version)
         if (
@@ -214,9 +245,9 @@ class ToolRegistry:
         current = self.get(registration.manifest.tool_id, registration.manifest.version)
         if current != registration:
             raise ToolNotApprovedError("registration does not match the registry")
-        canonical, issues = _validate_object(current.manifest.output_schema, output)
-        if not issues and len(canonical) > current.manifest.max_output_bytes:
-            issues.append(ValidationIssue(location="$", type="too_large"))
+        canonical, issues = _validate_object(
+            current.manifest.output_schema, output, max_bytes=current.manifest.max_output_bytes
+        )
         if issues:
             raise ToolOutputError(tuple(issues))
         return ValidatedToolOutput(

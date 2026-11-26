@@ -369,6 +369,26 @@ class LogRecordTooLargeError(LogWriteError):
     code = "LOG_RECORD_TOO_LARGE"
 
 
+class LogFileChangedError(LogWriteError):
+    """The log file changed outside this sink (size, identity or links). The sink
+    stops: it cannot tell what the file now holds."""
+
+    code = "LOG_FILE_CHANGED"
+
+
+class LogPartialWriteError(LogWriteError):
+    """Only part of a line was written. The partial tail stays in the file (it is
+    never truncated) and the sink stops; the file's last line is then incomplete."""
+
+    code = "LOG_PARTIAL_WRITE"
+
+
+class LogSinkStoppedError(LogWriteError):
+    """The sink stopped after an earlier failure and accepts no more lines."""
+
+    code = "LOG_SINK_STOPPED"
+
+
 class AuditWriteError(AgentCoreError):
     """An audit record could not be written. The operation that needs it must stop
     (C2 4.5): audit is never skipped. Full enforcement is WP-09."""

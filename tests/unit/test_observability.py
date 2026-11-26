@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,10 @@ from agent_core.types.errors import (
     IllegalTransitionError,
     JournalError,
     LogCapacityError,
+    LogFileChangedError,
+    LogPartialWriteError,
     LogRecordTooLargeError,
+    LogSinkStoppedError,
     LogWriteError,
 )
 from agent_core.types.ids import AttemptId, EventId, RunId, StepId, TaskId
@@ -345,3 +349,152 @@ def test_no_network_is_used(tmp_path: Path) -> None:
     sink = JsonLinesLogSink(tmp_path / "o.jsonl", max_total_bytes=10_000)
     logger, _ = _logger(sink=sink)
     logger.state_changed(entity=LogEntity.TASK, state="ACTIVE", task_id=b.new_id(TaskId))
+
+
+# ---------------------------------------------------------- WP11-R01: capacity and single writer
+
+
+def _write_one(sink: Any) -> None:
+    logger, _ = _logger(sink=sink)
+    logger.state_changed(entity=LogEntity.TASK, state="ACTIVE", task_id=b.new_id(TaskId))
+
+
+def test_second_sink_on_the_same_file_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    first = JsonLinesLogSink(path, max_total_bytes=10_000)
+    try:
+        with pytest.raises(LogWriteError):
+            JsonLinesLogSink(path, max_total_bytes=10_000)
+        _write_one(first)
+    finally:
+        first.close()
+    second = JsonLinesLogSink(path, max_total_bytes=10_000)
+    second.close()
+
+
+def test_external_size_change_stops_the_sink(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    _write_one(sink)
+    with path.open("ab") as other:
+        other.write(b"x" * 10)
+    with pytest.raises(LogFileChangedError):
+        _write_one(sink)
+    with pytest.raises(LogSinkStoppedError):
+        _write_one(sink)
+
+
+def test_existing_file_over_the_cap_is_refused_and_kept(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    path.write_bytes(b"x" * 100)
+    path.chmod(0o600)
+    with pytest.raises(LogCapacityError):
+        JsonLinesLogSink(path, max_total_bytes=50)
+    assert path.read_bytes() == b"x" * 100
+
+
+# ---------------------------------------------------------- WP11-R02: partial writes and files
+
+
+def test_partial_write_stops_the_sink_and_keeps_the_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "o.jsonl"
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    real_write = os.write
+
+    def short_write(fd: int, data: bytes) -> int:
+        return real_write(fd, data[:5])
+
+    monkeypatch.setattr("agent_core.adapters.jsonl_log.os.write", short_write)
+    with pytest.raises(LogPartialWriteError):
+        _write_one(sink)
+    monkeypatch.undo()
+    with pytest.raises(LogSinkStoppedError):
+        _write_one(sink)
+    assert len(path.read_bytes()) == 5  # the partial tail stays; nothing is truncated
+
+
+def test_os_error_during_write_stops_the_sink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sink = JsonLinesLogSink(tmp_path / "o.jsonl", max_total_bytes=10_000)
+
+    def failing_write(_fd: int, _data: bytes) -> int:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("agent_core.adapters.jsonl_log.os.write", failing_write)
+    with pytest.raises(LogWriteError):
+        _write_one(sink)
+    monkeypatch.undo()
+    with pytest.raises(LogSinkStoppedError):
+        _write_one(sink)
+
+
+def test_fifo_is_refused_without_blocking(tmp_path: Path) -> None:
+    fifo = tmp_path / "pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(LogWriteError):
+        JsonLinesLogSink(fifo, max_total_bytes=10_000)
+
+
+def test_group_or_world_accessible_file_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    path.write_bytes(b"")
+    path.chmod(0o644)
+    with pytest.raises(LogWriteError):
+        JsonLinesLogSink(path, max_total_bytes=10_000)
+
+
+def test_replaced_file_stops_the_sink(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    path.unlink()
+    path.write_bytes(b"")
+    with pytest.raises(LogFileChangedError):
+        _write_one(sink)
+
+
+# ---------------------------------------------------------------- WP11-R03: audit limits and errors
+
+
+def test_audit_record_size_limit() -> None:
+    writer = AuditWriter(sink=MemorySink(), max_record_bytes=64)
+    with pytest.raises(AuditWriteError):
+        writer.write(_audit_record())
+
+
+@pytest.mark.parametrize("value", [0, -1, 10_000_000, True])
+def test_invalid_writer_settings_are_refused(value: Any) -> None:
+    with pytest.raises(AuditWriteError):
+        AuditWriter(sink=MemorySink(), max_record_bytes=value)
+    with pytest.raises(LogWriteError):
+        StructuredLogger(
+            sink=MemorySink(),
+            clock=FixedClock(),
+            monotonic=FakeMonotonic(0),
+            engine=b.ENGINE,
+            max_record_bytes=value,
+        )
+
+
+class _LeakySink:
+    def write(self, line: bytes) -> None:
+        raise OSError(f"disk failure near {MARKER}")
+
+
+def test_sink_exception_text_does_not_leak_from_the_audit_writer() -> None:
+    writer = AuditWriter(sink=_LeakySink())
+    with pytest.raises(AuditWriteError) as excinfo:
+        writer.write(_audit_record())
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert MARKER not in rendered
+    assert excinfo.value.__cause__ is None
+    assert excinfo.value.__suppress_context__
+
+
+def test_sink_exception_text_does_not_leak_from_the_logger() -> None:
+    logger, _ = _logger(sink=_LeakySink())
+    with pytest.raises(LogWriteError) as excinfo:
+        logger.state_changed(entity=LogEntity.TASK, state="ACTIVE", task_id=b.new_id(TaskId))
+    assert MARKER not in "".join(traceback.format_exception(excinfo.value))

@@ -180,11 +180,23 @@ class ToolManifestBody(FrozenModel):
 
     @model_validator(mode="after")
     def _effects_fit_declaration(self) -> Self:
-        if self.effect_class is ToolEffectClass.READ_ONLY:
-            writes = any(r.access is ResourceAccess.WRITE for r in self.resources)
-            if writes or ToolPermission.FILE_WRITE in self.required_permissions:
-                raise ValueError("a READ_ONLY tool cannot declare writes")
+        writes = any(r.access is ResourceAccess.WRITE for r in self.resources)
+        reads = any(r.access is ResourceAccess.READ for r in self.resources)
+        permissions = set(self.required_permissions)
+        # Declared accesses and permissions must agree in both directions (WP07-R02).
+        if writes != (ToolPermission.FILE_WRITE in permissions):
+            raise ValueError("WRITE resources and the FILE_WRITE permission go together")
+        if reads != (ToolPermission.FILE_READ in permissions):
+            raise ValueError("READ resources and the FILE_READ permission go together")
+        if self.effect_class is ToolEffectClass.READ_ONLY and writes:
+            raise ValueError("a READ_ONLY tool cannot declare writes")
+        if (self.effect_class is ToolEffectClass.MODEL_CALL) != (self.kind is ToolKind.MODEL_CALL):
+            raise ValueError("the MODEL_CALL effect belongs to MODEL_CALL tools only")
         return self
+
+    @property
+    def declares_writes(self) -> bool:
+        return ToolPermission.FILE_WRITE in self.required_permissions
 
     def compute_hash(self) -> str:
         fields = ToolManifestBody.model_fields
