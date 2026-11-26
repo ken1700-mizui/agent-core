@@ -41,6 +41,7 @@ from agent_core.runtime.state_machine import (
     rebuild_with_head,
 )
 from agent_core.types.errors import (
+    CostError,
     JournalArgumentError,
     JournalClosedError,
     JournalHeadMismatchError,
@@ -56,6 +57,7 @@ from agent_core.types.errors import (
 from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import AttemptId, EventId, RunGrantId, RunId, StepId, TaskId, TenantId
+from agent_core.types.ledger import LedgerOp
 from agent_core.types.records import (
     Attempt,
     AttemptState,
@@ -88,6 +90,8 @@ _NOTHING_STORED = (
     JournalClosedError,
     StaleEventEpochError,
     RunTenantMismatchError,
+    # A refused ledger operation rolls the whole transaction back (WP-09).
+    CostError,
 )
 # Phase 1 is synthetic only (PHASE_1_IMPLEMENTATION_PLAN section 2).
 EVENT_LABELS = ("synthetic",)
@@ -306,9 +310,12 @@ class RuntimeStateMachine:
         attempt: Attempt,
         target: AttemptState,
         evidence: AttemptEvidence | None = None,
+        *,
+        ledger: tuple[LedgerOp, ...] = (),
     ) -> Attempt:
+        """``ledger`` operations are applied in the same journal transaction (WP-09)."""
         transition = plan_attempt_status(self._state, attempt, target, evidence)
-        self._commit((transition,))
+        self._commit((transition,), ledger=ledger)
         self._late = transition.late
         return self._state.attempts[attempt.attempt_id]
 
@@ -321,7 +328,9 @@ class RuntimeStateMachine:
                 if evidence is not None and transition.before is not None:
                     self._verifier.verify(evidence, subject=transition.before)
 
-    def _commit(self, transitions: tuple[Transition, ...]) -> Event:
+    def _commit(
+        self, transitions: tuple[Transition, ...], *, ledger: tuple[LedgerOp, ...] = ()
+    ) -> Event:
         if self._reload_required:
             raise RuntimeReloadRequiredError("reload the runtime from the journal")
         if self._base is None:
@@ -358,6 +367,8 @@ class RuntimeStateMachine:
             )
             # The journal compares ``expected`` with its head inside the write
             # transaction; a state that changed after verification is refused.
+            if ledger:
+                return self._journal.append_with_ledger(draft, expected=expected, ledger=ledger)
             return self._journal.append(draft, expected=expected)
 
         try:

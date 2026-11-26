@@ -19,6 +19,7 @@ import hashlib
 import hmac
 
 from agent_core.types.errors import ApprovalRejectedError
+from agent_core.types.ledger import LedgerBatch
 from agent_core.types.safety import (
     APPROVAL_MAC_DOMAIN,
     ApprovalReason,
@@ -28,6 +29,8 @@ from agent_core.types.safety import (
     SignedApproval,
 )
 from agent_core.types.serialization import dump_json
+
+OWNER_LEDGER_DOMAIN = b"agent-core/owner-ledger-batch/v1\x00"
 
 
 def _mac(key: SecretKey, approval: ExactApproval) -> str:
@@ -50,6 +53,22 @@ class OwnerApprovalChannel:
         if type(approval) is not ExactApproval:
             raise TypeError("approve takes an ExactApproval")
         return SignedApproval(approval=approval, owner_mac=_mac(self._key, approval))
+
+    def sign_ledger(self, batch: LedgerBatch) -> str:
+        """MAC of owner ledger operations (caps, counters, run windows, stop/resume)."""
+        if type(batch) is not LedgerBatch:
+            raise TypeError("sign_ledger takes a LedgerBatch")
+        return ledger_mac(self._key, batch)
+
+
+def ledger_mac(key: SecretKey, batch: LedgerBatch) -> str:
+    return hmac.new(
+        key.reveal(), OWNER_LEDGER_DOMAIN + dump_json(batch), hashlib.sha256
+    ).hexdigest()
+
+
+def verify_ledger_mac(key: SecretKey, batch: LedgerBatch, mac: str) -> bool:
+    return type(mac) is str and hmac.compare_digest(ledger_mac(key, batch), mac)
 
 
 def verify_signature(key: SecretKey, signed: SignedApproval) -> ExactApproval:

@@ -21,8 +21,13 @@ Summary:
 - Reads verify every returned row plus the links on both sides of the page
   (the row before it and the row after it, or the head). Rows outside the page
   are covered by open-time verification and by ``verify_tenant``.
-- The write transaction is a single unit so WP-09 can update the cost ledger
-  in the same SQLite transaction.
+- The write transaction is a single unit: ledger operations (WP-09) run inside
+  it, after the head check and before the event row, and must pair with the
+  event's runtime transitions (``sqlite_ledger.check_pairing``). Every append
+  checks the pairing, so a transition that needs a ledger operation cannot be
+  journaled without it, and vice versa. Ledger refusals roll everything back.
+- Schema version 2 adds the ledger tables. A version 1 file is refused, never
+  migrated (Phase 1 files are synthetic test data).
 - The database directory must be a trusted local directory (A 5.3).
 """
 
@@ -36,10 +41,20 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
 
+from agent_core.adapters import sqlite_ledger
 from agent_core.adapters.runtime_lock import RuntimeLock
 from agent_core.ports.clock import Clock
 from agent_core.ports.journal import HeadExpectation, JournalHead
 from agent_core.ports.randomness import RandomSource
+from agent_core.safety.approval import verify_ledger_mac
+from agent_core.types.cost import (
+    BudgetScopeType,
+    CounterKind,
+    CounterView,
+    LedgerEntryView,
+    ReservationView,
+    ScopeUsage,
+)
 from agent_core.types.errors import (
     DuplicateIdError,
     InvalidIdError,
@@ -52,6 +67,8 @@ from agent_core.types.errors import (
     JournalSchemaError,
     JournalStorageError,
     JournalWriteOutcomeUnknownError,
+    LedgerKeyMissingError,
+    OwnerAuthorizationError,
     OwnerEpochMismatchError,
     RandomSourceError,
     RecordValidationError,
@@ -62,10 +79,12 @@ from agent_core.types.errors import (
 from agent_core.types.event_hash import EVENT_HASH_VERSION, event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
+from agent_core.types.ledger import LedgerBatch, LedgerOp
+from agent_core.types.safety import LedgerKeys
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 1
+JOURNAL_SCHEMA_VERSION: Final = 2
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -107,6 +126,7 @@ SCHEMA_DDL: Final = (
     CONSTRAINT events_run_position_unique UNIQUE (run_id, run_seq),
     CHECK ((run_id IS NULL) = (run_seq IS NULL))
 ) STRICT""",
+    *sqlite_ledger.LEDGER_DDL,
 )
 
 _SCHEMA_OBJECTS_SQL: Final = (
@@ -160,8 +180,12 @@ class SqliteJournal:
         identity: tuple[int, int],
         owner_epoch: int,
         instance_id: str,
+        clock: Clock,
+        keys: LedgerKeys | None,
     ) -> None:
         self._path = path
+        self._clock = clock
+        self._keys = keys
         self._conn: sqlite3.Connection | None = conn
         self._lock = lock
         self._identity = identity
@@ -171,8 +195,20 @@ class SqliteJournal:
     # ------------------------------------------------------------ lifecycle
 
     @classmethod
-    def open(cls, path: Path, *, clock: Clock, random: RandomSource) -> SqliteJournal:
-        """Lock, check the schema, verify the whole journal, then claim a new epoch."""
+    def open(
+        cls,
+        path: Path,
+        *,
+        clock: Clock,
+        random: RandomSource,
+        keys: LedgerKeys | None = None,
+    ) -> SqliteJournal:
+        """Lock, check the schema, verify the whole journal, then claim a new epoch.
+
+        ``keys`` are the ledger's owner and permit keys. Without them, owner
+        operations and permits are refused (fail closed)."""
+        if keys is not None and type(keys) is not LedgerKeys:
+            raise JournalArgumentError("keys must be LedgerKeys")
         if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
             raise JournalSchemaError("SQLite 3.37 or newer is required")
         path = Path(path)
@@ -209,6 +245,8 @@ class SqliteJournal:
             identity=identity,
             owner_epoch=epoch,
             instance_id=instance_id,
+            clock=clock,
+            keys=keys,
         )
 
     @property
@@ -246,6 +284,12 @@ class SqliteJournal:
     # ------------------------------------------------------------ append
 
     def append(self, draft: EventDraft, *, expected: HeadExpectation) -> Event:
+        return self.append_with_ledger(draft, expected=expected, ledger=())
+
+    def append_with_ledger(
+        self, draft: EventDraft, *, expected: HeadExpectation, ledger: tuple[LedgerOp, ...]
+    ) -> Event:
+        """Append one event and apply its ledger operations in one transaction."""
         conn = self._require_open()
         if type(draft) is not EventDraft:
             raise JournalArgumentError("append expects an EventDraft")
@@ -253,11 +297,81 @@ class SqliteJournal:
             raise JournalArgumentError("append expects a HeadExpectation")
         if draft.owner_epoch != self._owner_epoch:
             raise StaleEventEpochError("draft owner_epoch is not the current owner epoch")
+        ops = self._ops(ledger)
+        sqlite_ledger.check_pairing(draft, ops)
         with self._write_transaction(conn) as cur:
             event, digest = self._position(cur, draft, expected)
+            now = self._now()
+            for op in ops:
+                sqlite_ledger.apply_op(cur, op, now_ms=now)
             self._insert_event(cur, event, digest)
             self._update_heads(cur, event, digest)
         return event
+
+    # ------------------------------------------------------------ ledger
+
+    def _ops(self, ledger: object) -> tuple[LedgerOp, ...]:
+        if type(ledger) is not tuple:
+            raise JournalArgumentError("ledger operations are a tuple")
+        if not ledger:
+            return ()
+        try:
+            # Re-validated: an operation built without validation is not trusted.
+            return LedgerBatch.model_validate({"ops": ledger}).ops
+        except (ValueError, TypeError) as exc:
+            raise JournalArgumentError("ledger operations are invalid") from exc
+
+    def _now(self) -> int:
+        now = self._clock.now_ms()
+        if type(now) is not int or not 0 <= now <= MAX_INT64:
+            raise JournalStorageError("clock returned an invalid time")
+        return now
+
+    def apply_ledger(self, ledger: tuple[LedgerOp, ...]) -> None:
+        """Standalone operations (usage, reconciliation, void, recovery) in one transaction."""
+        conn = self._require_open()
+        ops = self._ops(ledger)
+        if not ops:
+            raise JournalArgumentError("no ledger operations")
+        sqlite_ledger.check_standalone(ops)
+        with self._write_transaction(conn) as cur:
+            now = self._now()
+            for op in ops:
+                sqlite_ledger.apply_op(cur, op, now_ms=now)
+
+    def apply_owner_ledger(self, batch: LedgerBatch, *, owner_mac: str) -> None:
+        """Owner operations, accepted only with the owner channel's MAC."""
+        conn = self._require_open()
+        if type(batch) is not LedgerBatch:
+            raise JournalArgumentError("owner operations come as a LedgerBatch")
+        if self._keys is None:
+            raise LedgerKeyMissingError("OWNER_KEY")
+        if not verify_ledger_mac(self._keys.owner, batch, owner_mac):
+            raise OwnerAuthorizationError("OWNER_MAC")
+        sqlite_ledger.check_owner_ops(batch.ops)
+        with self._write_transaction(conn) as cur:
+            now = self._now()
+            for op in batch.ops:
+                sqlite_ledger.apply_op(cur, op, now_ms=now)
+
+    def reservation(self, reservation_id: str) -> ReservationView | None:
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_reservation(cur, str(reservation_id))
+
+    def scope_usage(self, scope_type: BudgetScopeType, scope_id: str) -> ScopeUsage:
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.scope_usage(cur, BudgetScopeType(scope_type), str(scope_id))
+
+    def counter(
+        self, scope_type: BudgetScopeType, scope_id: str, counter: CounterKind
+    ) -> CounterView | None:
+        with self._read_transaction(self._require_open()) as cur:
+            kind = BudgetScopeType(scope_type)
+            return sqlite_ledger.read_counter(cur, kind, str(scope_id), counter)
+
+    def ledger_entries(self, reservation_id: str) -> tuple[LedgerEntryView, ...]:
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_entries(cur, str(reservation_id))
 
     @contextmanager
     def _write_transaction(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Cursor]:
@@ -614,7 +728,9 @@ def _inspect_schema(conn: sqlite3.Connection) -> bool:
     if version != JOURNAL_SCHEMA_VERSION:
         raise JournalSchemaError(f"unsupported journal schema version {version}")
     if objects != _expected_schema_objects():
-        raise JournalSchemaError("journal schema objects do not match version 1")
+        raise JournalSchemaError(
+            f"journal schema objects do not match version {JOURNAL_SCHEMA_VERSION}"
+        )
     return False
 
 

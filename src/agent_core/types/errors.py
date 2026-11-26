@@ -455,3 +455,98 @@ class StorageAdmissionError(SafetyError):
     """The minimal Phase 1 storage admission gate refused the data."""
 
     code = "STORAGE_ADMISSION_REFUSED"
+
+
+# ---------------------------------------------------------------- cost (WP-09B)
+
+
+class CostError(AgentCoreError):
+    """A budget ledger operation was refused. The whole transaction is rolled back
+    (no journal event, no ledger row). ``reasons`` are fixed codes."""
+
+    code = "COST_REFUSED"
+
+    def __init__(self, *reasons: str) -> None:
+        if not reasons:
+            raise ValueError("a refusal names at least one reason")
+        super().__init__(", ".join(reasons))
+        self.reasons: tuple[str, ...] = tuple(reasons)
+
+
+class CostOverflowError(CostError):
+    """A cost total or product would leave the 64-bit range (E 4.3, E.Z9)."""
+
+    code = "COST_OVERFLOW"
+    fatal = True
+
+
+class BudgetExceededError(CostError):
+    """A reservation would exceed a budget level; ``reasons`` name the levels."""
+
+    code = "BUDGET_EXCEEDED"
+
+
+class BudgetCapMissingError(CostError):
+    """A budget level has no cap configured (fail closed: no cap, no reservation)."""
+
+    code = "BUDGET_CAP_MISSING"
+
+
+class BudgetBlockedError(CostError):
+    """New reservations in this scope are stopped (overrun or unexplained difference)."""
+
+    code = "BUDGET_BLOCKED"
+
+
+class CounterCapExceededError(CostError):
+    """A non-monetary limit (calls, retries, work units, elapsed time) was reached."""
+
+    code = "COUNTER_CAP_EXCEEDED"
+
+
+class ReservationStateError(CostError):
+    """The reservation is not in a state that allows this operation."""
+
+    code = "RESERVATION_STATE"
+
+
+class ReservationMismatchError(CostError):
+    """The operation names another Attempt, action or reservation than the ledger row."""
+
+    code = "RESERVATION_MISMATCH"
+
+
+class ReservationReuseError(CostError):
+    """The reservation ID or the Attempt already has a reservation (E 38.3)."""
+
+    code = "RESERVATION_REUSED"
+
+
+class ReservationExpiredError(CostError):
+    code = "RESERVATION_EXPIRED"
+
+
+class ReservationAmountError(CostError):
+    """The amount is below the trusted required amount or above the cost cap."""
+
+    code = "RESERVATION_AMOUNT"
+
+
+class DuplicateUsageReportError(CostError):
+    code = "USAGE_REPORT_DUPLICATE"
+
+
+class LedgerPairingError(CostError):
+    """A ledger operation and a runtime transition must come together (WP-09B)."""
+
+    code = "LEDGER_PAIRING"
+
+
+class LedgerKeyMissingError(CostError):
+    code = "LEDGER_KEY_MISSING"
+
+
+class OwnerAuthorizationError(CostError):
+    """An owner operation without a valid owner channel MAC."""
+
+    code = "OWNER_AUTHORIZATION"

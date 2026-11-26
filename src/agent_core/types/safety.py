@@ -99,6 +99,27 @@ class SecretKey:
         raise TypeError("keys are not serializable")
 
 
+class LedgerKeys:
+    """The ledger's keys: the owner channel key (verifies owner approvals and owner
+    operations) and the permit MAC key (P1 only; C2 6.2). Never serialized."""
+
+    __slots__ = ("owner", "permit")
+
+    def __init__(self, *, owner: SecretKey, permit: SecretKey) -> None:
+        if type(owner) is not SecretKey or type(permit) is not SecretKey:
+            raise TypeError("ledger keys are SecretKeys")
+        if owner.reveal() == permit.reveal():
+            raise ValueError("the owner key and the permit key are separate keys")
+        self.owner = owner
+        self.permit = permit
+
+    def __repr__(self) -> str:
+        return "<LedgerKeys>"
+
+    def __reduce__(self) -> str | tuple[object, ...]:
+        raise TypeError("keys are not serializable")
+
+
 class HashScheme(StrEnum):
     SYNTHETIC_SHA256 = "SYNTHETIC_SHA256"
     # Required for confidential data (C2 6.2, WP-14). Refused in Phase 1.

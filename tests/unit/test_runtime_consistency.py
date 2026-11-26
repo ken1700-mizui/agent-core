@@ -259,6 +259,9 @@ class _Snapshot:
         self._journal = journal
         self.owner_epoch = journal.owner_epoch
 
+    def append_with_ledger(self, draft: Any, *, expected: Any, ledger: Any) -> Any:
+        raise AssertionError("the snapshot view never writes")
+
     def read_tenant(self, tenant_id: Any, *, after_tenant_seq: int, limit: int) -> Any:
         return InMemoryJournal.read_tenant(
             self._journal, tenant_id, after_tenant_seq=after_tenant_seq, limit=limit

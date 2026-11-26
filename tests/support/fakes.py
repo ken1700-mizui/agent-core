@@ -11,7 +11,7 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 from agent_core.ports.journal import HeadExpectation, JournalHead
-from agent_core.types.errors import DuplicateIdError, JournalHeadMismatchError
+from agent_core.types.errors import DuplicateIdError, JournalArgumentError, JournalHeadMismatchError
 from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import EntityId, EventId, RunId, TenantId
@@ -72,6 +72,12 @@ class InMemoryJournal:
         self._events: dict[TenantId, list[Event]] = {}
         self._event_ids: set[EventId] = set()
         self._run_seq: dict[RunId, int] = {}
+
+    def append_with_ledger(
+        self, draft: EventDraft, *, expected: HeadExpectation, ledger: tuple[Any, ...]
+    ) -> Event:
+        """This fake has no ledger: refuse instead of storing the event alone."""
+        raise JournalArgumentError("the in-memory journal has no ledger")
 
     def append(self, draft: EventDraft, *, expected: HeadExpectation) -> Event:
         if HeadExpectation.of(self.head(draft.tenant_id)) != expected:

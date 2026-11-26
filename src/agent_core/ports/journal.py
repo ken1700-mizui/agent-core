@@ -26,6 +26,7 @@ from pydantic import Field, model_validator
 from agent_core.types.base import FrozenModel
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
+from agent_core.types.ledger import LedgerOp
 from agent_core.types.values import MAX_INT64, Digest, Seq
 
 
@@ -67,6 +68,15 @@ class JournalPort(Protocol):
         """Store the draft at the next position if the head is ``expected``.
 
         Raises ``JournalHeadMismatchError`` or ``DuplicateIdError`` (nothing stored)."""
+        ...
+
+    def append_with_ledger(
+        self, draft: EventDraft, *, expected: HeadExpectation, ledger: tuple[LedgerOp, ...]
+    ) -> Event:
+        """``append`` plus ledger operations in the same transaction (WP-09).
+
+        The operations must pair with the draft's runtime transitions. A journal
+        without a ledger raises instead of storing the event alone."""
         ...
 
     def read_tenant(
