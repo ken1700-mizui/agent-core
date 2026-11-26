@@ -2731,6 +2731,103 @@ def _journal_view(cur: sqlite3.Cursor) -> dict[str, dict[str, Any]]:
     return view
 
 
+MIRROR_TABLES: Final = ("rt_tasks", "rt_runs", "rt_steps", "rt_attempts")
+
+
+def repair_mirror(cur: sqlite3.Cursor) -> tuple[str, ...]:
+    """WP-12 ProjectionRepair: the runtime mirror (``rt_*``) is a projection of the
+    journal's events; rewrite each table that differs from what the events record.
+    Nothing else is touched: costs, approvals, permits, receipts, stops and the
+    audit are sources of truth, never projections. A row's ``created_at_ms`` is
+    kept when the row exists, else taken from its creating event's recorded time.
+    Returns the names of the tables rewritten (empty when nothing differed)."""
+    tasks: dict[str, tuple[str, int, str, int]] = {}
+    runs: dict[str, tuple[str, str, str, int, int]] = {}
+    steps: dict[str, str] = {}
+    attempts: dict[str, tuple[str, str]] = {}
+    for (body,) in cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq"):
+        event = Event.model_validate_json(body)
+        if not isinstance(event.payload, RuntimePayload):
+            continue
+        tenant = str(event.tenant_id)
+        for tr in event.payload.transitions:
+            if isinstance(tr, TaskTransition):
+                old = tasks.get(str(tr.after.task_id))
+                tasks[str(tr.after.task_id)] = (
+                    tenant,
+                    tr.after.budget_total.micro_units,
+                    dump_json(tr.after.caps_total).decode(),
+                    old[3] if old else event.recorded_at_ms,
+                )
+            elif isinstance(tr, RunTransition):
+                prior = runs.get(str(tr.after.run_id))
+                runs[str(tr.after.run_id)] = (
+                    str(tr.after.task_id),
+                    tenant,
+                    tr.after.status.value,
+                    int(tr.after.cancel_requested),
+                    prior[4] if prior else event.recorded_at_ms,
+                )
+            elif isinstance(tr, StepTransition):
+                steps[str(tr.after.step_id)] = str(tr.after.run_id)
+            elif isinstance(tr, AttemptTransition):
+                attempts[str(tr.after.attempt_id)] = (str(tr.after.step_id), tr.after.state.value)
+    repaired: list[str] = []
+    have_tasks = {
+        r[0]: (r[1], r[2], r[3], r[4])
+        for r in cur.execute(
+            "SELECT task_id, tenant_id, budget_micro, caps, created_at_ms FROM rt_tasks"
+        )
+    }
+    want_tasks = {
+        k: (v[0], v[1], v[2], have_tasks[k][3] if k in have_tasks else v[3])
+        for k, v in tasks.items()
+    }
+    if have_tasks != want_tasks:
+        cur.execute("DELETE FROM rt_tasks")
+        cur.executemany(
+            "INSERT INTO rt_tasks (task_id, tenant_id, budget_micro, caps, created_at_ms) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(k, *v) for k, v in sorted(want_tasks.items())],
+        )
+        repaired.append("rt_tasks")
+    have_runs = {
+        r[0]: (r[1], r[2], r[3], r[4], r[5])
+        for r in cur.execute(
+            "SELECT run_id, task_id, tenant_id, status, cancel_requested, created_at_ms "
+            "FROM rt_runs"
+        )
+    }
+    want_runs = {k: (*v[:4], have_runs[k][4] if k in have_runs else v[4]) for k, v in runs.items()}
+    if have_runs != want_runs:
+        cur.execute("DELETE FROM rt_runs")
+        cur.executemany(
+            "INSERT INTO rt_runs (run_id, task_id, tenant_id, status, cancel_requested, "
+            "created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+            [(k, *v) for k, v in sorted(want_runs.items())],
+        )
+        repaired.append("rt_runs")
+    have_steps = {r[0]: r[1] for r in cur.execute("SELECT step_id, run_id FROM rt_steps")}
+    if have_steps != steps:
+        cur.execute("DELETE FROM rt_steps")
+        cur.executemany(
+            "INSERT INTO rt_steps (step_id, run_id) VALUES (?, ?)", sorted(steps.items())
+        )
+        repaired.append("rt_steps")
+    have_attempts = {
+        r[0]: (r[1], r[2])
+        for r in cur.execute("SELECT attempt_id, step_id, state FROM rt_attempts")
+    }
+    if have_attempts != attempts:
+        cur.execute("DELETE FROM rt_attempts")
+        cur.executemany(
+            "INSERT INTO rt_attempts (attempt_id, step_id, state) VALUES (?, ?, ?)",
+            [(k, *v) for k, v in sorted(attempts.items())],
+        )
+        repaired.append("rt_attempts")
+    return tuple(repaired)
+
+
 def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
     attempts = {
         r[0]: (r[1], r[2])

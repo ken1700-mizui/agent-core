@@ -69,6 +69,8 @@ class ReconciliationTriggerReason(StrEnum):
     OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"
     DEADLINE_EXCEEDED = "DEADLINE_EXCEEDED"
     COMPENSATION_FAILED = "COMPENSATION_FAILED"
+    # WP-12: an interrupted Run whose transcript is gone (it is never continued).
+    SESSION_LOST = "SESSION_LOST"
 
 
 class ResolutionDecision(StrEnum):

@@ -200,6 +200,10 @@ class RuntimeStateMachine:
         )
 
     @property
+    def tenant_id(self) -> TenantId:
+        return self._tenant_id
+
+    @property
     def state(self) -> RuntimeState:
         return self._state
 

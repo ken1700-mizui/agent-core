@@ -343,6 +343,60 @@ class SqliteJournal:
         journal._read_only = True
         return journal
 
+    @classmethod
+    def repair_projections(
+        cls, path: Path, *, clock: Clock, keys: LedgerKeys | None = None
+    ) -> tuple[str, ...]:
+        """WP-12 ProjectionRepair, an explicit maintenance operation under the
+        Runtime's OS lock, in one write transaction: the journal's events (the source
+        of truth) are verified in full first; then the runtime mirror is rewritten
+        where it differs from them; then every other open-time check must hold. Any
+        failure rolls everything back and raises (a damaged source of truth is
+        never repaired by guessing: it stays as it is, and the journal does not
+        open). No owner epoch is claimed and nothing is revoked. Running it again
+        changes nothing. A crash part way leaves the file as it was (SQLite)."""
+        del clock, keys  # nothing is signed or timed here
+        path = Path(path)
+        _check_database_path(path)
+        if not path.exists():
+            raise JournalStorageError("no journal to repair")
+        lock = RuntimeLock.acquire(path.with_name(path.name + ".lock"))
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(
+                path, isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=True
+            )
+            _configure_before_inspection(conn)
+            if _inspect_schema(conn):
+                raise JournalSchemaError("no journal to repair")
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.cursor()
+                _check_database(cur)
+                tenants = cur.execute(
+                    "SELECT tenant_id FROM tenant_head UNION SELECT tenant_id FROM events "
+                    "UNION SELECT tenant_id FROM run_head ORDER BY 1"
+                ).fetchall()
+                for (tenant,) in tenants:
+                    try:
+                        tenant_id = TenantId(tenant)
+                    except (InvalidIdError, TypeError) as exc:
+                        raise JournalCorruptionError("stored tenant_id is invalid") from exc
+                    _verify_tenant(cur, tenant_id)
+                repaired = sqlite_ledger.repair_mirror(cur)
+                sqlite_ledger.verify_consistency(cur)
+                conn.execute("COMMIT")
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+        except sqlite3.Error as exc:
+            raise JournalStorageError(f"cannot repair: {type(exc).__name__}") from exc
+        finally:
+            _close_quietly(conn)
+            lock.release()
+        return repaired
+
     @property
     def read_only(self) -> bool:
         return self._read_only

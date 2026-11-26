@@ -12,7 +12,7 @@
 | 項目 | 内容 |
 |---|---|
 | 今の段階 | **WP-12（Recovery）を実装している**（`impl/phase-1-foundation`）。段階1で WP-10（94/100、条件付き合格）の限定修正 WP10-R01〜R04 と WP15-R06 を済ませた。記録は `docs/design/phase-1/WP-10_CLI.md`（15章）、`WP-15_AGENT_LOOP.md`（16章）。WP-01 は、CI が未実行のため、完了の条件をすべて満たしたとは記録しない。WP-13 の実装は、まだ認められていない |
-| 次の作業 | WP-12 の段階2（Rebuild、ProjectionRepair、復旧と照合）と段階3（CLI、障害の注入、実際のプロセスの停止の試験、`WP-12_RECOVERY.md`）。その後、ChatGPT のレビューを待つ。**WP-13 には進まない。** 残っている課題：AUDIT-02〜04、A-P6、CI、OS の隔離、実データのための鍵付きのハッシュ |
+| 次の作業 | WP-12 の段階1（限定修正、`b23b0ac`）と段階2（Rebuild、ProjectionRepair、復旧と照合）は済み。段階3（CLI、障害の注入、実際のプロセスの停止の試験、`WP-12_RECOVERY.md`）が残っている。その後、ChatGPT のレビューを待つ。**WP-13 には進まない。** 残っている課題：AUDIT-02〜04、A-P6、CI、OS の隔離、実データのための鍵付きのハッシュ |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
