@@ -591,22 +591,6 @@ def zero_usage() -> Any:
     )
 
 
-def completed_scenario(st: Setup) -> Any:
-    """A Task with one completed Run (synthetic), touching every entity kind."""
-    from agent_core.types.records import RunStatus, StepStatus, TaskStatus
-
-    the_task = w.task(st.sm)
-    run = w.running_run(st.sm, the_task)
-    step = w.step_in_progress(st.sm, run)
-    attempt = dispatched(st, step)
-    gate(st).finish(attempt, SyntheticResult(outcome="COMPLETED", usage=zero_usage(), final=True))
-    st.sm.set_step_status(st.sm.state.steps[step.step_id], StepStatus.COMMITTED)
-    verifying = st.sm.set_run_status(st.sm.state.runs[run.run_id], RunStatus.VERIFYING)
-    st.sm.set_run_status(verifying, RunStatus.COMPLETED, w.passing_verification(the_task))
-    st.sm.set_task_status(st.sm.state.tasks[the_task.task_id], TaskStatus.COMPLETED)
-    return the_task
-
-
 def abort(st: Setup, attempt: Attempt, *, release: bool) -> Attempt:
     """ABORTED_BEFORE_DISPATCH before consumption, releasing only when asked."""
     from agent_core.types.ledger import ReleaseReservation

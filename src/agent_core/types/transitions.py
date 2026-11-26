@@ -19,7 +19,7 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, model_validator
 
 from agent_core.types.base import FrozenModel
-from agent_core.types.ids import PermitId, ReceiptId, ReservationId
+from agent_core.types.ids import AttemptId, PermitId, ReceiptId, ReservationId
 from agent_core.types.records import Attempt, Run, Step, Task
 from agent_core.types.values import Digest, PolicyVersion
 
@@ -196,9 +196,14 @@ class VerificationEvidence(FrozenModel):
     expected_artifact_hash: Digest
     apply_plan: ApplyPlanStatus
     passed: bool
+    # WP15-R06: the verification reads this result rests on (the confirmation
+    # reads). The completion transaction checks each one against the ledger.
+    verified_reads: tuple[AttemptId, ...] = ()
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
+        if len(set(self.verified_reads)) != len(self.verified_reads):
+            raise ValueError("verified_reads must be unique")
         derived = bool(self.criteria) and all(c.passed for c in self.criteria)
         derived = derived and self.artifact_hash == self.expected_artifact_hash
         if self.passed != derived:

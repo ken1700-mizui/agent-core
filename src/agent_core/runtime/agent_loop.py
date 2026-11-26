@@ -90,6 +90,7 @@ from agent_core.types.context import ContextProfile, SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind, PriceTable, ReservationState
 from agent_core.types.errors import (
     AgentCoreError,
+    CompletionRefusedError,
     ContextBudgetExceededError,
     ContextError,
     CostError,
@@ -1085,12 +1086,19 @@ class AgentLoop:
 
     def _read_all(
         self, run_id: RunId, session: _Session, specs: list[FileCriterion | None]
-    ) -> list[str | None]:
+    ) -> tuple[list[str | None], list[AttemptId]]:
+        """The digest of each criterion's file, and the read Attempts that ran."""
         found: list[str | None] = []
+        reads: list[AttemptId] = []
         for spec in specs:
+            before = {a.attempt_id for a in self._attempts(run_id)}
             data = None if spec is None else self._read(run_id, session, spec.path)
             found.append(None if data is None else file_digest(data))
-        return found
+            if data is not None:
+                reads.extend(
+                    a.attempt_id for a in self._attempts(run_id) if a.attempt_id not in before
+                )
+        return found, reads
 
     def _committed_writes(self, run_id: RunId) -> dict[str, str]:
         """The content digest of the latest committed write of each path."""
@@ -1104,55 +1112,25 @@ class AgentLoop:
                 latest[change.path] = change.content_digest
         return latest
 
-    def _verify(self, run_id: RunId, session: _Session) -> bool:
-        """The done criteria checked on the actual files (never the model's word),
-        then confirmed and bound to the decision (WP15-R03)."""
-        deps = self._deps
-        tenant = str(self._config.tenant_id)
-        epoch = deps.ledger.access_epoch(tenant)
-        task = deps.sm.state.tasks[deps.sm.state.runs[run_id].task_id]
-        refs = list(task.done_criteria)
-        specs = [self._config.criteria.spec_for(ref) for ref in refs]
-        first = self._read_all(run_id, session, specs)
-        passed = [
-            spec is not None and found == spec.expected_digest
-            for spec, found in zip(specs, first, strict=True)
-        ]
-        if all(passed) and refs:
-            # The confirmation: every file again, after all were read once. A change
-            # while the files were read (by any writer) shows as a difference.
-            second = self._read_all(run_id, session, specs)
-            if second != first:
-                raise self._fail(
-                    session, run_id, TerminationReason.VERIFICATION_FAILED, "ARTIFACT_CHANGED"
-                )
-            writes = self._committed_writes(run_id)
-            for spec, found in zip(specs, second, strict=True):
-                assert spec is not None  # noqa: S101 (passed)
-                if spec.path in writes and writes[spec.path] != found:
-                    # The ApplyPlan committed something else than what is there now.
-                    raise self._fail(
-                        session,
-                        run_id,
-                        TerminationReason.VERIFICATION_FAILED,
-                        "APPLY_PLAN_MISMATCH",
-                    )
-        # The decision: the stop, the costs, the time, the grant, the access epoch.
-        self._guard(run_id, session, "read")
-        if deps.ledger.run_grant(str(run_id)) is None or deps.ledger.policy(tenant) is None:
-            raise self._unsafe(session, run_id, "GRANT_MISSING")
-        if deps.ledger.access_epoch(tenant) != epoch:
-            raise self._unsafe(session, run_id, "ACCESS_CHANGED")
+    def _verification_evidence(
+        self,
+        refs: list[str],
+        specs: list[FileCriterion | None],
+        found: list[str | None],
+        passed: list[bool],
+        reads: tuple[AttemptId, ...],
+        run_id: RunId,
+    ) -> VerificationEvidence:
         observed = [
-            f"{spec.path if spec else ref}={found or 'missing'}"
-            for ref, spec, found in zip(refs, specs, first, strict=True)
+            f"{spec.path if spec else ref}={digest or 'missing'}"
+            for ref, spec, digest in zip(refs, specs, found, strict=True)
         ]
         expected = [
             f"{spec.path if spec else ref}={spec.expected_digest if spec else 'unknown'}"
             for ref, spec in zip(refs, specs, strict=True)
         ]
         wrote = bool(self._committed_writes(run_id))
-        evidence = VerificationEvidence(
+        return VerificationEvidence(
             kind="verification",
             criteria=tuple(
                 CriterionResult(criterion_ref=ref, passed=ok)
@@ -1162,21 +1140,83 @@ class AgentLoop:
             expected_artifact_hash=sha256_digest("|".join(expected).encode()),
             apply_plan=ApplyPlanStatus.COMMITTED if wrote else ApplyPlanStatus.NOT_REQUIRED,
             passed=bool(refs) and all(passed),
+            verified_reads=reads,
         )
-        self._set(run_id, RunStatus.VERIFYING)
-        if evidence.passed:
-            self._set(run_id, RunStatus.COMPLETED, evidence)
-            return True
-        self._set(run_id, RunStatus.RUNNING, evidence)
-        failures = [
-            f"{spec.path if spec else ref}: expected "
-            f"{spec.expected_digest if spec else 'unknown'}, found {found or 'missing'}"
-            for ref, spec, found, ok in zip(refs, specs, first, passed, strict=True)
-            if not ok
+
+    def _verify(self, run_id: RunId, session: _Session) -> bool:
+        """The done criteria checked on the actual files (never the model's word),
+        then confirmed and bound to the decision (WP15-R03, R06)."""
+        deps = self._deps
+        task = deps.sm.state.tasks[deps.sm.state.runs[run_id].task_id]
+        refs = list(task.done_criteria)
+        specs = [self._config.criteria.spec_for(ref) for ref in refs]
+        first, _ = self._read_all(run_id, session, specs)
+        passed = [
+            spec is not None and found == spec.expected_digest
+            for spec, found in zip(specs, first, strict=True)
         ]
-        session.add(
-            TurnKind.OBSERVATION,
-            "Verification failed: " + "; ".join(failures),
-            f"verification:{len(session.turns)}",
-        )
-        return False
+        if not (all(passed) and refs):
+            self._guard(run_id, session, "read")
+            evidence = self._verification_evidence(refs, specs, first, passed, (), run_id)
+            self._set(run_id, RunStatus.VERIFYING)
+            self._set(run_id, RunStatus.RUNNING, evidence)
+            failures = [
+                f"{spec.path if spec else ref}: expected "
+                f"{spec.expected_digest if spec else 'unknown'}, found {found or 'missing'}"
+                for ref, spec, found, ok in zip(refs, specs, first, passed, strict=True)
+                if not ok
+            ]
+            session.add(
+                TurnKind.OBSERVATION,
+                "Verification failed: " + "; ".join(failures),
+                f"verification:{len(session.turns)}",
+            )
+            return False
+        # WP15-R06: from the confirmation reads to the completion record, this
+        # Runtime's gate refuses every change (cooperating writers are held off).
+        with deps.gate.verification_hold():
+            self._confirm_and_complete(run_id, session, refs, specs, first, passed)
+        return True
+
+    def _confirm_and_complete(
+        self,
+        run_id: RunId,
+        session: _Session,
+        refs: list[str],
+        specs: list[FileCriterion | None],
+        first: list[str | None],
+        passed: list[bool],
+    ) -> None:
+        deps = self._deps
+        tenant = str(self._config.tenant_id)
+        epoch = deps.ledger.access_epoch(tenant)
+        # The confirmation: every file again, after all were read once. A change
+        # while the files were read (by any writer) shows as a difference.
+        second, reads = self._read_all(run_id, session, specs)
+        if second != first:
+            raise self._fail(
+                session, run_id, TerminationReason.VERIFICATION_FAILED, "ARTIFACT_CHANGED"
+            )
+        writes = self._committed_writes(run_id)
+        for spec, found in zip(specs, second, strict=True):
+            assert spec is not None  # noqa: S101 (passed)
+            if spec.path in writes and writes[spec.path] != found:
+                # The ApplyPlan committed something else than what is there now.
+                raise self._fail(
+                    session, run_id, TerminationReason.VERIFICATION_FAILED, "APPLY_PLAN_MISMATCH"
+                )
+        # The decision: the stop, the costs, the time, the grant, the access epoch.
+        self._guard(run_id, session, "read")
+        if deps.ledger.run_grant(str(run_id)) is None or deps.ledger.policy(tenant) is None:
+            raise self._unsafe(session, run_id, "GRANT_MISSING")
+        if deps.ledger.access_epoch(tenant) != epoch:
+            raise self._unsafe(session, run_id, "ACCESS_CHANGED")
+        evidence = self._verification_evidence(refs, specs, second, passed, tuple(reads), run_id)
+        self._set(run_id, RunStatus.VERIFYING)
+        try:
+            # The journal's completion transaction checks the reads, the policy, the
+            # grant, the access epoch, every cost and the stops again (WP15-R06).
+            self._set(run_id, RunStatus.COMPLETED, evidence)
+        except (CompletionRefusedError, CostError) as exc:
+            # Refused inside the transaction (a cost not settled is a CostError).
+            raise self._unsafe(session, run_id, "COMPLETION_REFUSED", _name(exc)) from None

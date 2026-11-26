@@ -69,6 +69,7 @@ from agent_core.types.errors import (
     JournalError,
     JournalFileChangedError,
     JournalHeadMismatchError,
+    JournalReadOnlyError,
     JournalSchemaError,
     JournalStorageError,
     JournalWriteOutcomeUnknownError,
@@ -207,6 +208,7 @@ class SqliteJournal:
         self._identity = identity
         self._owner_epoch = owner_epoch
         self._instance_id = instance_id
+        self._read_only = False
 
     # ------------------------------------------------------------ lifecycle
 
@@ -264,6 +266,94 @@ class SqliteJournal:
             clock=clock,
             keys=keys,
         )
+
+    @classmethod
+    def open_read_only(
+        cls, path: Path, *, clock: Clock, keys: LedgerKeys | None = None
+    ) -> SqliteJournal:
+        """Read the journal without taking ownership (WP10-R03): the Runtime's OS lock
+        is held (so no other writer exists while reading), the file is opened
+        read-only (SQLite's own locking and WAL reading apply), the whole journal
+        and the ledger's agreement with it are verified in one read snapshot, and
+        nothing is written: no new owner epoch, no revocation, no recovery. Every
+        write method refuses. A journal SQLite cannot read in this mode is refused,
+        never read around."""
+        if keys is not None and type(keys) is not LedgerKeys:
+            raise JournalArgumentError("keys must be LedgerKeys")
+        path = Path(path)
+        _check_database_path(path)
+        if not path.exists():
+            raise JournalStorageError("no journal to read")
+        lock = RuntimeLock.acquire(path.with_name(path.name + ".lock"))
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                timeout=BUSY_TIMEOUT_MS / 1000,
+                check_same_thread=True,
+            )
+            identity = _database_identity(path)
+            _configure_before_inspection(conn)
+            conn.execute("BEGIN DEFERRED")
+            try:
+                if _inspect_schema(conn):
+                    raise JournalSchemaError("no journal to read")
+                cur = conn.cursor()
+                _check_database(cur)
+                tenants = cur.execute(
+                    "SELECT tenant_id FROM tenant_head UNION SELECT tenant_id FROM events "
+                    "UNION SELECT tenant_id FROM run_head ORDER BY 1"
+                ).fetchall()
+                for (tenant,) in tenants:
+                    try:
+                        tenant_id = TenantId(tenant)
+                    except (InvalidIdError, TypeError) as exc:
+                        raise JournalCorruptionError("stored tenant_id is invalid") from exc
+                    _verify_tenant(cur, tenant_id)
+                sqlite_ledger.verify_consistency(cur)
+                rows = cur.execute("SELECT epoch, instance_id FROM runtime_owner").fetchall()
+                if len(rows) != 1:
+                    raise JournalCorruptionError("runtime_owner must have exactly one row")
+                epoch, instance_id = int(rows[0][0]), str(rows[0][1])
+            finally:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+            if _database_identity(path) != identity:
+                raise JournalFileChangedError("journal file changed while opening")
+        except sqlite3.Error as exc:
+            _close_quietly(conn)
+            lock.release()
+            raise JournalStorageError(f"cannot read journal: {type(exc).__name__}") from exc
+        except BaseException:
+            _close_quietly(conn)
+            lock.release()
+            raise
+        journal = cls(
+            path=path,
+            conn=conn,
+            lock=lock,
+            identity=identity,
+            owner_epoch=epoch,
+            instance_id=instance_id,
+            clock=clock,
+            keys=keys,
+        )
+        journal._read_only = True
+        return journal
+
+    @property
+    def read_only(self) -> bool:
+        return self._read_only
+
+    def last_owner_seq(self) -> int:
+        """The last owner batch number the ledger applied (WP10-R02)."""
+        with self._read_transaction(self._require_open()) as cur:
+            row = cur.execute("SELECT last_seq FROM owner_sequence WHERE singleton = 1").fetchone()
+        if row is None:
+            raise JournalCorruptionError("owner_sequence must have exactly one row")
+        return int(row[0])
 
     @property
     def owner_epoch(self) -> int:
@@ -452,6 +542,8 @@ class SqliteJournal:
     @contextmanager
     def _write_transaction(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Cursor]:
         """One ``BEGIN IMMEDIATE`` transaction with owner checks. All or nothing."""
+        if self._read_only:
+            raise JournalReadOnlyError("this journal was opened read-only")
         try:
             self._check_files()
         except JournalError:

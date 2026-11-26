@@ -25,14 +25,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
-import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 
-from agent_core.adapters.file_broker import SyntheticFileBroker, create_synthetic_workspace
+from pydantic import StringConstraints
+
+from agent_core.adapters.file_broker import (
+    SyntheticFileBroker,
+    create_synthetic_workspace,
+    open_private_dir,
+    read_private_file,
+    replace_private_file,
+    write_private_file,
+)
 from agent_core.adapters.sqlite_journal import SqliteJournal
 from agent_core.adapters.system import OsRandomSource
 from agent_core.identity.generator import IdGenerator
@@ -47,8 +56,10 @@ from agent_core.runtime.verification import CriteriaCatalog
 from agent_core.safety.approval import OwnerApprovalChannel
 from agent_core.safety.workspace import manifest_digest, manifest_key
 from agent_core.tool.registry import ToolRegistry
+from agent_core.types.base import FrozenModel
 from agent_core.types.context import SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind
+from agent_core.types.errors import WorkspaceRejectedError
 from agent_core.types.ids import (
     ApprovalId,
     PepInstanceId,
@@ -71,6 +82,7 @@ from agent_core.types.ledger import (
     SetStepCapDefault,
     StopScope,
 )
+from agent_core.types.model_errors import ModelNotSentError
 from agent_core.types.records import Attempt, AttemptState, Run, RunStatus, Task
 from agent_core.types.safety import (
     ApproverRole,
@@ -85,7 +97,7 @@ from agent_core.types.safety import (
     StopStatus,
 )
 from agent_core.types.tools import ToolEffectClass, ToolRegistration
-from agent_core.types.values import EngineName, EngineVersion, sha256_digest
+from agent_core.types.values import Digest, EngineName, EngineVersion, sha256_digest
 from agent_core_cli import demo
 
 KEY_FILE: Final = "owner.key"
@@ -114,73 +126,100 @@ class Hooks:
     files_wrapper: Callable[[FileOperationPort, Session], FileOperationPort] | None = None
 
 
-# ---------------------------------------------------------------- private files
+# ---------------------------------------------------------------- the home (WP10-R01)
+
+READY_FILE: Final = "home.ready"
+READY_CONTENT: Final = b"agent-core-cli home v1\n"
+MAX_FILE: Final = 4_096
+MAX_SEQ: Final = 2**63 - 1
+_SEQ_TEXT: Final = re.compile(rb"^(0|[1-9][0-9]{0,18})\n$")
+_HEX_KEY: Final = r"^[0-9a-f]{64}$"
 
 
-def _write_private(path: Path, data: bytes) -> None:
-    """A new private file (0600); never follows or replaces an existing entry."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _FILE_FLAGS, 0o600)
-    try:
-        os.write(fd, data)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+class Home:
+    """The home directory, opened once from "/" with the WP-08 checks (trusted
+    ancestors, a private directory of this user). Its files are read and written
+    relative to that verified fd (no path re-resolution); every file is looked at
+    before it is opened (no FIFO or device side effect), must be one link, ours,
+    0600, and is read with a bound enforced while reading."""
 
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        if not path.exists() and not path.is_symlink():
+            raise CliError("HOME_MISSING")
+        try:
+            self.fd = open_private_dir(path.absolute())
+        except (WorkspaceRejectedError, OSError):
+            raise CliError("HOME_UNSAFE") from None
 
-def _read_private(path: Path, limit: int = 4_096) -> bytes:
-    """A private regular file of this user (0600, one link); otherwise refused."""
-    try:
-        fd = os.open(path, os.O_RDONLY | _FILE_FLAGS)
-    except FileNotFoundError:
-        raise CliError("HOME_INCOMPLETE") from None
-    except OSError:
-        raise CliError("HOME_UNSAFE") from None
-    try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_uid != os.geteuid()
-            or info.st_nlink != 1
-            or info.st_size > limit
-        ):
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> Home:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def read(self, name: str, limit: int = MAX_FILE) -> bytes:
+        try:
+            return read_private_file(self.fd, name, limit=limit)
+        except LookupError as exc:
+            if exc.args and exc.args[0] == "MISSING":
+                raise CliError("HOME_INCOMPLETE") from None
+            raise CliError("HOME_UNSAFE") from None
+        except OSError:
+            raise CliError("HOME_UNSAFE") from None
+
+    def create(self, name: str, data: bytes) -> None:
+        write_private_file(self.fd, name, data)
+
+    def replace(self, name: str, data: bytes) -> None:
+        replace_private_file(self.fd, name, data, tag=secrets.token_hex(8))
+
+    def require_ready(self) -> None:
+        """A home whose init did not finish is never opened (and never deleted)."""
+        if self.read(READY_FILE) != READY_CONTENT:
             raise CliError("HOME_UNSAFE")
-        return os.read(fd, limit + 1)
-    finally:
-        os.close(fd)
 
 
-def _replace_private(path: Path, data: bytes) -> None:
-    temp = path.with_name(path.name + ".new")
-    if temp.exists() or temp.is_symlink():
-        temp.unlink()
-    _write_private(temp, data)
-    os.replace(temp, path)
+def _strict_json(data: bytes) -> dict[str, Any]:
+    """One JSON object, no duplicate keys, UTF-8."""
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        keys = [k for k, _ in items]
+        if len(set(keys)) != len(keys):
+            raise ValueError("duplicate key")
+        return dict(items)
+
+    value = json.loads(data.decode("utf-8"), object_pairs_hook=pairs)
+    if not isinstance(value, dict):
+        raise ValueError("not an object")
+    return value
 
 
-def _check_home(home: Path) -> None:
+class _KeyFile(FrozenModel):
+    owner: Annotated[str, StringConstraints(strict=True, pattern=_HEX_KEY)]
+    permit: Annotated[str, StringConstraints(strict=True, pattern=_HEX_KEY)]
+
+
+class _ConfigFile(FrozenModel):
+    version: Literal[1]
+    tenant_id: Annotated[str, StringConstraints(strict=True, max_length=128)]
+    owner_id: Annotated[str, StringConstraints(strict=True, max_length=128)]
+    workspace_ref: Digest
+
+
+def _load_keys(home: Home) -> LedgerKeys:
     try:
-        info = os.lstat(home)
-    except FileNotFoundError:
-        raise CliError("HOME_MISSING") from None
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or stat.S_IMODE(info.st_mode) != 0o700
-        or info.st_uid != os.geteuid()
-    ):
-        raise CliError("HOME_UNSAFE")
-
-
-def _load_keys(home: Path) -> LedgerKeys:
-    try:
-        data = json.loads(_read_private(home / KEY_FILE))
+        data = _KeyFile.model_validate(_strict_json(home.read(KEY_FILE)))
         return LedgerKeys(
-            owner=SecretKey(bytes.fromhex(data["owner"])),
-            permit=SecretKey(bytes.fromhex(data["permit"])),
+            owner=SecretKey(bytes.fromhex(data.owner)),
+            permit=SecretKey(bytes.fromhex(data.permit)),
         )
-    except CliError:
-        raise
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, TypeError, UnicodeDecodeError):  # pydantic's error is a ValueError
         raise CliError("HOME_UNSAFE") from None
 
 
@@ -191,34 +230,53 @@ class HomeConfig:
     workspace_ref: str
 
     @classmethod
-    def load(cls, home: Path) -> HomeConfig:
+    def load(cls, home: Home) -> HomeConfig:
         try:
-            data = json.loads(_read_private(home / CONFIG_FILE))
-            if data.get("version") != 1:
-                raise CliError("HOME_UNSAFE")
+            data = _ConfigFile.model_validate(_strict_json(home.read(CONFIG_FILE)))
             return cls(
-                tenant_id=TenantId(data["tenant_id"]),
-                owner_id=UserId(data["owner_id"]),
-                workspace_ref=str(data["workspace_ref"]),
+                tenant_id=TenantId(data.tenant_id),
+                owner_id=UserId(data.owner_id),
+                workspace_ref=data.workspace_ref,
             )
-        except CliError:
-            raise
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, TypeError, UnicodeDecodeError):
             raise CliError("HOME_UNSAFE") from None
+
+
+def parse_seq(data: bytes) -> int | None:
+    """The saved counter, or None if it is not exactly one decimal in range."""
+    if _SEQ_TEXT.fullmatch(data) is None:
+        return None
+    value = int(data)
+    return value if value <= MAX_SEQ else None
 
 
 class OwnerSequence:
-    """The owner's own record of its last batch number (WP09-R05)."""
+    """The owner's own record of its last batch number (WP09-R05, WP10-R02).
 
-    def __init__(self, home: Path) -> None:
-        self._path = home / SEQ_FILE
+    Saved before each signing (a new temporary file written in full and fsynced,
+    renamed over the old one, the directory fsynced): a crash leaves the old or
+    the new number, never a part. A number above the journal's last applied one
+    is a gap (a crash after saving, or a refused batch) and is fine; a number
+    below it would sign batches the ledger already applied: owner operations
+    stop until the owner looks (never set back or forward by guessing)."""
+
+    def __init__(self, home: Home, last_applied: int | None) -> None:
+        self._home = home
+        self.problem: str | None = None
+        value = parse_seq(home.read(SEQ_FILE, limit=64))
+        if value is None:
+            self.problem = "OWNER_SEQUENCE_INVALID"
+        elif last_applied is not None and value < last_applied:
+            self.problem = "OWNER_SEQUENCE_STALE"
 
     def next(self) -> int:
-        try:
-            current = int(_read_private(self._path).decode("ascii").strip())
-        except (ValueError, UnicodeDecodeError):
-            raise CliError("HOME_UNSAFE") from None
-        _replace_private(self._path, f"{current + 1}\n".encode())
+        if self.problem is not None:
+            raise CliError(self.problem)
+        current = parse_seq(self._home.read(SEQ_FILE, limit=64))
+        if current is None or current >= MAX_SEQ:
+            self.problem = "OWNER_SEQUENCE_INVALID"
+            raise CliError(self.problem)
+        self._home.replace(SEQ_FILE, f"{current + 1}\n".encode())
         return current + 1
 
 
@@ -261,79 +319,83 @@ class AcceptSyntheticEvidence:
 
 
 def init_home(home: Path, *, clock: Clock) -> None:
-    """A new home: keys, config, the work tree, the journal with the owner's price
-    table, policy and the wide caps. Refuses an existing path."""
+    """A new home: keys, counter, config, the work tree, the journal with the
+    owner's price table, policy and wide caps, and last the ready mark. Refuses
+    an existing path. A crash part way leaves a home without the mark, which is
+    never opened and never deleted (the owner looks at it)."""
     if home.exists() or home.is_symlink():
         raise CliError("HOME_EXISTS")
     if not home.parent.is_dir():
         raise CliError("HOME_PARENT_MISSING")
     home.mkdir(mode=0o700)
     home.chmod(0o700)
-    keys = LedgerKeys(
-        owner=SecretKey(secrets.token_bytes(32)), permit=SecretKey(secrets.token_bytes(32))
-    )
-    _write_private(
-        home / KEY_FILE,
-        json.dumps(
-            {"owner": keys.owner.reveal().hex(), "permit": keys.permit.reveal().hex()}
-        ).encode(),
-    )
-    _write_private(home / SEQ_FILE, b"0\n")
-    area = home / AREA_DIR
-    area.mkdir(mode=0o700)
-    area.chmod(0o700)
-    signed = create_synthetic_workspace(
-        area=area,
-        workspace_id=demo.WORKSPACE_ID,
-        files=dict(demo.WORKSPACE_FILES),
-        key=manifest_key(keys.owner),
-        now_ms=clock.now_ms(),
-    )
-    ids = IdGenerator(demo.SITE, clock, OsRandomSource())
-    config = HomeConfig(
-        tenant_id=ids.new(TenantId),
-        owner_id=ids.new(UserId),
-        workspace_ref=manifest_digest(signed.manifest),
-    )
-    _write_private(
-        home / CONFIG_FILE,
-        json.dumps(
-            {
-                "version": 1,
-                "tenant_id": str(config.tenant_id),
-                "owner_id": str(config.owner_id),
-                "workspace_ref": config.workspace_ref,
-            },
-            sort_keys=True,
-        ).encode(),
-    )
-    journal = SqliteJournal.open(
-        home / JOURNAL_FILE, clock=clock, random=OsRandomSource(), keys=keys
-    )
-    try:
-        _, tools = demo.registry()
-        owner = _Owner(OwnerApprovalChannel(keys.owner), OwnerSequence(home))
-        wide = (
-            (BudgetScopeType.TENANT, str(config.tenant_id)),
-            (BudgetScopeType.USER, str(config.owner_id)),
-            (BudgetScopeType.PERIOD, demo.PERIOD),
+    with Home(home) as h:
+        keys = LedgerKeys(
+            owner=SecretKey(secrets.token_bytes(32)), permit=SecretKey(secrets.token_bytes(32))
         )
-        owner.apply(
-            journal,
-            InstallPriceTable(op="install_price_table", table=demo.PRICE_TABLE),
-            InstallPolicy(op="install_policy", policy=policy_for(config, tools)),
-            *(
-                SetBudgetCap(
-                    op="set_budget_cap",
-                    scope_type=kind,
-                    scope_id=scope,
-                    cap=demo.xtu(demo.WIDE_CAP),
-                )
-                for kind, scope in wide
-            ),
+        h.create(
+            KEY_FILE,
+            json.dumps(
+                {"owner": keys.owner.reveal().hex(), "permit": keys.permit.reveal().hex()}
+            ).encode(),
         )
-    finally:
-        journal.close()
+        h.create(SEQ_FILE, b"0\n")
+        area = home / AREA_DIR
+        area.mkdir(mode=0o700)
+        area.chmod(0o700)
+        signed = create_synthetic_workspace(
+            area=area,
+            workspace_id=demo.WORKSPACE_ID,
+            files=dict(demo.WORKSPACE_FILES),
+            key=manifest_key(keys.owner),
+            now_ms=clock.now_ms(),
+        )
+        ids = IdGenerator(demo.SITE, clock, OsRandomSource())
+        config = HomeConfig(
+            tenant_id=ids.new(TenantId),
+            owner_id=ids.new(UserId),
+            workspace_ref=manifest_digest(signed.manifest),
+        )
+        h.create(
+            CONFIG_FILE,
+            json.dumps(
+                {
+                    "version": 1,
+                    "tenant_id": str(config.tenant_id),
+                    "owner_id": str(config.owner_id),
+                    "workspace_ref": config.workspace_ref,
+                },
+                sort_keys=True,
+            ).encode(),
+        )
+        journal = SqliteJournal.open(
+            home / JOURNAL_FILE, clock=clock, random=OsRandomSource(), keys=keys
+        )
+        try:
+            _, tools = demo.registry()
+            owner = _Owner(OwnerApprovalChannel(keys.owner), OwnerSequence(h, None))
+            wide = (
+                (BudgetScopeType.TENANT, str(config.tenant_id)),
+                (BudgetScopeType.USER, str(config.owner_id)),
+                (BudgetScopeType.PERIOD, demo.PERIOD),
+            )
+            owner.apply(
+                journal,
+                InstallPriceTable(op="install_price_table", table=demo.PRICE_TABLE),
+                InstallPolicy(op="install_policy", policy=policy_for(config, tools)),
+                *(
+                    SetBudgetCap(
+                        op="set_budget_cap",
+                        scope_type=kind,
+                        scope_id=scope,
+                        cap=demo.xtu(demo.WIDE_CAP),
+                    )
+                    for kind, scope in wide
+                ),
+            )
+        finally:
+            journal.close()
+        h.create(READY_FILE, READY_CONTENT)
 
 
 class _Owner:
@@ -376,6 +438,7 @@ class Session:
     registry: ToolRegistry
     tools: tuple[ToolRegistration, ...]
     hooks: Hooks
+    home_dir: Home | None = None
     runs: dict[RunId, _RunEntry] = field(default_factory=dict)
     current: RunId | None = None
     closed: bool = False
@@ -383,9 +446,16 @@ class Session:
     # -------------------------------------------------------- lifecycle
 
     def close(self) -> None:
-        if not self.closed:
-            self.closed = True
+        """Close the journal (releasing the lock) and the home fd. A failure of the
+        first does not leave the second open."""
+        if self.closed:
+            return
+        self.closed = True
+        try:
             self.journal.close()
+        finally:
+            if self.home_dir is not None:
+                self.home_dir.close()
 
     # -------------------------------------------------------- owner operations
 
@@ -465,13 +535,15 @@ class Session:
             return entry.loop
         # A Run of an earlier session: a loop without its transcript, which can
         # only report or stop it (WP15-R01: never continued as new).
+        # It plans nothing (no task profile) and has no model: it never stands in
+        # for the earlier session's transcript or script (WP10-R04).
         task = self.sm.state.tasks[self.sm.state.runs[run_id].task_id]
-        loop = self._make_loop(None, task, demo.ScriptedFakeModel([]))
+        loop = self._make_loop(None, task, _NoModel(), plan=False)
         self.runs[run_id] = _RunEntry(loop, "earlier")
         return loop
 
     def _make_loop(
-        self, task_demo: demo.DemoTask | None, task: Task, model: ModelPort
+        self, task_demo: demo.DemoTask | None, task: Task, model: ModelPort, *, plan: bool = True
     ) -> AgentLoop:
         if self.hooks.model_wrapper is not None:
             model = self.hooks.model_wrapper(model)
@@ -490,7 +562,7 @@ class Session:
             rules=RuleCatalog(rules=()),
             texts=texts,
             criteria=criteria,
-            tasks=(TaskProfile(goal_ref=task.goal_ref, complexity="simple"),),
+            tasks=(TaskProfile(goal_ref=task.goal_ref, complexity="simple"),) if plan else (),
             limits=demo.LIMITS,
             cost_cap_micro=demo.COST_CAP_PER_ACTION,
             user_input=demo.REQUEST,
@@ -645,6 +717,79 @@ class Session:
         return loop.run(run_id, approval_id=approval.approval_id)
 
 
+class _NoModel:
+    """The model of a loop for a Run of an earlier session: never sends anything."""
+
+    def complete(self, request: Any) -> Any:
+        raise ModelNotSentError("no model for a Run of an earlier session")
+
+
+@dataclass
+class Snapshot:
+    """A read-only view of the home's Runtime (WP10-R03): the journal opened
+    read-only under the OS lock, the runtime state rebuilt from it. No owner
+    epoch, no revocation, no recovery, no loop, no gate."""
+
+    journal: SqliteJournal
+    sm: RuntimeStateMachine
+    config: HomeConfig
+
+    def continues(self, run_id: RunId) -> bool:
+        return False
+
+    def pending(self) -> list[Attempt]:
+        return [
+            a for a in self.sm.state.attempts.values() if a.state is AttemptState.APPROVAL_PENDING
+        ]
+
+    def close(self) -> None:
+        self.journal.close()
+
+
+def _checked_home(home: Path) -> tuple[Home, LedgerKeys, HomeConfig]:
+    h = Home(home)
+    try:
+        h.require_ready()
+        keys = _load_keys(h)
+        config = HomeConfig.load(h)
+        h.read(SEQ_FILE, limit=64)  # present and safe (its value is checked by the owner path)
+    except BaseException:
+        h.close()
+        raise
+    return h, keys, config
+
+
+def _load_state(
+    journal: SqliteJournal, clock: Clock, config: HomeConfig
+) -> tuple[IdGenerator, RuntimeStateMachine]:
+    ids = IdGenerator(demo.SITE, clock, OsRandomSource())
+    sm = RuntimeStateMachine.load(
+        journal,
+        ids=ids,
+        clock=clock,
+        verifier=AcceptSyntheticEvidence(),
+        tenant_id=config.tenant_id,
+        engine=ENGINE,
+        policy_version=demo.POLICY_VERSION,
+    )
+    return ids, sm
+
+
+def open_snapshot(home: Path, *, clock: Clock) -> Snapshot:
+    """Read the home's state without taking ownership (``status``)."""
+    h, keys, config = _checked_home(home)
+    try:
+        journal = SqliteJournal.open_read_only(home / JOURNAL_FILE, clock=clock, keys=keys)
+    finally:
+        h.close()
+    try:
+        _, sm = _load_state(journal, clock, config)
+    except BaseException:
+        journal.close()
+        raise
+    return Snapshot(journal=journal, sm=sm, config=config)
+
+
 def open_session(
     home: Path,
     *,
@@ -652,25 +797,18 @@ def open_session(
     monotonic: Callable[[], int],
     hooks: Hooks | None = None,
 ) -> Session:
-    """Open the home's Runtime (the journal takes the OS lock)."""
-    _check_home(home)
-    keys = _load_keys(home)
-    config = HomeConfig.load(home)
-    sequence = OwnerSequence(home)
-    journal = SqliteJournal.open(
-        home / JOURNAL_FILE, clock=clock, random=OsRandomSource(), keys=keys
-    )
+    """Open the home's Runtime: the journal takes the OS lock and a new owner epoch."""
+    h, keys, config = _checked_home(home)
     try:
-        ids = IdGenerator(demo.SITE, clock, OsRandomSource())
-        sm = RuntimeStateMachine.load(
-            journal,
-            ids=ids,
-            clock=clock,
-            verifier=AcceptSyntheticEvidence(),
-            tenant_id=config.tenant_id,
-            engine=ENGINE,
-            policy_version=demo.POLICY_VERSION,
+        journal = SqliteJournal.open(
+            home / JOURNAL_FILE, clock=clock, random=OsRandomSource(), keys=keys
         )
+    except BaseException:
+        h.close()
+        raise
+    try:
+        sequence = OwnerSequence(h, journal.last_owner_seq())
+        ids, sm = _load_state(journal, clock, config)
         gate = SyntheticExecutionGate(
             runtime=sm,
             ledger=journal,
@@ -679,7 +817,9 @@ def open_session(
             clock=clock,
         )
         broker = SyntheticFileBroker(
-            area=home / AREA_DIR, workspace_id=demo.WORKSPACE_ID, key=manifest_key(keys.owner)
+            area=home.absolute() / AREA_DIR,
+            workspace_id=demo.WORKSPACE_ID,
+            key=manifest_key(keys.owner),
         )
         registry, tools = demo.registry()
         session = Session(
@@ -696,10 +836,12 @@ def open_session(
             registry=registry,
             tools=tools,
             hooks=hooks or Hooks(),
+            home_dir=h,
         )
         if session.hooks.files_wrapper is not None:
             session.files = session.hooks.files_wrapper(broker, session)
         return session
     except BaseException:
+        h.close()
         journal.close()
         raise

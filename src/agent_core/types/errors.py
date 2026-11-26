@@ -109,6 +109,13 @@ class JournalError(AgentCoreError):
     fatal = True
 
 
+class JournalReadOnlyError(JournalError):
+    """A write on a journal opened read-only (WP10-R03). Nothing was written."""
+
+    code = "JOURNAL_READ_ONLY"
+    fatal = False
+
+
 class JournalArgumentError(JournalError, ValueError):
     """A caller passed an invalid argument. Nothing was read or written."""
 
@@ -434,6 +441,14 @@ class SafetyError(AgentCoreError):
             raise ValueError("a refusal names at least one reason")
         super().__init__(", ".join(reasons))
         self.reasons: tuple[str, ...] = tuple(reasons)
+
+
+class CompletionRefusedError(SafetyError):
+    """WP15-R06: the completion transaction refused a COMPLETED Run: its evidence
+    does not name verification reads that ran for this Run under the current
+    policy, grant and access epoch, a cost is not settled, or a stop holds."""
+
+    code = "COMPLETION_REFUSED"
 
 
 class ActionDescriptorError(SafetyError):

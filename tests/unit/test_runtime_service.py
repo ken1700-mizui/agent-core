@@ -22,7 +22,7 @@ from agent_core.types.records import AttemptState, RunStatus, StepStatus, TaskSt
 from agent_core.types.serialization import dump_json
 from agent_core.types.transitions import RUNTIME_EVENT_SCHEMA_VERSION, RUNTIME_EVENT_TYPE
 from support import builders as b
-from support import ledger_world as lw
+from support import loop_world as lp
 from support import runtime_world as w
 from support.fakes import InMemoryJournal
 
@@ -119,9 +119,9 @@ def test_rebuild_reproduces_the_live_state_deterministically() -> None:
 def test_rebuild_from_sqlite_after_restart(tmp_path: Path) -> None:
     # Driven through the real budget ledger (WP-09): SQLite refuses authorized
     # transitions without their ledger operations.
-    setup = lw.setup(tmp_path)
+    # A Run completed by the loop with real verification reads (WP15-R06).
+    setup = lp.completed_world(tmp_path).st
     path, journal, sm = setup.path, setup.journal, setup.sm
-    lw.completed_scenario(setup)
     live = sm.state
     journal.close()
     reopened = SqliteJournal.open(path, clock=SystemClock(), random=OsRandomSource())
@@ -249,10 +249,9 @@ def test_version_1_events_cannot_carry_a_payload() -> None:
 
 
 def test_runtime_events_survive_the_sqlite_journal_verification(tmp_path: Path) -> None:
-    setup = lw.setup(tmp_path)
+    setup = lp.completed_world(tmp_path).st
     path, journal = setup.path, setup.journal
     try:
-        lw.completed_scenario(setup)
         assert journal.verify_tenant(b.TENANT) is not None
     finally:
         journal.close()

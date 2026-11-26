@@ -17,6 +17,7 @@ import pytest
 from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
 from agent_core.types.cost import BudgetScopeType, ReservationState
 from agent_core.types.errors import (
+    CompletionRefusedError,
     CostError,
     IllegalTransitionError,
     OwnerAuthorizationError,
@@ -304,10 +305,17 @@ def test_run_and_task_cannot_complete_with_unsettled_costs(st: Any) -> None:
     with pytest.raises(CostError, match="UNSETTLED_COST"):
         st.sm.set_run_status(verifying, RunStatus.COMPLETED, w.passing_verification(the_task))
     lw.report_with(st, done, gate.execution_report(done, _ok(None)))
-    st.sm.set_run_status(
-        st.sm.state.runs[run.run_id], RunStatus.COMPLETED, w.passing_verification(the_task)
-    )
-    assert st.sm.set_task_status(st.sm.state.tasks[the_task.task_id], TaskStatus.COMPLETED)
+    # WP15-R06: settled costs alone do not complete the Run: its evidence must name
+    # verification reads that ran for it (this made-up evidence names none).
+    with pytest.raises(CompletionRefusedError, match="NO_VERIFIED_READS"):
+        st.sm.set_run_status(
+            st.sm.state.runs[run.run_id], RunStatus.COMPLETED, w.passing_verification(the_task)
+        )
+    assert st.sm.state.runs[run.run_id].status is RunStatus.VERIFYING
+    # Nor the Task: its last Run did not complete. The positive path, with real
+    # verification reads, is test_wp15_r06::test_a_verified_run_lets_its_task_complete.
+    with pytest.raises(TransitionPreconditionError):
+        st.sm.set_task_status(st.sm.state.tasks[the_task.task_id], TaskStatus.COMPLETED)
 
 
 # ---------------------------------------------------------------- WP09-R05: stop, cancel, time

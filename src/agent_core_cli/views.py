@@ -15,11 +15,17 @@ from typing import Any, Final
 from agent_core.runtime.agent_loop import LoopOutcome
 from agent_core.types.cost import BudgetScopeType, CounterKind, ReservationState
 from agent_core.types.ids import RunId
-from agent_core.types.records import Attempt
+from agent_core.types.records import Attempt, RunStatus, TaskStatus
 from agent_core_cli import render
-from agent_core_cli.environment import Session
+from agent_core_cli.environment import Session, Snapshot
+
+View = Session | Snapshot
 
 UNIT: Final = "XTU (synthetic)"
+TERMINAL_RUN: Final = frozenset(
+    {RunStatus.COMPLETED, RunStatus.CANCELLED, RunStatus.FAILED, RunStatus.ABORTED_SAFETY}
+)
+CLOSED_TASK: Final = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED})
 REAL_API_COST: Final = "none"
 _SETTLED: Final = frozenset(
     {
@@ -48,7 +54,7 @@ def outcome(run_id: RunId, result: LoopOutcome) -> dict[str, Any]:
     }
 
 
-def approval_screen(session: Session, attempt: Attempt) -> dict[str, Any]:
+def approval_screen(session: View, attempt: Attempt) -> dict[str, Any]:
     descriptor = session.journal.recorded_descriptor(str(attempt.attempt_id))
     run_id = session.sm.state.steps[attempt.step_id].run_id
     if descriptor is None:  # never for a waiting Attempt; shown as unknown, not guessed
@@ -92,16 +98,16 @@ def approval_screen(session: Session, attempt: Attempt) -> dict[str, Any]:
     }
 
 
-def pending(session: Session) -> dict[str, Any]:
+def pending(session: View) -> dict[str, Any]:
     return {"items": [approval_screen(session, a) for a in session.pending()]}
 
 
-def _count(session: Session, run_id: RunId, counter: CounterKind) -> int | None:
+def _count(session: View, run_id: RunId, counter: CounterKind) -> int | None:
     view = session.journal.counter(BudgetScopeType.RUN, str(run_id), counter)
     return None if view is None else view.used
 
 
-def status(session: Session) -> dict[str, Any]:
+def status(session: View) -> dict[str, Any]:
     state = session.sm.state
     tasks = []
     for task in state.tasks.values():
@@ -117,13 +123,23 @@ def status(session: Session) -> dict[str, Any]:
                     "ledger_model_calls": _count(session, run.run_id, CounterKind.MODEL_CALLS),
                     "ledger_tool_calls": _count(session, run.run_id, CounterKind.TOOL_CALLS),
                     "resumable": session.continues(run.run_id),
+                    # A Run's end is its own; a Task is closed only by its own
+                    # transition (Phase 1's loop never closes a Task).
+                    "terminal": run.status in TERMINAL_RUN,
                 }
             )
-        tasks.append({"task_id": str(task.task_id), "status": task.status.value, "runs": runs})
+        tasks.append(
+            {
+                "task_id": str(task.task_id),
+                "status": task.status.value,
+                "closed": task.status in CLOSED_TASK,
+                "runs": runs,
+            }
+        )
     return {"tasks": tasks, "unit": UNIT, "real_api_cost": REAL_API_COST}
 
 
-def _attempts(session: Session, run_id: RunId) -> list[tuple[Any, Attempt]]:
+def _attempts(session: View, run_id: RunId) -> list[tuple[Any, Attempt]]:
     state = session.sm.state
     return [
         (state.steps[s], state.attempts[a])
@@ -132,13 +148,13 @@ def _attempts(session: Session, run_id: RunId) -> list[tuple[Any, Attempt]]:
     ]
 
 
-def _reservation(session: Session, attempt: Attempt) -> Any:
+def _reservation(session: View, attempt: Attempt) -> Any:
     if attempt.reservation_id is None:
         return None
     return session.journal.reservation(str(attempt.reservation_id))
 
 
-def steps(session: Session, run_id: RunId) -> dict[str, Any]:
+def steps(session: View, run_id: RunId) -> dict[str, Any]:
     state = session.sm.state
     out = []
     for index, step_id in enumerate(state.run_steps.get(run_id, ()), start=1):
@@ -168,7 +184,7 @@ def steps(session: Session, run_id: RunId) -> dict[str, Any]:
     return {"run_id": str(run_id), "steps": out}
 
 
-def budget(session: Session, run_id: RunId) -> dict[str, Any]:
+def budget(session: View, run_id: RunId) -> dict[str, Any]:
     run = session.sm.state.runs[run_id]
     scopes = []
     for kind, scope_id in (
@@ -212,7 +228,7 @@ def budget(session: Session, run_id: RunId) -> dict[str, Any]:
     }
 
 
-def stops(session: Session) -> dict[str, Any]:
+def stops(session: View) -> dict[str, Any]:
     return {
         "items": [
             {

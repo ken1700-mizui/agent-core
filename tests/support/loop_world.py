@@ -221,3 +221,17 @@ def approve_pending(wd: World, outcome: Any) -> Any:
     """The owner approves the waiting action (exact action hash), then the loop resumes."""
     approval_id = lw.record_approval_for(wd.st, outcome.pending_action_hash)
     return wd.loop.run(wd.run.run_id, approval_id=approval_id)
+
+
+def completed_world(tmp_path: Path) -> World:
+    """A Task whose Run the loop completed with real verification reads (WP15-R06),
+    and the Task completed after it: every entity kind, through the real paths."""
+    from agent_core.types.records import RunStatus, TaskStatus
+
+    wd = world(tmp_path, [write(), done()])
+    outcome = wd.loop.run(wd.run.run_id)
+    outcome = approve_pending(wd, outcome)
+    if outcome.status is not RunStatus.COMPLETED:
+        raise AssertionError(f"the scenario did not complete: {outcome.reason}")
+    wd.st.sm.set_task_status(wd.st.sm.state.tasks[wd.task.task_id], TaskStatus.COMPLETED)
+    return wd

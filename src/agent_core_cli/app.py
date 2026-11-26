@@ -31,11 +31,19 @@ from typing import Any, Final, NoReturn, TextIO
 
 from agent_core.adapters.system import SystemClock
 from agent_core.ports.clock import Clock
-from agent_core.types.errors import RuntimeLockHeldError
+from agent_core.types.errors import JournalError, RuntimeLockHeldError
 from agent_core.types.ids import RunId
 from agent_core.types.records import RunStatus
 from agent_core_cli import demo, views
-from agent_core_cli.environment import CliError, Hooks, Session, init_home, open_session
+from agent_core_cli.environment import (
+    CliError,
+    Hooks,
+    Session,
+    Snapshot,
+    init_home,
+    open_session,
+    open_snapshot,
+)
 from agent_core_cli.render import Printer, clean
 
 __all__ = ["Hooks", "main"]
@@ -132,26 +140,66 @@ def main(
             init_home(home, clock=the_clock)
             stdout.write("initialized a synthetic home\n")
             return EXIT_OK
-        session = open_session(home, clock=the_clock, monotonic=the_monotonic, hooks=hooks)
-    except CliError as refused:
-        stderr.write(f"error: {refused.code}\n")
-        return EXIT_FAILURE
-    except RuntimeLockHeldError:
-        stderr.write("error: RUNTIME_LOCKED\n")
-        return EXIT_LOCKED
-    except KeyboardInterrupt:
-        return EXIT_INTERRUPTED
-    except Exception as exc:  # noqa: BLE001 (reported by a fixed code, never a message)
-        stderr.write(f"error: INTERNAL_ERROR ({clean(type(exc).__name__)})\n")
-        return EXIT_ERROR
+        if args.command == "status":
+            opened: Session | Snapshot = open_snapshot(home, clock=the_clock)
+        else:
+            opened = open_session(home, clock=the_clock, monotonic=the_monotonic, hooks=hooks)
+    except BaseException as exc:  # noqa: BLE001 (every failure has a fixed code)
+        return _refused(stderr, exc)
     printer = Printer(stdout, as_json=bool(args.json))
     try:
-        if args.command == "status":
-            printer.event("status", **views.status(session))
-            return EXIT_OK
-        return _Shell(session, printer, reader, stdout).run()
-    finally:
-        session.close()
+        if isinstance(opened, Snapshot):
+            printer.event("status", **views.status(opened))
+            code = EXIT_OK
+        else:
+            code = _Shell(opened, printer, reader, stdout).run()
+    except BaseException as exc:  # noqa: BLE001 (reported by a fixed code; closed below)
+        code = _refused(stderr, exc)
+        _close(opened, stderr, original=exc)
+        return code
+    return _close(opened, stderr, original=None) or code
+
+
+def _refused(stderr: TextIO, exc: BaseException) -> int:
+    """A fixed code for every failure; never a free message."""
+    if isinstance(exc, KeyboardInterrupt):
+        return EXIT_INTERRUPTED
+    if isinstance(exc, CliError):
+        stderr.write(f"error: {exc.code}\n")
+        return EXIT_FAILURE
+    if isinstance(exc, RuntimeLockHeldError):
+        stderr.write("error: RUNTIME_LOCKED\n")
+        return EXIT_LOCKED
+    if isinstance(exc, JournalError):
+        stderr.write(f"error: JOURNAL_UNAVAILABLE ({clean(type(exc).__name__)})\n")
+        return EXIT_ERROR
+    stderr.write(f"error: INTERNAL_ERROR ({clean(type(exc).__name__)})\n")
+    return EXIT_ERROR
+
+
+def _close(opened: Session | Snapshot, stderr: TextIO, *, original: BaseException | None) -> int:
+    """Close; a failure here never hides an earlier one (it is only noted)."""
+    try:
+        opened.close()
+    except Exception as exc:  # noqa: BLE001 (noted with a fixed code)
+        stderr.write(f"note: CLOSE_FAILED ({clean(type(exc).__name__)})\n")
+        return EXIT_ERROR if original is None else 0
+    return 0
+
+
+MAX_LINE: Final = 4_096
+
+
+def _bounded_stdin_line() -> str:
+    """One line of at most ``MAX_LINE`` characters; a longer line is read to its
+    end in bounded pieces and returned as an over-long marker (never kept)."""
+    line = sys.stdin.readline(MAX_LINE + 1)
+    if len(line) <= MAX_LINE or line.endswith("\n"):
+        return line
+    while True:
+        rest = sys.stdin.readline(MAX_LINE)
+        if not rest or rest.endswith("\n"):
+            return "x" * (MAX_LINE + 1)
 
 
 class _Shell:
@@ -165,7 +213,7 @@ class _Shell:
         self._session = session
         self._printer = printer
         self._interactive = reader is None and sys.stdin.isatty()
-        self._read = reader if reader is not None else sys.stdin.readline
+        self._read = reader if reader is not None else _bounded_stdin_line
         self._stdout = stdout
         self._acted: RunId | None = None
 
@@ -179,6 +227,10 @@ class _Shell:
                 line = self._read()
                 if line == "":
                     break  # EOF: a normal end; nothing waiting is approved
+                if len(line) > MAX_LINE:
+                    # Never parsed: bounded memory and time (WP10-R04).
+                    self._printer.event("error", code="USAGE_LINE_TOO_LONG", detail=None)
+                    continue
                 code = self._line(line)
         except KeyboardInterrupt:
             code = EXIT_INTERRUPTED

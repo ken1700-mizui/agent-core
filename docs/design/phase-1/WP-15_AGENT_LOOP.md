@@ -293,3 +293,19 @@ spent: 180 + 140 + 180 + 140 = 640 (model only; the file tools cost 0)
 
 1866 件から 1896 件（+30）。8種類の検査が、すべて成功した。`uv.lock` は変えていない。
 
+## 16. 限定修正 WP15-R06：最終の検証と完了
+
+起点：`88ab790`。回帰の試験 `tests/unit/test_wp15_r06.py`（10件）を先に書いた（`CompletionRefusedError` がなく、収集の時点で失敗）。
+
+- **協調する書き込み元との排他：** 確認の読み取りから完了の記録までの間、実行のゲート（この Runtime のツールの呼び出しの唯一の PEP）が「書き込みの保留」（`verification_hold`）に入り、変更を伴う操作（書き込みのファイル操作、READ_ONLY でないツール）を `GATE_BUSY` で拒否する。読み取りは続く。再入はできない。同じホームに Runtime は1つだけ（OS のロック）なので、協調する書き込み元はすべてこのゲートを通る。
+- **完了の記録と検証した対象の対応：** `VerificationEvidence` に `verified_reads`（確認の読み取りの Attempt）を加えた。
+- **Journal の完了のトランザクションでの強制：** Run が COMPLETED になるイベントの追記と同じトランザクションの中で、台帳（`sqlite_ledger._completion_basis`）が次を確かめ、満たさなければ `CompletionRefusedError` で全体を取り消す。
+  - `verified_reads` が空でない。どれもこの Run の、完了した Attempt。記録された記述子が、READ_ONLY のツールで、対象がすべて READ のファイルの読み取り（変更なし）。予約は使用量の報告済みで、費用が確定している。
+  - 読み取りの記述子の policy_version とアクセスの epoch が、今のものと同じ。
+  - Run の許可がある、期限内（台帳の時刻で）、policy_version が今のポリシーと同じ、許可のときのアクセスの epoch が今と同じ（失効していない）。
+  - Run、テナント、全体のどれも停止していない。
+  - 費用の確定していない予約がない（既存の `UNSETTLED_COST` の検査）。
+- 作っただけの `VerificationEvidence`（読み取りを指さない、または書き込みの Attempt を指す）では完了できない（試験で確かめた）。ループは、この拒否を `ABORTED_SAFETY`（`COMPLETION_REFUSED`）にする。
+- 既存の試験の変更：`test_wp09_execution.py` の1件は、作っただけの証拠で Run を完了させていた。それが拒否されることを確かめる形に変え、Task の完了の成功の経路は、本物の検証の読み取りを伴う新しい試験 `test_a_verified_run_lets_its_task_complete` に移した。`test_runtime_service.py` の2件（Rebuild と Journal の検証）は、作っただけの証拠の補助関数 `completed_scenario` の代わりに、ループが本物の読み取りで完了させた Run（`loop_world.completed_world`）を使うようにした。
+- **ADR-0008 の限界は変えない：** 協調しない書き込み元（このゲートを通らない別のプロセス、同じユーザーの直接の書き込み）が、最後の読み取りと完了の記録の間にファイルを変えることは防げない。
+

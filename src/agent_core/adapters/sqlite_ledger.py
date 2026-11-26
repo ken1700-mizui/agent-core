@@ -62,6 +62,7 @@ from agent_core.types.errors import (
     BudgetBlockedError,
     BudgetCapMissingError,
     BudgetExceededError,
+    CompletionRefusedError,
     CostBasisMissingError,
     CounterCapExceededError,
     DuplicateUsageReportError,
@@ -142,7 +143,7 @@ from agent_core.types.safety import (
     ToolCostBasis,
 )
 from agent_core.types.serialization import dump_json
-from agent_core.types.tools import ToolRegistration
+from agent_core.types.tools import ResourceAccess, ToolEffectClass, ToolRegistration
 from agent_core.types.transitions import (
     AbortEvidence,
     AttemptTransition,
@@ -2514,6 +2515,7 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
             else:
                 if run.status.value == "COMPLETED":
                     _unsettled(cur, "run_id", str(run.run_id))
+                    _completion_basis(cur, str(run.run_id), tenant, transition.evidence, now_ms)
                 cur.execute(
                     "UPDATE rt_runs SET status = ?, cancel_requested = ? WHERE run_id = ?",
                     (run.status.value, int(run.cancel_requested), str(run.run_id)),
@@ -2597,6 +2599,69 @@ def _unsettled(cur: sqlite3.Cursor, column: str, scope_id: str) -> None:
     ).fetchone()
     if found is not None:
         raise ReservationStateError("UNSETTLED_COST")
+
+
+def _completion_basis(
+    cur: sqlite3.Cursor, run_id: str, tenant: str, evidence: object, now_ms: int
+) -> None:
+    """WP15-R06: a COMPLETED Run, in the same transaction as its event, only if its
+    evidence names verification reads that ran for this Run (completed, read-only
+    file reads, cost final) under the current policy, Run grant (not expired) and
+    access epoch, with no stop of the Run, the tenant or everything."""
+    reasons: list[str] = []
+    reads = getattr(evidence, "verified_reads", ())
+    if not reads:
+        reasons.append("NO_VERIFIED_READS")
+    stopped = cur.execute(
+        "SELECT 1 FROM stop_state WHERE status = ? AND ((scope_type = 'RUN' AND scope_id = ?) "
+        "OR (scope_type = 'TENANT' AND scope_id = ?) OR scope_type = 'GLOBAL') LIMIT 1",
+        (StopStatus.STOPPED.value, run_id, tenant),
+    ).fetchone()
+    if stopped is not None:
+        reasons.append("STOPPED")
+    grant, policy = _grant(cur, run_id), _policy(cur, tenant)
+    epoch = _access_epoch(cur, tenant)
+    if grant is None or policy is None:
+        reasons.append("GRANT_MISSING")
+    else:
+        if now_ms >= grant.expires_at_ms:
+            reasons.append("GRANT_EXPIRED")
+        if grant.policy_version != policy.policy_version:
+            reasons.append("POLICY_CHANGED")
+        if grant.access_epoch_at_grant != epoch:
+            reasons.append("ACCESS_REVOKED")
+    for attempt_id in reads:
+        row = cur.execute(
+            "SELECT a.state, s.run_id FROM rt_attempts a JOIN rt_steps s ON s.step_id = a.step_id "
+            "WHERE a.attempt_id = ?",
+            (str(attempt_id),),
+        ).fetchone()
+        found = cur.execute(
+            "SELECT descriptor FROM decisions WHERE attempt_id = ?", (str(attempt_id),)
+        ).fetchone()
+        reservation = cur.execute(
+            "SELECT state, spent_known FROM reservations WHERE attempt_id = ?", (str(attempt_id),)
+        ).fetchone()
+        if row is None or row[0] != "COMPLETED" or row[1] != run_id or found is None:
+            reasons.append("READ_NOT_OF_THIS_RUN")
+            continue
+        descriptor = ActionDescriptor.model_validate_json(found[0])
+        if (
+            descriptor.kind is not ActionKind.TOOL_CALL
+            or descriptor.effect_class is not ToolEffectClass.READ_ONLY
+            or descriptor.apply_change is not None
+            or not descriptor.target_resources
+            or any(r.access is not ResourceAccess.READ for r in descriptor.target_resources)
+        ):
+            reasons.append("NOT_A_VERIFICATION_READ")
+        if policy is not None and (
+            descriptor.policy_version != policy.policy_version or descriptor.access_epoch != epoch
+        ):
+            reasons.append("READ_UNDER_OLD_AUTHORITY")
+        if reservation is None or reservation[0] != R.USAGE_REPORTED.value or reservation[1] != 1:
+            reasons.append("READ_COST_NOT_FINAL")
+    if reasons:
+        raise CompletionRefusedError(*dict.fromkeys(reasons))
 
 
 def _stop_run(cur: sqlite3.Cursor, run_id: str, now_ms: int) -> None:

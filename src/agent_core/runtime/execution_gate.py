@@ -73,7 +73,7 @@ from agent_core.types.safety import (
     Receipt,
     ReceiptState,
 )
-from agent_core.types.tools import ResourceAccess, ToolRegistration
+from agent_core.types.tools import ResourceAccess, ToolEffectClass, ToolRegistration
 from agent_core.types.transitions import (
     AbortEvidence,
     AbortReason,
@@ -125,12 +125,37 @@ class SyntheticExecutionGate:
         self._usage_events = 0
         # WP-08 tickets: at most one open, inside the running callback.
         self._ticket_lock = threading.Lock()
+        self._writes_held = False
         self._open: _OpenTicket | None = None
         self._issued: weakref.WeakSet[ExecutionTicket] = weakref.WeakSet()
 
     @property
     def pep_instance_id(self) -> PepInstanceId:
         return self._pep
+
+    # ------------------------------------------------------------ the verification hold
+
+    @property
+    def writes_held(self) -> bool:
+        return self._writes_held
+
+    @contextmanager
+    def verification_hold(self) -> Iterator[None]:
+        """WP15-R06: while held, this gate (the Runtime's one PEP for tool calls)
+        refuses every operation that changes something, so no cooperating writer
+        can change the files between the final verification reads and the
+        completion record. Reads go on. Not reentrant."""
+        if self._writes_held:
+            raise PermitRejectedError(PermitReason.GATE_BUSY)
+        self._writes_held = True
+        try:
+            yield
+        finally:
+            self._writes_held = False
+
+    def refuse_write_while_held(self) -> None:
+        if self._writes_held:
+            raise PermitRejectedError(PermitReason.GATE_BUSY)
 
     @contextmanager
     def _exclusive(self) -> Iterator[None]:
@@ -239,6 +264,11 @@ class SyntheticExecutionGate:
         file operations (``execute_file``)."""
         with self._exclusive():
             self._refuse_file_operation(attempt)
+            if registration is not None and registration.manifest.effect_class not in (
+                ToolEffectClass.READ_ONLY,
+                ToolEffectClass.MODEL_CALL,
+            ):
+                self.refuse_write_while_held()
             claimed = self._claim(attempt, content, registration)
             started, authorization = self._start(claimed)
             try:
@@ -271,6 +301,8 @@ class SyntheticExecutionGate:
                 raise PermitRejectedError(PermitReason.FILE_OPERATION_NEEDS_BROKER)
             if (descriptor.apply_change is not None) != (write_content is not None):
                 raise PermitRejectedError(PermitReason.FILE_OPERATION_NEEDS_BROKER)
+            if write_content is not None:
+                self.refuse_write_while_held()
             claimed = self._claim(attempt, content, registration)
             started, authorization = self._start(claimed)
             try:

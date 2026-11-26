@@ -910,3 +910,70 @@ def create_synthetic_workspace(
             os.close(root_fd)
     finally:
         os.close(area_fd)
+
+
+# ================================================================ composition-root private files
+
+# WP10-R01: the composition root's own private files (its keys and settings) are
+# read with the same checks as the managed area: the directory is reached from
+# "/" one name at a time (trusted ancestors, a private last directory), and a file
+# is looked at with O_PATH before it is opened (no FIFO or device side effect),
+# must be one link, ours, on the same device, and is read with a bound enforced
+# while reading.
+
+
+def open_private_dir(path: Path | str) -> int:
+    """The fd of a private directory (0700-like, ours) below trusted ancestors.
+    Raises ``WorkspaceRejectedError("AREA_UNSAFE")`` otherwise."""
+    _require_safe_resolution()
+    try:
+        normal = _normal_area(path)
+    except ValueError:
+        raise WorkspaceRejectedError("AREA_UNSAFE") from None
+    return _open_area(normal)
+
+
+def read_private_file(dir_fd: int, name: str, *, limit: int, mode: int = 0o600) -> bytes:
+    """The bytes of the regular file ``name`` directly in ``dir_fd``: one link,
+    ours, exactly ``mode``, on the directory's device, at most ``limit`` bytes
+    (also while reading). Raises ``LookupError`` with a reason otherwise."""
+    if "/" in name or name in ("", ".", ".."):
+        raise LookupError("UNSAFE")
+    device = os.fstat(dir_fd).st_dev
+    fd, info = _open_regular(dir_fd, name, device=device, limit=limit)
+    try:
+        if stat.S_IMODE(info.st_mode) != mode:
+            raise LookupError("UNSAFE")
+        return _read_bounded(fd, limit)
+    finally:
+        os.close(fd)
+
+
+def write_private_file(dir_fd: int, name: str, data: bytes, *, mode: int = 0o600) -> None:
+    """A new file ``name`` in ``dir_fd`` holding ``data`` (written in full and
+    fsynced), then the directory fsynced. Never follows or replaces an entry."""
+    if "/" in name or name in ("", ".", ".."):
+        raise LookupError("UNSAFE")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(name, flags, mode, dir_fd=dir_fd)
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.fsync(dir_fd)
+
+
+def replace_private_file(dir_fd: int, name: str, data: bytes, *, tag: str) -> None:
+    """Atomically replace ``name`` in ``dir_fd``: a new temporary file (unique
+    ``tag``, written in full and fsynced), renamed over ``name``, then the
+    directory fsynced. A crash leaves the old file or the new one, never a part;
+    a left temporary file is never taken for the saved one."""
+    temp = f"{name}.tmp-{tag}"
+    write_private_file(dir_fd, temp, data)
+    try:
+        os.rename(temp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except BaseException:
+        os.unlink(temp, dir_fd=dir_fd)
+        raise
+    os.fsync(dir_fd)
