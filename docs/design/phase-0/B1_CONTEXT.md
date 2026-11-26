@@ -585,7 +585,7 @@ Orchestrator：Step を計画する
 
 ### 6.4 Memory Engine との接続（B1 が受け持つ範囲だけ）
 
-- **照会の接続口：** `MemoryQuery(scope, task_features, budget_tokens, k)`。Engine は、これを `MemoryQueryRequest` として返し、Runtime が実行する（1.1）。結果は次の項目を持つ一覧。
+- **照会の接続口：** `MemoryQueryRequest{query_text_ref, task_features, hints, purpose, budget_tokens, k}`。**`scope` は含まない**（P-1）。Engine は、これを要求として返す。Runtime が、Safety の決めた `AuthorizedScope` を付けて実行する（1.1）。結果は次の項目を持つ一覧。
   - `memory_id`, `version`, `status`, `type`, 本文（または抜粋と handle）, `evidence_refs`, `source_trust`, `confidence`, スコアの内訳
   - 照会は Runtime の READ_ONLY Step として実行し、結果（ID、バージョン、本文のハッシュ）を Journal に記録する。
 - **文脈に入れるかどうか：** Context Engine が、記憶の区画の割り当て（最小 0）の範囲で決める。入れる場合は、「過去の記憶であり、古いかもしれない」という注意書きを付けて、D3 の区画に置く。
@@ -780,3 +780,28 @@ Orchestrator：Step を計画する
 | B1-P03 | 削除した記憶から派生したデータ | 記憶本体の暗号鍵を破棄しても、その記憶を含む要約、変換済みの文脈、モデルの応答、バックアップなどが残る可能性がある。派生データまで含めた削除を設計すること | B2（`B2_MEMORY.md` の7章） |
 | B1-P04 | 処理量の上限 | - ContextRequest、補助的なモデル呼び出し、組み立て直し、再試行、計画の立て直しが組み合わさった場合の、総実行回数・費用・時間の上限を決めること。個別の上限だけでなく、Run 全体の上限が必要。<br>- 設計A と B1 で書き方がそろっていない「Safety 判定 → 予算予約 → Intent → Permit」の順序を統一すること | D・E |
 
+## 15. E2 での統合（2026-11-26、DRAFT。E2 の審査待ち）
+
+この章は、`E_INTEGRATION.md`（E2 の版）との整合のための注記である。本文で食い違う部分は、E の側を優先する。
+
+- **処理の順序：** 6.1 の流れは、E の3.1 の Attempt の状態遷移に従う（CP-1）。具体的には、次の順にする。
+  1. 内容を確定する
+  2. PDP の判定と、送信の認可を受ける
+  3. 保存の認可を受ける
+  4. 承認を受ける
+  5. 予算を予約する
+  6. Intent を記録する（リクエストの記録は、ここで保存する）
+  7. Permit を発行する
+  8. 消費する
+  9. 送信の関門を通る
+  - 6.1 で、予算の予約を Safety の判定より先に書いていた部分は、この順序に置き換える。
+- **MemoryQuery：** 6.4 の照会から `scope` を外した（P-1）。
+- **ハッシュの鍵：**
+  - 記憶の項目（D3）の `item_content_hash` には、記憶ごとの MAC 鍵を使う（P-2）。
+  - rendering_hash と request_hash には、別々の鍵を使う（CP-12、C2 の6.2）。
+  - 6.2.1 の「テナントごとの鍵」は、記憶ではない機密の項目にだけ使う。
+- **補助のためのモデル呼び出し：** 独立した Model Call の Attempt として扱う。決まった最小の文脈で行い、再帰させない（E の5章、`E.Z12`）。
+- **比べる構成の名前：** 11章の「全履歴方式」「基本的な圧縮」「最適化」は、FeatureComparator である。エージェント全体の Baseline A とは別のもの（CP-13、E の10.3）。
+- **不変条件と Strategy の呼び方：**
+  - この文書の不変条件は、`B1.C1`〜`B1.C26` と呼ぶ。
+  - 圧縮の Strategy の S1〜S6 は、`B1.ST1`〜`B1.ST6` と読み替える（C1 の S1〜S27 とぶつからないようにするため）。

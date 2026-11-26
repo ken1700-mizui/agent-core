@@ -81,7 +81,8 @@
 
 | モード | 目的 | 外部への副作用 |
 |---|---|---|
-| `Rebuild` | Journal から状態を作り直す | **構造的に不可能**。Provider や Tool への接続口を渡さず、通信も遮断する |
+| `Rebuild` | Journal を**メモリの中で** fold して、状態を計算する（永続的な保存先には書き込まない。P-5、E の2.4） | **構造的に不可能**。Provider や Tool への接続口を渡さず、通信も遮断する |
+| `ProjectionRepair` | Materialized State などの、永続化した投影を、Journal から作り直す（保守のモード。A11 の排他のロックを持って行う。E の2.4） | モデルの呼び出し、外部への通信、内容の作り直しはしない |
 | `Replay` | 記録を使った再実行（評価・再現用） | 新しい `run_id` で、外部とは切り離して動かす。ReplayProvider と偽の Tool だけを使う |
 | `Live` | 新規実行 | 通常の Step 手順（3章）に従う |
 
@@ -351,3 +352,31 @@ RECONCILIATION_REQUIRED ──（人間が解決）──▶ RUNNING | CANCELLED
 - `context_hash`：Context Engine が組み立てた文脈の識別子。Step イベントに記録する（2章、3.4）。
 - 記憶への書き込み候補をイベントとして渡す仕組み：Runtime が候補イベントを出し、採用するかどうかは Memory Engine が決める（1章）。
 - `Rebuild` 中の副作用禁止：状態を作り直す間は、Context と Memory も外部への副作用を起こさない（2.2、I14）。
+
+## 15. E2 での統合（2026-11-26、DRAFT。E2 の審査待ち）
+
+この章は、`E_INTEGRATION.md`（E2 の版）との整合のための注記である。本文で食い違う部分は、E の側を優先する。
+
+- **Rebuild と ProjectionRepair：** 2.2 の表を書き直した（P-5）。
+- **Step と Attempt の状態：** 3.1 の Step の状態は、E の3.1 の Attempt の状態に、次のように対応する。
+
+| A の3.1 の Step の状態 | E の3.1 の Attempt の状態 |
+|---|---|
+| `SAFETY_CHECKED` | `POLICY_ALLOWED` |
+| `APPROVED` | `APPROVED` |
+| `BUDGET_RESERVED` | `BUDGET_RESERVED` |
+| `INTENT_RECORDED` | `INTENT_RECORDED` |
+| `PERMIT_ISSUED` | `PERMIT_ISSUED` |
+| `DISPATCHED` | `PERMIT_CONSUMED` → `DISPATCH_AUTHORIZED` → `DISPATCH_STARTED` |
+| `UNKNOWN_OUTCOME` | `OUTCOME_UNKNOWN` |
+
+  - 消費した後、送っていないことが確かでない場合は、`OUTCOME_UNKNOWN` とする（D-P01）。
+- **Permit：** 5.1 の Permit の項目は、E の8章の Permit の項目に置き換える（CP-4、CP-8）。MAC は、P1 の消費の中で検証する（CP-9）。
+- **Worker：** 設計A の Worker は、2つに分ける（CP-3）。
+  - Worker-Control：信頼する制御の部分。Broker の一部。
+  - Worker-Exec：信頼しない実行の部分。Sandbox の中。
+- **費用の状態：** 4.1 の項目は、E の4.1 の費用の台帳の状態に置き換える（CP-14。`CONSUMED` を加えた）。
+  - `A.I5` は、「関係するすべての階層で `Σ hold ≤ 上限`」と読み替える（E の4.4）。
+- **P1 の呼び方：** P1 を Runtime Core と呼ぶ（`E.Z1`）。
+- **不変条件の呼び方：** この文書の不変条件は、`A.I1`〜`A.I18` と呼ぶ。
+- **I10（LiveProvider）：** I10 の書き方を変えるかどうかは、E4 で、オーナーの承認を得て決める。この章では変えていない。
