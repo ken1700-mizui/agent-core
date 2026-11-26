@@ -7,14 +7,13 @@ is WP-03's SQLite UNIQUE constraint).
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterable, Iterator
 
 from agent_core.ports.journal import JournalHead
 from agent_core.types.errors import DuplicateIdError
+from agent_core.types.event_hash import event_hash
 from agent_core.types.ids import EntityId, EventId, RunId, TenantId
 from agent_core.types.records import Event, EventDraft
-from agent_core.types.serialization import dump_json
 from agent_core.types.values import Digest
 
 
@@ -63,8 +62,8 @@ class InMemoryIdRegistry:
 class InMemoryJournal:
     """Minimal synthetic journal honouring the JournalPort contract.
 
-    The hash chain here is a test stand-in (sha256 of the canonical JSON);
-    the real event hash is specified and implemented in WP-03.
+    Uses the real event hash (agent_core.types.event_hash) but keeps everything
+    in memory; it is not a substitute for the SQLite journal.
     """
 
     def __init__(self) -> None:
@@ -95,6 +94,10 @@ class InMemoryJournal:
         events = self._events.get(tenant_id, [])
         return tuple(events[after_tenant_seq : after_tenant_seq + limit])
 
+    def read_run(self, run_id: RunId, *, after_run_seq: int, limit: int) -> tuple[Event, ...]:
+        events = [e for es in self._events.values() for e in es if e.run_id == run_id]
+        return tuple(events[after_run_seq : after_run_seq + limit])
+
     def head(self, tenant_id: TenantId) -> JournalHead | None:
         events = self._events.get(tenant_id)
         if not events:
@@ -106,4 +109,4 @@ class InMemoryJournal:
 
 
 def _stand_in_hash(event: Event) -> Digest:
-    return "sha256:" + hashlib.sha256(dump_json(event)).hexdigest()
+    return event_hash(event)

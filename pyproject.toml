@@ -101,6 +101,13 @@ layers = [
 ]
 
 [[tool.importlinter.contracts]]
+id = "core-independent-of-storage"
+name = "Core (types, ports, identity) does not depend on SQLite or OS locks"
+type = "forbidden"
+source_modules = ["agent_core.types", "agent_core.ports", "agent_core.identity"]
+forbidden_modules = ["sqlite3", "fcntl", "agent_core.adapters"]
+
+[[tool.importlinter.contracts]]
 id = "phase1-no-network-or-process"
 name = "Phase 1: agent_core has no network, provider SDK or process-spawning code path"
 type = "forbidden"

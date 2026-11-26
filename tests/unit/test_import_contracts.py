@@ -189,3 +189,29 @@ def test_cycle_between_layers_breaks_the_real_contract(tmp_path: Path) -> None:
     result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
     assert result.returncode == 1
     assert "agent_core.types.planted_low -> agent_core.ports.planted_high" in result.stdout
+
+
+# -------------------------------------------------- WP-03: core does not depend on SQLite
+
+
+@pytest.mark.parametrize(
+    ("module", "statement", "expected"),
+    [
+        ("agent_core.types.planted", "import sqlite3", "agent_core.types.planted -> sqlite3"),
+        ("agent_core.ports.planted", "import sqlite3", "agent_core.ports.planted -> sqlite3"),
+        ("agent_core.identity.planted", "import fcntl", "agent_core.identity.planted -> fcntl"),
+        (
+            "agent_core.ports.planted",
+            "from agent_core.adapters import sqlite_journal",
+            "agent_core.ports.planted -> agent_core.adapters.sqlite_journal",
+        ),
+    ],
+)
+def test_core_cannot_depend_on_sqlite_or_os_locks(
+    tmp_path: Path, module: str, statement: str, expected: str
+) -> None:
+    src = _copy_real_package(tmp_path)
+    _plant(src, module, statement)
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert expected in result.stdout

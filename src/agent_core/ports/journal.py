@@ -1,4 +1,4 @@
-"""Journal port: the basic contract only (PROVISIONAL; WP-03 implements and may refine it).
+"""Journal port (WP-03). Implemented by ``agent_core.adapters.sqlite_journal``.
 
 Contract (E_INTEGRATION 2.1-2.3, A 2):
 
@@ -8,7 +8,8 @@ Contract (E_INTEGRATION 2.1-2.3, A 2):
 - A duplicate ``event_id`` raises ``DuplicateIdError`` and stores nothing,
   so the caller can retry with a new ID (``IdGenerator.issue_unique``).
 - Reads return events in ``tenant_seq`` order.
-- The event hash, storage schema and transaction details are WP-03.
+- The event hash is ``agent_core.types.event_hash`` (version 1). Storage schema
+  and transactions are in the SQLite adapter (docs/design/phase-1/WP-03_JOURNAL.md).
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from agent_core.types.base import FrozenModel
-from agent_core.types.ids import TenantId
+from agent_core.types.ids import RunId, TenantId
 from agent_core.types.records import Event, EventDraft
 from agent_core.types.values import Digest, Seq
 
@@ -41,6 +42,18 @@ class JournalPort(Protocol):
         """Events with ``tenant_seq > after_tenant_seq``, at most ``limit``, in order."""
         ...
 
+    def read_run(self, run_id: RunId, *, after_run_seq: int, limit: int) -> tuple[Event, ...]:
+        """Events of one run with ``run_seq > after_run_seq``, at most ``limit``, in order."""
+        ...
+
     def head(self, tenant_id: TenantId) -> JournalHead | None:
         """The last position, or None when the tenant has no events."""
+        ...
+
+
+@runtime_checkable
+class JournalVerifier(Protocol):
+    def verify_tenant(self, tenant_id: TenantId) -> JournalHead | None:
+        """Re-check the tenant's whole journal; raise ``JournalCorruptionError`` on any
+        mismatch. Returns the verified head, or None when there are no events."""
         ...

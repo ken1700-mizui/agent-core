@@ -96,3 +96,94 @@ class RecordValidationError(AgentCoreError):
         super().__init__(f"invalid {record_type}: {summary}")
         self.record_type = record_type
         self.issues = issues
+
+
+# ---------------------------------------------------------------- journal (WP-03)
+
+
+class JournalError(AgentCoreError):
+    """Base class of journal errors. Fatal unless stated otherwise: stop, restart, verify."""
+
+    code = "JOURNAL_ERROR"
+    fatal = True
+
+
+class JournalArgumentError(JournalError, ValueError):
+    """A caller passed an invalid argument. Nothing was read or written."""
+
+    code = "JOURNAL_INVALID_ARGUMENT"
+    fatal = False
+
+
+class JournalClosedError(JournalError):
+    """The journal instance was closed or stopped after a fatal error."""
+
+    code = "JOURNAL_CLOSED"
+
+
+class RuntimeLockHeldError(JournalError):
+    """Another Runtime holds the OS lock. This process must not start (A 5.3)."""
+
+    code = "RUNTIME_LOCK_HELD"
+
+
+class RuntimeLockLostError(JournalError):
+    """The lock file was deleted or replaced while this Runtime held it."""
+
+    code = "RUNTIME_LOCK_LOST"
+
+
+class OwnerEpochMismatchError(JournalError):
+    """The runtime_owner row names another owner or epoch (A 5.3, A.I3)."""
+
+    code = "OWNER_EPOCH_MISMATCH"
+
+
+class StaleEventEpochError(JournalError):
+    """A draft carries an owner_epoch other than the journal's current one."""
+
+    code = "STALE_EVENT_EPOCH"
+    fatal = False
+
+
+class RunTenantMismatchError(JournalError):
+    """A run_id already belongs to another tenant."""
+
+    code = "RUN_TENANT_MISMATCH"
+    fatal = False
+
+
+class JournalSchemaError(JournalError):
+    """The database is not a journal, or its schema version is not supported."""
+
+    code = "JOURNAL_SCHEMA_UNSUPPORTED"
+
+
+class JournalCorruptionError(JournalError):
+    """Stored data failed verification (hash, chain, sequence, body or head)."""
+
+    code = "JOURNAL_CORRUPTION"
+
+    def __init__(self, reason: str, tenant_seq: int | None = None) -> None:
+        where = f" at tenant_seq {tenant_seq}" if tenant_seq is not None else ""
+        super().__init__(f"journal corruption: {reason}{where}")
+        self.reason = reason
+        self.tenant_seq = tenant_seq
+
+
+class JournalStorageError(JournalError):
+    """A database error that is not a duplicate ID. The transaction was rolled back."""
+
+    code = "JOURNAL_STORAGE_FAILURE"
+
+
+class JournalWriteOutcomeUnknownError(JournalError):
+    """It is not known whether the write was stored. Never retry under a new ID."""
+
+    code = "JOURNAL_WRITE_OUTCOME_UNKNOWN"
+
+
+class SequenceExhaustedError(JournalError):
+    """A sequence or epoch would exceed the signed 64-bit range."""
+
+    code = "SEQUENCE_EXHAUSTED"
