@@ -1,6 +1,6 @@
 # Agent Core
 
-> 文書の状態：**DRAFT**（WP-01）
+> 文書の状態：**DRAFT**（Phase 1 の実装の提出の時点）
 
 Agent Core は、オーナー自身が使うための、専用の AI エージェントの基盤である。商用の製品ではない。
 
@@ -11,8 +11,24 @@ Agent Core は、オーナー自身が使うための、専用の AI エージ�
 
 ## 今の状態
 
-- Phase 1 の WP-01（プロジェクトの構成と CI）、WP-02（共通の型と Ports）、WP-03（SQLite の Journal）、WP-04（状態機械）、WP-05（Fake Provider と ModelPort）、WP-06（合成の記録の Replay Provider）、WP-07（Tool Registry）、WP-09（Safety、Cost、Permit と Receipt）、WP-11（構造化ログ）を実装した。Engine の機能は、まだない（設計の記録は `docs/design/phase-1/`）。
-- Phase 1 は、合成のデータだけを使う。実 API、認証情報、外部への通信は使わない（費用は 0 ドル）。
+- **Phase 1 は「実装提出済み・最終監査待ち」**である。正式な完了ではない（Codex の独立監査、CI の実行、必要な修正、オーナーの最終承認の後に完了とする）。
+- WP-01〜WP-15 を実装した（設計の記録は `docs/design/phase-1/`、実装の報告は `docs/reviews/PHASE_1_IMPLEMENTATION_REPORT.md`）。WP-01 の CI は、まだ GitHub Actions で実行していない。
+- Phase 1 は、合成のデータだけを使う。実モデル、実 API、認証情報、外部への通信は使わない（費用は 0 ドル）。
+
+## CLI（合成のデータだけ）
+
+このリポジトリはパッケージをインストールしない。`src` をパスに入れて起動する（詳しくは `docs/design/phase-1/WP-10_CLI.md`）。
+
+```bash
+PYTHONPATH=src uv run --locked --offline python -m agent_core_cli init --home /path/to/new/home
+```
+
+```bash
+PYTHONPATH=src uv run --locked --offline python -m agent_core_cli shell --home /path/to/new/home
+```
+
+- `status` と `recovery` は読み取りだけ（Runtime の所有権を取らない）。
+- 対話のセッションの中で `help` を入力すると、命令の一覧を出す（合成のデモの開始、承認、停止、`recover <run>|all`、`reconcile` など）。
 
 ## 開発の環境（Linux）
 
@@ -91,12 +107,14 @@ src/agent_core/
   types/             共通の型（ID、値、記録、エラー、書き出しと復元）。最も下の層
   ports/             接続口（Clock、RandomSource、IdRegistry、JournalPort、EvidenceVerifier、ModelPort、ReplayBlobStore、ReplayAccessPort）
   identity/          ID の生成
-  runtime/           Task、Run、Step、Attempt の状態機械（純粋な判断と、Journal への記録）
+  runtime/           Task、Run、Step、Attempt の状態機械、実行のゲート、エージェントのループ、検証、復旧（recovery）
+  context/           最小の Context Engine（Context IR、信頼の階層、ProtectedFact、予算）
   tool/              Tool Registry（オーナーが承認したツールの登録と、提案の検証）
   safety/            Safety Engine（PDP、ActionDescriptor、ExactApproval。入出力なしの判断）
   cost/              Cost Engine の規則（整数の計算、予約の状態遷移。入出力なし）
   observability/     構造化ログと、監査の書き込み
-  adapters/          接続口の実装（システムの時計、OS の乱数、SQLite の Journal、OS のロック、合成の Fake Provider、合成の記録の Replay Provider、JSON Lines のログ、Journal と同じ DB の予算と権限の台帳）
+  adapters/          接続口の実装（システムの時計、OS の乱数、SQLite の Journal、OS のロック、合成の Fake Provider、合成の記録の Replay Provider、JSON Lines のログ、Journal と同じ DB の予算と権限の台帳、ファイルのブローカー）
+src/agent_core_cli/  CLI（agent_core の外の合成の根。init、status、recovery、対話のセッション）
 tests/support/       試験だけで使う、合成の偽の実装
 tests/unit/          単体の試験（合成のデータだけ。Python の通信は試験の中で遮断する）
 tools/secret_scan.py 秘密情報の検査（標準ライブラリだけ）
