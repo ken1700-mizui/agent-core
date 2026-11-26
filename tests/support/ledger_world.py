@@ -11,7 +11,7 @@ from agent_core.adapters.system import OsRandomSource
 from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.safety.approval import OwnerApprovalChannel
-from agent_core.safety.descriptor import AttemptRef, pin_of
+from agent_core.safety.descriptor import AttemptRef
 from agent_core.types.cost import (
     BudgetScopeType,
     CounterKind,
@@ -55,12 +55,13 @@ from agent_core.types.safety import (
     RunGrant,
     ToolContent,
 )
-from agent_core.types.tools import ToolRegistration
+from agent_core.types.tools import ToolEffectClass, ToolRegistration
 from agent_core.types.transitions import ContentFixedEvidence, PolicyDecisionEvidence
 from agent_core.types.values import Budget, Currency
 from support import builders as b
 from support import runtime_world as w
 from support import safety_world as s
+from support import tool_world as tw
 
 PERIOD = "synthetic-2026-11"
 CounterScope = Literal[BudgetScopeType.RUN, BudgetScopeType.TASK]
@@ -302,12 +303,20 @@ def fixed_attempt(
         )
         registration = None
     else:
+        # Synthetic operations by default (no file target, WP08-R06). A file
+        # operation names its file tool: ``registration=s.READ_TOOL`` or
+        # ``s.WRITE_TOOL`` (tests/support/files_world.py).
         if write:
-            registration, default_input = s.WRITE_TOOL, s.WRITE_INPUT
+            registration = s.SYNTH_CHANGE_TOOL  # irreversible: needs approval
         elif costly:
-            registration, default_input = s.COSTLY_TOOL, '{"path":"workspace/a.txt"}'
+            registration = s.SYNTH_COSTLY_TOOL
         else:
-            registration, default_input = s.READ_TOOL, '{"path":"workspace/a.txt"}'
+            registration = s.SYNTH_TOOL
+        default_input = tw.SYNTHETIC_INPUT
+        if descriptor.get("registration") is s.WRITE_TOOL:
+            default_input = s.WRITE_INPUT
+        elif descriptor.get("registration") in (s.READ_TOOL, s.COSTLY_TOOL):
+            default_input = '{"path":"workspace/a.txt"}'
         values.setdefault("canonical_input", default_input)
         values.setdefault("registration", registration)
         built = s.read_descriptor(ref_of(st, attempt), **values)
@@ -341,7 +350,9 @@ def allowed(st: Setup, attempt: Attempt, *, approval_required: bool | None = Non
     """POLICY_ALLOWED with the PDP decision recorded by the ledger."""
     descriptor = st.descriptors[attempt.attempt_id]
     needed = (
-        descriptor.tool == pin_of(s.WRITE_TOOL) if approval_required is None else approval_required
+        descriptor.effect_class is ToolEffectClass.IRREVERSIBLE
+        if approval_required is None
+        else approval_required
     )
     evidence = PolicyDecisionEvidence(
         kind="policy_decision",
@@ -457,11 +468,14 @@ def consume(
     return st.sm.advance_attempt(attempt, A.PERMIT_CONSUMED, evidence, ledger=(op,))
 
 
-def issued(st: Setup, step: Step, *, write: bool = False, costly: bool = False) -> Attempt:
+def issued(
+    st: Setup, step: Step, *, write: bool = False, costly: bool = False, **descriptor: Any
+) -> Attempt:
     """A fresh attempt up to PERMIT_ISSUED through the real path."""
     scopes = scopes_of(st.sm, step)
     caps(st, scopes)
-    attempt = reserve(st, fixed_attempt(st, step, scopes, write=write, costly=costly), 1_000)
+    fixed = fixed_attempt(st, step, scopes, write=write, costly=costly, **descriptor)
+    attempt = reserve(st, fixed, 1_000)
     return issue(st, intent(st, attempt))
 
 
@@ -677,22 +691,3 @@ def raw_apply(st: Setup, op: Any) -> None:
             conn.execute("ROLLBACK")
     finally:
         conn.close()
-
-
-def use_ticket(gate_: Any, authorization: Any, ticket: Any) -> Any:
-    """Redeem the execution ticket for exactly the operation it was issued for
-    (a callback that reports COMPLETED for a file target must have used it)."""
-    from agent_core.types.files import FileOperation
-    from agent_core.types.tools import ResourceAccess
-
-    descriptor = authorization.descriptor
-    (target,) = descriptor.target_resources
-    return gate_.redeem(
-        ticket,
-        FileOperation(
-            access=target.access,
-            path=target.path,
-            change=descriptor.apply_change if target.access is ResourceAccess.WRITE else None,
-            workspace_ref=descriptor.workspace_ref,
-        ),
-    )

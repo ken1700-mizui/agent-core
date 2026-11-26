@@ -5,10 +5,12 @@ the policy's trust, the managed area, the tree's root and its signed manifest,
 and takes the single-writer lock. It refuses with ``WorkspaceRejectedError`` or
 ``FileOperationRefusedError`` and never opens a target.
 
-The prepared operation is used inside the gate callback for the one file
-operation, redeeming the execution ticket (``redeem`` is the gate's). A failure
-there is a ``FileOperationFailedError`` whose ``effect`` says whether a target may
-have changed. ``close`` releases the fds and the lock.
+The gate itself calls the prepared operation (``execute_file``, WP08-R06) for the
+one file operation; the broker redeems the execution ticket (``redeem`` is the
+gate's) and returns a ``FileOutcome`` that the gate checks against the redeemed
+binding before anything is recorded as done. A failure is a
+``FileOperationFailedError`` whose ``effect`` says whether a target may have
+changed. ``close`` releases the fds and the lock.
 
 Implemented by ``agent_core.adapters.file_broker``; only the composition root
 builds one.
@@ -19,7 +21,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
-from agent_core.types.files import ExecutionTicket, FileOperation, TicketBinding
+from agent_core.types.files import ExecutionTicket, FileOperation, FileOutcome, TicketBinding
 from agent_core.types.safety import ActionDescriptor, DispatchAuthorization, Policy
 
 Redeem = Callable[[ExecutionTicket, FileOperation], TicketBinding]
@@ -32,7 +34,7 @@ class PreparedFileOperation(Protocol):
 
     def read(
         self, authorization: DispatchAuthorization, ticket: ExecutionTicket, redeem: Redeem
-    ) -> bytes: ...
+    ) -> tuple[FileOutcome, bytes]: ...
 
     def write(
         self,
@@ -40,7 +42,7 @@ class PreparedFileOperation(Protocol):
         ticket: ExecutionTicket,
         redeem: Redeem,
         content: bytes,
-    ) -> None: ...
+    ) -> FileOutcome: ...
 
     def close(self) -> None: ...
 

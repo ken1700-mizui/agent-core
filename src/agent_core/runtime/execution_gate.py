@@ -41,15 +41,17 @@ import threading
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Literal
+from typing import Literal, NamedTuple
 
 from agent_core.ports.clock import Clock
+from agent_core.ports.files import PreparedFileOperation
 from agent_core.ports.ledger import LedgerPort
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.safety import reports
+from agent_core.safety.workspace import file_digest
 from agent_core.types.base import FrozenModel
-from agent_core.types.errors import PermitRejectedError
-from agent_core.types.files import ExecutionTicket, FileOperation, TicketBinding
+from agent_core.types.errors import FileEffect, FileOperationFailedError, PermitRejectedError
+from agent_core.types.files import ExecutionTicket, FileOperation, FileOutcome, TicketBinding
 from agent_core.types.ids import PepInstanceId
 from agent_core.types.ledger import (
     ClaimReceipt,
@@ -59,7 +61,7 @@ from agent_core.types.ledger import (
     ReleaseReservation,
     ReportUsage,
 )
-from agent_core.types.model import Usage
+from agent_core.types.model import CostStatus, Usage, UsageStatus
 from agent_core.types.records import Attempt, AttemptState
 from agent_core.types.safety import (
     ActionContent,
@@ -141,10 +143,18 @@ class SyntheticExecutionGate:
 
     # ------------------------------------------------------------ steps
 
+    def _refuse_file_operation(self, attempt: Attempt) -> None:
+        """WP08-R06: an operation on a file target is settled only through
+        ``execute_file`` (the broker path). The separate steps refuse it."""
+        descriptor = self._ledger.recorded_descriptor(attempt.attempt_id)
+        if descriptor is not None and descriptor.target_resources:
+            raise PermitRejectedError(PermitReason.FILE_OPERATION_NEEDS_BROKER)
+
     def claim(
         self, attempt: Attempt, *, content: ActionContent, registration: ToolRegistration | None
     ) -> Attempt:
         with self._exclusive():
+            self._refuse_file_operation(attempt)
             return self._claim(attempt, content, registration)
 
     def _claim(
@@ -165,6 +175,7 @@ class SyntheticExecutionGate:
 
     def start(self, attempt: Attempt) -> tuple[Attempt, DispatchAuthorization]:
         with self._exclusive():
+            self._refuse_file_operation(attempt)
             return self._start(attempt)
 
     def _start(self, attempt: Attempt) -> tuple[Attempt, DispatchAuthorization]:
@@ -189,7 +200,15 @@ class SyntheticExecutionGate:
         )
 
     def finish(self, attempt: Attempt, result: SyntheticResult) -> Attempt:
+        """Record a synthetic operation's outcome. For a file operation a direct
+        report is not a broker result: it is recorded as unknown, never as done."""
         with self._exclusive():
+            try:
+                self._refuse_file_operation(attempt)
+            except PermitRejectedError:
+                if attempt.state is A.DISPATCH_STARTED:
+                    self._unknown(attempt)
+                raise
             return self._finish(attempt, result)
 
     def _finish(self, attempt: Attempt, result: SyntheticResult) -> Attempt:
@@ -214,27 +233,85 @@ class SyntheticExecutionGate:
         *,
         content: ActionContent,
         registration: ToolRegistration | None,
-        run: Callable[[DispatchAuthorization, ExecutionTicket | None], SyntheticResult],
+        run: Callable[[DispatchAuthorization], SyntheticResult],
     ) -> Attempt:
-        """Claim, start, run the callback once, record the outcome. The callback gets
-        the execution ticket for its one file operation (None without one target)."""
+        """Claim, start, run a synthetic callback once, record the outcome. Not for
+        file operations (``execute_file``)."""
         with self._exclusive():
+            self._refuse_file_operation(attempt)
             claimed = self._claim(attempt, content, registration)
             started, authorization = self._start(claimed)
             try:
-                ticket = self._open_ticket(authorization)
-                try:
-                    result = run(authorization, ticket)
-                finally:
-                    redeemed = self._close_ticket()
-                if ticket is not None and result.outcome == "COMPLETED" and not redeemed:
-                    # WP08-R04: an operation on a file target that reports success
-                    # must have used its ticket; otherwise the report is not trusted.
-                    raise PermitRejectedError(PermitReason.TICKET_NOT_USED)
+                result = run(authorization)
             except BaseException:
                 self._unknown(started)
                 raise
             return self._finish(started, result)
+
+    def execute_file(
+        self,
+        attempt: Attempt,
+        *,
+        content: ActionContent,
+        registration: ToolRegistration | None,
+        prepared: PreparedFileOperation,
+        write_content: bytes | None,
+        accept_read: Callable[[bytes], bool],
+    ) -> FileExecution:
+        """WP08-R06: the one path that settles a file operation. The gate claims,
+        starts, issues the ticket, calls the prepared broker operation itself and
+        checks its result against the ticket the broker redeemed (the binding:
+        receipt, attempt, action_hash, tree, path, access, change) and against
+        the bytes (a read) or the approved change (a write). Only then is the
+        attempt COMPLETED. A broker failure with effect NONE is a definite
+        failure; anything else, or a result that does not check, is unknown."""
+        with self._exclusive():
+            descriptor = self._ledger.recorded_descriptor(attempt.attempt_id)
+            if descriptor is None or len(descriptor.target_resources) != 1:
+                raise PermitRejectedError(PermitReason.FILE_OPERATION_NEEDS_BROKER)
+            if (descriptor.apply_change is not None) != (write_content is not None):
+                raise PermitRejectedError(PermitReason.FILE_OPERATION_NEEDS_BROKER)
+            claimed = self._claim(attempt, content, registration)
+            started, authorization = self._start(claimed)
+            try:
+                return self._run_file(started, authorization, prepared, write_content, accept_read)
+            except BaseException:
+                if self._runtime.state.attempts[started.attempt_id].state is A.DISPATCH_STARTED:
+                    self._unknown(started)
+                raise
+
+    def _run_file(
+        self,
+        started: Attempt,
+        authorization: DispatchAuthorization,
+        prepared: PreparedFileOperation,
+        write_content: bytes | None,
+        accept_read: Callable[[bytes], bool],
+    ) -> FileExecution:
+        ticket = self._open_ticket(authorization)
+        if ticket is None:
+            raise PermitRejectedError(PermitReason.FILE_OPERATION_NEEDS_BROKER)
+        data: bytes | None = None
+        try:
+            try:
+                if write_content is None:
+                    outcome, data = prepared.read(authorization, ticket, self.redeem)
+                else:
+                    outcome = prepared.write(authorization, ticket, self.redeem, write_content)
+            finally:
+                binding = self._close_ticket()
+        except FileOperationFailedError as exc:
+            if exc.effect is not FileEffect.NONE:
+                raise
+            return FileExecution(self._finish(started, _definite()), None)
+        if binding is None:
+            raise PermitRejectedError(PermitReason.TICKET_NOT_USED)
+        if not _checks(outcome, binding, data):
+            raise PermitRejectedError(PermitReason.FILE_RESULT_UNVERIFIED)
+        if data is not None and not accept_read(data):
+            return FileExecution(self._finish(started, _definite()), None)
+        done = self._finish(started, _completed())
+        return FileExecution(done, data)
 
     # ------------------------------------------------------------ tickets (WP-08)
 
@@ -262,11 +339,13 @@ class SyntheticExecutionGate:
             self._issued.add(ticket)
         return ticket
 
-    def _close_ticket(self) -> bool:
-        """Close the open ticket; whether it was redeemed for its operation."""
+    def _close_ticket(self) -> TicketBinding | None:
+        """Close the open ticket; its binding if it was redeemed for its operation."""
         with self._ticket_lock:
             current, self._open = self._open, None
-            return current is not None and current.redeemed
+            if current is None or not current.redeemed:
+                return None
+            return current.binding
 
     def redeem(self, ticket: ExecutionTicket, operation: FileOperation) -> TicketBinding:
         """Use the open ticket once for the operation it was bound to. Any refusal
@@ -373,6 +452,50 @@ class SyntheticExecutionGate:
         if receipt is None:
             raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
         return receipt
+
+
+class FileExecution(NamedTuple):
+    attempt: Attempt
+    # The bytes of a completed read (checked against the broker's result).
+    data: bytes | None
+
+
+def _no_usage() -> Usage:
+    return Usage(
+        status=UsageStatus.FINAL,
+        input_tokens=0,
+        output_tokens=0,
+        total_tokens=0,
+        cost=None,
+        cost_status=CostStatus.UNKNOWN,
+        synthetic=True,
+    )
+
+
+def _completed() -> SyntheticResult:
+    return SyntheticResult(outcome="COMPLETED", usage=_no_usage(), final=True)
+
+
+def _definite() -> SyntheticResult:
+    return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+
+
+def _checks(outcome: object, binding: TicketBinding, data: bytes | None) -> bool:
+    """The broker's result is for exactly the redeemed binding, and its digest and
+    size are those of the bytes read, or of the approved change."""
+    if type(outcome) is not FileOutcome or outcome.binding != binding:
+        return False
+    change = binding.operation.change
+    if change is not None:
+        return data is None and (outcome.result_digest, outcome.result_size) == (
+            change.content_digest,
+            change.content_size,
+        )
+    return (
+        type(data) is bytes
+        and outcome.result_size == len(data)
+        and outcome.result_digest == file_digest(data)
+    )
 
 
 def _ref(step: str, receipt: Receipt) -> str:

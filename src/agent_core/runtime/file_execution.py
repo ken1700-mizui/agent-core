@@ -17,24 +17,21 @@ Order:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import NamedTuple
 
 from agent_core.ports.files import FileOperationPort, PreparedFileOperation
 from agent_core.ports.ledger import LedgerPort
-from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
+from agent_core.runtime.execution_gate import SyntheticExecutionGate
 from agent_core.tool.registry import ToolRegistry
 from agent_core.types.errors import (
-    FileEffect,
-    FileOperationFailedError,
     FileOperationRefusedError,
     PermitRejectedError,
     ToolOutputError,
     WorkspaceRejectedError,
 )
-from agent_core.types.files import ExecutionTicket
-from agent_core.types.model import CostStatus, Usage, UsageStatus
 from agent_core.types.records import Attempt, AttemptState
-from agent_core.types.safety import ActionContent, DispatchAuthorization, PermitReason
+from agent_core.types.safety import ActionContent, PermitReason
 from agent_core.types.tools import ToolRegistration, ValidatedToolOutput, canonical_json
 from agent_core.types.transitions import AbortReason
 
@@ -70,22 +67,6 @@ def _read_output(
         return registry.validate_output(registration, output)
     except ToolOutputError:
         return None
-
-
-def _no_usage() -> Usage:
-    return Usage(
-        status=UsageStatus.FINAL,
-        input_tokens=0,
-        output_tokens=0,
-        total_tokens=0,
-        cost=None,
-        cost_status=CostStatus.UNKNOWN,
-        synthetic=True,
-    )
-
-
-def _failed() -> SyntheticResult:
-    return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
 
 
 def run_file_operation(
@@ -129,30 +110,47 @@ def _execute(
     write_content: bytes | None,
     registry: ToolRegistry,
 ) -> FileOperationResult:
-    read: list[tuple[bytes, ValidatedToolOutput]] = []
+    outputs: list[ValidatedToolOutput] = []
 
-    def run(
-        authorization: DispatchAuthorization, ticket: ExecutionTicket | None
-    ) -> SyntheticResult:
-        if ticket is None:
-            # Not one file target: nothing is attempted.
-            return _failed()
-        try:
-            if write_content is None:
-                data = prepared.read(authorization, ticket, gate.redeem)
-                output = _read_output(registry, registration, data)
-                if output is None:
-                    return _failed()  # read, nothing changed, the result is not usable
-                read.append((data, output))
-            else:
-                prepared.write(authorization, ticket, gate.redeem, write_content)
-        except FileOperationFailedError as exc:
-            if exc.effect is FileEffect.NONE:
-                return _failed()
-            raise  # a target may have changed: unknown, never retried
-        return SyntheticResult(outcome="COMPLETED", usage=_no_usage(), final=True)
+    def accept_read(data: bytes) -> bool:
+        output = _read_output(registry, registration, data)
+        if output is None:
+            return False  # read, nothing changed, but the result is not usable
+        outputs.append(output)
+        return True
 
-    done = gate.execute(attempt, content=content, registration=registration, run=run)
-    if read and done.state is AttemptState.COMPLETED:
-        return FileOperationResult(done, read[0][0], read[0][1])
-    return FileOperationResult(done, None, None)
+    # WP08-R06: the gate calls the broker and checks its result itself.
+    done = gate.execute_file(
+        attempt,
+        content=content,
+        registration=registration,
+        prepared=prepared,
+        write_content=write_content,
+        accept_read=accept_read,
+    )
+    if done.data is not None and outputs and done.attempt.state is AttemptState.COMPLETED:
+        return FileOperationResult(done.attempt, done.data, outputs[0])
+    return FileOperationResult(done.attempt, None, None)
+
+
+_RECOVERABLE = (AttemptState.DISPATCH_STARTED, AttemptState.OUTCOME_UNKNOWN)
+
+
+def recovery_receipts(
+    *, ledger: LedgerPort, attempts: Iterable[Attempt], workspace_ref: str
+) -> tuple[str, ...]:
+    """WP08-R07: the receipts of writes on this tree whose outcome is not known
+    (started, or recorded as unknown). Only their temporary files may be removed;
+    the outcomes themselves stay for reconciliation (WP-12)."""
+    found: list[str] = []
+    for attempt in attempts:
+        if attempt.state not in _RECOVERABLE or attempt.receipt_id is None:
+            continue
+        descriptor = ledger.recorded_descriptor(attempt.attempt_id)
+        if (
+            descriptor is not None
+            and descriptor.apply_change is not None
+            and descriptor.workspace_ref == workspace_ref
+        ):
+            found.append(str(attempt.receipt_id))
+    return tuple(sorted(found))

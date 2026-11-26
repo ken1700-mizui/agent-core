@@ -28,6 +28,7 @@ from agent_core.types.safety import LedgerKeys, SecretKey, ToolContent
 from support import ledger_world as lw
 from support import runtime_world as w
 from support import safety_world as s
+from support import tool_world as tw
 
 
 def main() -> int:
@@ -55,8 +56,8 @@ def main() -> int:
     print("consumed", flush=True)
     if mode == "start-then-exit":
         gate = lw.gate(st)
-        content = ToolContent(kind="tool", canonical_input='{"path":"workspace/a.txt"}')
-        claimed = gate.claim(consumed, content=content, registration=s.READ_TOOL)
+        content = ToolContent(kind="tool", canonical_input=tw.SYNTHETIC_INPUT)
+        claimed = gate.claim(consumed, content=content, registration=s.SYNTH_TOOL)
         gate.start(claimed)
         print("started", flush=True)
     os._exit(0)

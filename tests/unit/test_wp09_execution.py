@@ -116,9 +116,8 @@ def test_one_receipt_starts_execution_once(st: Any) -> None:
     attempt = _consumed(st)
     calls: list[Any] = []
 
-    def run(authorization: Any, ticket: Any) -> SyntheticResult:
+    def run(authorization: Any) -> SyntheticResult:
         calls.append(authorization)
-        lw.use_ticket(gate, authorization, ticket)  # WP08-R04: COMPLETED uses the ticket
         return _ok(authorization)
 
     done = gate.execute(attempt, run=run, **lw.actual(st, attempt))
@@ -139,15 +138,15 @@ def test_a_confirmed_authorization_cannot_be_presented_again(st: Any) -> None:
 def test_the_actual_operation_must_match_at_execution(st: Any) -> None:
     gate = lw.gate(st)
     attempt = _consumed(st)
-    other = ToolContent(kind="tool", canonical_input='{"path":"workspace/other.txt"}')
+    other = ToolContent(kind="tool", canonical_input='{"value":"other"}')
     calls: list[Any] = []
 
-    def run(authorization: Any, _ticket: Any) -> SyntheticResult:
+    def run(authorization: Any) -> SyntheticResult:
         calls.append(authorization)
         return _ok(authorization)
 
     with pytest.raises(PermitRejectedError, match="DESCRIPTOR_NOT_FROM_CONTENT"):
-        gate.execute(attempt, content=other, registration=s.READ_TOOL, run=run)
+        gate.execute(attempt, content=other, registration=s.SYNTH_TOOL, run=run)
     assert calls == []
     assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.ISSUED
 
@@ -176,7 +175,7 @@ def test_the_gate_cannot_be_reentered_from_the_callback(st: Any) -> None:
     seen: list[str] = []
     run_id = st.sm.state.steps[attempt.step_id].run_id
 
-    def run(authorization: Any, ticket: Any) -> SyntheticResult:
+    def run(authorization: Any) -> SyntheticResult:
         for call in (
             lambda: gate.stop(st.signed(lw.stop_op(StopScopeType.RUN, str(run_id)))),
             lambda: gate.start(st.sm.state.attempts[attempt.attempt_id]),
@@ -185,7 +184,6 @@ def test_the_gate_cannot_be_reentered_from_the_callback(st: Any) -> None:
                 call()
             except PermitRejectedError as exc:
                 seen.extend(exc.reasons)
-        lw.use_ticket(gate, authorization, ticket)  # WP08-R04: COMPLETED uses the ticket
         return _ok(authorization)
 
     gate.execute(attempt, run=run, **lw.actual(st, attempt))

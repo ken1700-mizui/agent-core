@@ -383,7 +383,9 @@ def test_a_descriptor_with_emptied_targets_is_not_recorded(st: Any) -> None:
     lw.caps(st, scopes)
     # The attempt is fixed on a descriptor whose targets were removed, while the
     # arguments still name a file: the ledger rebuilds the descriptor and refuses.
-    attempt = lw.fixed_attempt(st, step, scopes, tamper={"target_resources": ()})
+    attempt = lw.fixed_attempt(
+        st, step, scopes, registration=s.READ_TOOL, tamper={"target_resources": ()}
+    )
     with pytest.raises(PermitRejectedError, match="DESCRIPTOR_NOT_FROM_CONTENT"):
         lw.allowed(st, attempt)
 

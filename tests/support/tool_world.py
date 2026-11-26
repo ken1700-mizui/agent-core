@@ -143,4 +143,23 @@ WRITE_BODY: dict[str, Any] = {
     "approval_conditions": (ApprovalCondition.ON_WRITE,),
 }
 
+
+def synthetic_body(tool_id: str, **overrides: Any) -> dict[str, Any]:
+    """A synthetic operation with no file target (WP08-R06): the gate settles it
+    with start and finish; it never touches the work tree."""
+    values: dict[str, Any] = {
+        "tool_id": tool_id,
+        "input_schema": ObjectSchema(
+            fields=(FieldSpec(name="value", type=FieldType.STRING, required=True, max_length=256),),
+            max_bytes=1_024,
+        ),
+        "required_permissions": (),
+        "resources": (),
+    }
+    values.update(overrides)
+    return values
+
+
+SYNTHETIC_INPUT = '{"value":"synthetic"}'
+
 __all__ = ["ApprovalCondition", "ResourceAccess", "ResourceSpec"]

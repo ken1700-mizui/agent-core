@@ -376,14 +376,15 @@ def test_a_stale_access_epoch_is_refused(st: Any) -> None:
 
 
 def test_a_denied_resource_stops_new_decisions_and_consumption(st: Any) -> None:
-    attempt = lw.issued(st, _step(st))
+    # A file read (a denied resource needs a file target).
+    attempt = lw.issued(st, _step(st), registration=s.READ_TOOL)
     st.owner(DenyResource(op="deny_resource", tenant_id=b.TENANT, path="workspace/a.txt"))
     with pytest.raises(PermitRejectedError):
         lw.consume(st, attempt)
     step = _step(st)
     scopes = lw.scopes_of(st.sm, step)
     lw.caps(st, scopes)
-    fresh = lw.fixed_attempt(st, step, scopes, access_epoch=1)
+    fresh = lw.fixed_attempt(st, step, scopes, access_epoch=1, registration=s.READ_TOOL)
     with pytest.raises(PolicyDeniedError, match="RESOURCE_DENIED"):
         lw.allowed(st, fresh)
 

@@ -593,6 +593,9 @@ class PermitReason(StrEnum):
     TICKET_USED = "TICKET_USED"
     TICKET_MISMATCH = "TICKET_MISMATCH"
     TICKET_NOT_USED = "TICKET_NOT_USED"
+    # WP08-R06: a file operation is settled only by the broker path
+    FILE_OPERATION_NEEDS_BROKER = "FILE_OPERATION_NEEDS_BROKER"
+    FILE_RESULT_UNVERIFIED = "FILE_RESULT_UNVERIFIED"
 
 
 class PermitBody(FrozenModel):

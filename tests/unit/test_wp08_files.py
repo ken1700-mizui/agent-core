@@ -26,6 +26,8 @@ from agent_core.safety.workspace import (
 from agent_core.types.cost import ReservationState
 from agent_core.types.errors import (
     ActionDescriptorError,
+    FileEffect,
+    FileOperationFailedError,
     PermitRejectedError,
     SafetyError,
     WorkspaceRejectedError,
@@ -33,8 +35,10 @@ from agent_core.types.errors import (
 from agent_core.types.files import (
     ExecutionTicket,
     FileOperation,
+    FileOutcome,
+    TicketBinding,
 )
-from agent_core.types.ids import ReservationId
+from agent_core.types.ids import AttemptId, ReceiptId, ReservationId
 from agent_core.types.records import AttemptState
 from agent_core.types.safety import (
     ActionDescriptor,
@@ -343,7 +347,14 @@ def test_substituted_content_is_refused_before_the_start(world: Any) -> None:
     gate = lw.gate(st)
     other = ToolContent(kind="tool", canonical_input=tw.write_input(NEW_PATH, content="evil"))
     with pytest.raises(PermitRejectedError, match="DESCRIPTOR_NOT_FROM_CONTENT"):
-        gate.claim(attempt, content=other, registration=s.WRITE_TOOL)
+        gate.execute_file(
+            attempt,
+            content=other,
+            registration=s.WRITE_TOOL,
+            prepared=_Stand(gate, lambda g, a, t: None, True),
+            write_content=b"evil",
+            accept_read=lambda data: True,
+        )
     assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.ISSUED
 
 
@@ -406,19 +417,82 @@ def test_an_operation_is_consistent_in_itself() -> None:
         WriteChange(**{**change.model_dump(), "op": WriteOp.REPLACE})
 
 
-def _execute(st: Any, attempt: Any, body: Any, gate: Any = None, *, used: bool = True) -> Any:
-    """Run ``body`` in the callback. ``used=False``: the body does not redeem the
-    ticket for its operation, so it reports a definite failure (a COMPLETED report
-    needs a used ticket, WP08-R04)."""
+def _bound(authorization: Any) -> TicketBinding:
+    """The binding the gate gives the attempt's ticket (computed independently)."""
+    descriptor = authorization.descriptor
+    (target,) = descriptor.target_resources
+    write = target.access is ResourceAccess.WRITE
+    return TicketBinding(
+        receipt_id=authorization.receipt.receipt_id,
+        attempt_id=descriptor.attempt_id,
+        action_hash=authorization.action_hash,
+        operation=FileOperation(
+            access=target.access,
+            path=target.path,
+            change=descriptor.apply_change if write else None,
+            workspace_ref=descriptor.workspace_ref,
+        ),
+    )
+
+
+def _outcome(authorization: Any, data: bytes = b"x", **binding: object) -> FileOutcome:
+    bound = _bound(authorization).model_copy(update=binding)
+    change = bound.operation.change
+    if change is not None:
+        return FileOutcome(
+            binding=bound, result_digest=change.content_digest, result_size=change.content_size
+        )
+    return FileOutcome(binding=bound, result_digest=file_digest(data), result_size=len(data))
+
+
+class _Stand:
+    """A stand-in for the broker's prepared operation, for the gate's mechanics only:
+    it runs ``body`` where the file operation would be, then returns ``result`` (an
+    outcome, or raises a definite failure when ``used`` is False). It touches no file."""
+
+    def __init__(self, gate: Any, body: Any, used: bool, result: Any = None) -> None:
+        self._gate, self._body, self._used, self._result = gate, body, used, result
+        self.workspace_ref = _WS.get("ref", "")
+
+    def _run(self, authorization: Any, ticket: Any) -> Any:
+        self._body(self._gate, authorization, ticket)
+        if not self._used:
+            raise FileOperationFailedError("SYNTHETIC_NOT_DONE", effect=FileEffect.NONE)
+        if self._result is not None:
+            return self._result(authorization)
+        return _outcome(authorization)
+
+    def read(self, authorization: Any, ticket: Any, redeem: Any) -> Any:
+        outcome = self._run(authorization, ticket)
+        return outcome, b"x"
+
+    def write(self, authorization: Any, ticket: Any, redeem: Any, content: bytes) -> Any:
+        return self._run(authorization, ticket)
+
+    def close(self) -> None:
+        return None
+
+
+def _execute(
+    st: Any,
+    attempt: Any,
+    body: Any,
+    gate: Any = None,
+    *,
+    used: bool = True,
+    result: Any = None,
+) -> Any:
+    """Run ``body`` where the broker's operation would run, through ``execute_file``.
+    ``used=False``: the stand-in reports a definite failure."""
     gate = gate if gate is not None else lw.gate(st)
-
-    def run(authorization: Any, ticket: Any) -> SyntheticResult:
-        body(gate, authorization, ticket)
-        if used:
-            return _ok()
-        return SyntheticResult(outcome="FAILED_DEFINITE", usage=lw.zero_usage(), final=True)
-
-    return gate.execute(attempt, run=run, **lw.actual(st, attempt))
+    write = st.descriptors[attempt.attempt_id].apply_change is not None
+    return gate.execute_file(
+        attempt,
+        prepared=_Stand(gate, body, used, result),
+        write_content=b"unused" if write else None,
+        accept_read=lambda data: True,
+        **lw.actual(st, attempt),
+    )
 
 
 def _ticket_reasons(call: Any) -> tuple[str, ...]:
@@ -439,7 +513,7 @@ def test_the_ticket_is_issued_after_the_start_is_committed(world: Any) -> None:
         seen.append(gate.redeem(ticket, _read_op()))
 
     done = _execute(st, attempt, body)
-    assert done.state is A.COMPLETED
+    assert done.attempt.state is A.COMPLETED
     (binding,) = seen
     assert binding.receipt_id == attempt.receipt_id
     assert binding.attempt_id == attempt.attempt_id
@@ -447,14 +521,14 @@ def test_the_ticket_is_issued_after_the_start_is_committed(world: Any) -> None:
     assert binding.operation == _read_op()
 
 
-def test_there_is_no_ticket_outside_the_callback(world: Any) -> None:
+def test_there_is_no_ticket_outside_the_broker_path(world: Any) -> None:
     st, tree = world
     attempt = fw.consumed(st, tree)
     gate = lw.gate(st)
-    claimed = gate.claim(attempt, **lw.actual(st, attempt))
-    started, authorization = gate.start(claimed)
-    # The separate steps give no ticket; nothing made up is accepted.
-    assert not any(isinstance(v, ExecutionTicket) for v in (started, authorization))
+    # WP08-R06: the separate steps refuse a file operation; nothing made up is accepted.
+    assert _ticket_reasons(lambda: gate.claim(attempt, **lw.actual(st, attempt))) == (
+        "FILE_OPERATION_NEEDS_BROKER",
+    )
     assert _ticket_reasons(lambda: gate.redeem(ExecutionTicket(), _read_op())) == (
         "TICKET_UNKNOWN",
     )
@@ -563,12 +637,12 @@ def test_a_ticket_is_closed_when_the_callback_raises(world: Any) -> None:
     gate = lw.gate(st)
     kept: list[Any] = []
 
-    def run(authorization: Any, ticket: Any) -> SyntheticResult:
+    def body(_gate: Any, authorization: Any, ticket: Any) -> None:
         kept.append(ticket)
         raise RuntimeError("synthetic failure")
 
     with pytest.raises(RuntimeError):
-        gate.execute(attempt, run=run, **lw.actual(st, attempt))
+        _execute(st, attempt, body, gate)
     assert _ticket_reasons(lambda: gate.redeem(kept[0], _read_op())) == ("TICKET_CLOSED",)
     assert st.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
 
@@ -615,17 +689,16 @@ def test_a_ticket_is_bound_to_the_tree_of_the_operation(world: Any, tmp_path: Pa
         seen.append(_ticket_reasons(lambda: gate.redeem(ticket, wrong)))
 
     with pytest.raises(PermitRejectedError):
-        _execute(st, attempt, body)  # COMPLETED reported for an unused ticket (below)
+        _execute(st, attempt, body)  # an outcome for an unused ticket is not trusted
     assert seen == [("TICKET_MISMATCH",)]
 
 
 def test_completed_without_using_the_ticket_is_an_unknown_outcome(world: Any) -> None:
-    """WP08-R04: a file operation reported as done must have used its ticket."""
+    """WP08-R04/R06: an outcome is trusted only for a ticket redeemed for it."""
     st, tree = world
     attempt = fw.consumed(st, tree)
-    gate = lw.gate(st)
     with pytest.raises(PermitRejectedError) as excinfo:
-        gate.execute(attempt, run=lambda a, t: _ok(), **lw.actual(st, attempt))
+        _execute(st, attempt, lambda g, a, t: None)
     assert excinfo.value.reasons == ("TICKET_NOT_USED",)
     assert st.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
     assert st.journal.reservation(attempt.reservation_id).hold_micro == 1_000
@@ -634,6 +707,101 @@ def test_completed_without_using_the_ticket_is_an_unknown_outcome(world: Any) ->
 def test_a_definite_failure_needs_no_ticket_use(world: Any) -> None:
     st, tree = world
     attempt = fw.consumed(st, tree)
-    failed = SyntheticResult(outcome="FAILED_DEFINITE", usage=lw.zero_usage(), final=True)
-    done = lw.gate(st).execute(attempt, run=lambda a, t: failed, **lw.actual(st, attempt))
-    assert done.state is A.FAILED_DEFINITE
+    done = _execute(st, attempt, lambda g, a, t: None, used=False)
+    assert done.attempt.state is A.FAILED_DEFINITE
+
+
+# ================================================================ WP08-R06: no false completion
+
+
+def test_the_separate_steps_refuse_a_file_operation(world: Any) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    gate = lw.gate(st)
+    for call in (
+        lambda: gate.claim(attempt, **lw.actual(st, attempt)),
+        lambda: gate.execute(attempt, run=lambda a: _ok(), **lw.actual(st, attempt)),
+    ):
+        assert _ticket_reasons(call) == ("FILE_OPERATION_NEEDS_BROKER",)
+    # Refused before anything changed.
+    assert st.sm.state.attempts[attempt.attempt_id].state is A.PERMIT_CONSUMED
+    assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.ISSUED
+
+
+@pytest.mark.parametrize("outcome", ["COMPLETED", "FAILED_DEFINITE"])
+def test_finish_cannot_settle_a_started_file_operation(world: Any, outcome: str) -> None:
+    """A file operation left at DISPATCH_STARTED (as after a process stop): a direct
+    finish, whatever it claims, is not a broker result. It becomes unknown."""
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    gate = lw.gate(st)
+    # Simulate the earlier start of the broker path (the public steps refuse it).
+    started, _ = gate._start(gate._claim(attempt, **lw.actual(st, attempt)).model_copy())
+    result = SyntheticResult(outcome=outcome, usage=lw.zero_usage(), final=True)  # type: ignore[arg-type]
+    assert _ticket_reasons(lambda: gate.finish(started, result)) == ("FILE_OPERATION_NEEDS_BROKER",)
+    assert st.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
+    assert st.journal.reservation(lw.rsv(attempt)).hold_micro == 1_000
+
+
+def test_a_redeemed_ticket_alone_does_not_complete(world: Any) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+
+    def redeem_only(gate: Any, authorization: Any, ticket: Any) -> None:
+        gate.redeem(ticket, _read_op())
+
+    forged = lambda a: _outcome(a, b"y").model_copy(update={"result_digest": file_digest(b"z")})  # noqa: E731
+    with pytest.raises(PermitRejectedError) as excinfo:
+        _execute(st, attempt, redeem_only, result=forged)
+    assert excinfo.value.reasons == ("FILE_RESULT_UNVERIFIED",)
+    assert st.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
+
+
+@pytest.mark.parametrize("field", ["receipt_id", "attempt_id", "action_hash", "operation"])
+def test_an_outcome_for_another_operation_is_not_trusted(world: Any, field: str) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    other = {
+        "receipt_id": b.new_id(ReceiptId),
+        "attempt_id": b.new_id(AttemptId),
+        "action_hash": b.digest("other-action"),
+        "operation": _read_op("workspace/out/r.txt"),
+    }[field]
+
+    def redeem_only(gate: Any, authorization: Any, ticket: Any) -> None:
+        gate.redeem(ticket, _read_op())
+
+    changes: dict[str, Any] = {field: other}
+    with pytest.raises(PermitRejectedError) as excinfo:
+        _execute(st, attempt, redeem_only, result=lambda a: _outcome(a, b"x", **changes))
+    assert excinfo.value.reasons == ("FILE_RESULT_UNVERIFIED",)
+    assert st.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
+
+
+def test_a_write_outcome_must_report_the_approved_content(world: Any) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree, write=True)
+
+    def redeem_only(gate: Any, authorization: Any, ticket: Any) -> None:
+        gate.redeem(ticket, _write_op(authorization.descriptor))
+
+    def wrong(a: Any) -> FileOutcome:
+        return _outcome(a).model_copy(update={"result_size": 1})
+
+    with pytest.raises(PermitRejectedError) as excinfo:
+        _execute(st, attempt, redeem_only, result=wrong)
+    assert excinfo.value.reasons == ("FILE_RESULT_UNVERIFIED",)
+
+
+def test_a_consistent_outcome_after_the_redeem_completes(world: Any) -> None:
+    """The gate checks the result against the redeemed binding. A stand-in that fakes a
+    fully consistent result is accepted: code inside the process is trusted (R08)."""
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+
+    def redeem_only(gate: Any, authorization: Any, ticket: Any) -> None:
+        gate.redeem(ticket, _read_op())
+
+    done = _execute(st, attempt, redeem_only)
+    assert done.attempt.state is A.COMPLETED
+    assert done.data == b"x"

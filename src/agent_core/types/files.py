@@ -120,6 +120,16 @@ class TicketBinding(FrozenModel):
     operation: FileOperation
 
 
+class FileOutcome(FrozenModel):
+    """WP08-R06: what the broker reports after a completed file operation, for the
+    gate to check against the ticket it redeemed: the binding, and the digest and
+    size of the bytes read or of the content committed."""
+
+    binding: TicketBinding
+    result_digest: Digest
+    result_size: Annotated[int, Field(strict=True, ge=0, le=1_073_741_824)]
+
+
 class ExecutionTicket:
     """An opaque handle for one file operation inside one gate callback. It holds no
     binding and no state of its own; constructing one grants nothing."""

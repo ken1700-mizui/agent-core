@@ -154,14 +154,9 @@ def consumed(
     lw.caps(st, scopes)
     workspace_ref = tree if isinstance(tree, str) else tree.digest
     inp = canonical_input if canonical_input is not None else (WRITE_INPUT if write else READ_INPUT)
+    descriptor.setdefault("registration", s.WRITE_TOOL if write else s.READ_TOOL)
     attempt = lw.fixed_attempt(
-        st,
-        step,
-        scopes,
-        write=write,
-        workspace_ref=workspace_ref,
-        canonical_input=inp,
-        **descriptor,
+        st, step, scopes, workspace_ref=workspace_ref, canonical_input=inp, **descriptor
     )
     attempt = lw.reserve(st, attempt, 1_000)
     attempt = lw.issue(st, lw.intent(st, attempt))

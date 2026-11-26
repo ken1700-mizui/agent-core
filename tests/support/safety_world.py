@@ -57,6 +57,17 @@ WRITE_MANIFEST = tw.manifest(**tw.WRITE_BODY)
 COSTLY_MANIFEST = tw.manifest(
     tool_id="costly_read", cost_estimate=Budget(currency=Currency.XTU, micro_units=300)
 )
+# WP08-R06: synthetic operations without a file target, for the gate's start and
+# finish (a file target is settled only through the broker path).
+SYNTH_MANIFEST = tw.manifest(**tw.synthetic_body("synthetic_op"))
+SYNTH_COSTLY_MANIFEST = tw.manifest(
+    **tw.synthetic_body(
+        "synthetic_costly", cost_estimate=Budget(currency=Currency.XTU, micro_units=300)
+    )
+)
+SYNTH_CHANGE_MANIFEST = tw.manifest(
+    **tw.synthetic_body("synthetic_change", effect_class=ToolEffectClass.IRREVERSIBLE)
+)
 PERIOD = "synthetic-2026-11"
 PRICE_TABLE = PriceTable(
     price_table_id="test_virtual",
@@ -85,7 +96,14 @@ def artifact_of(sealed: ToolManifest) -> str:
 
 
 def registry(*manifests: ToolManifest) -> ToolRegistry:
-    chosen = manifests or (READ_MANIFEST, WRITE_MANIFEST, COSTLY_MANIFEST)
+    chosen = manifests or (
+        READ_MANIFEST,
+        WRITE_MANIFEST,
+        COSTLY_MANIFEST,
+        SYNTH_MANIFEST,
+        SYNTH_COSTLY_MANIFEST,
+        SYNTH_CHANGE_MANIFEST,
+    )
     reg = ToolRegistry(
         TrustedToolCatalog(entries=tuple(tw.entry(m, artifact_of(m)) for m in chosen))
     )
@@ -98,7 +116,22 @@ REGISTRY = registry()
 READ_TOOL: ToolRegistration = REGISTRY.get("read_file", "1.0.0")
 WRITE_TOOL: ToolRegistration = REGISTRY.get("write_file", "1.0.0")
 COSTLY_TOOL: ToolRegistration = REGISTRY.get("costly_read", "1.0.0")
-ALL_PINS = (pin_of(READ_TOOL), pin_of(WRITE_TOOL), pin_of(COSTLY_TOOL))
+SYNTH_TOOL: ToolRegistration = REGISTRY.get("synthetic_op", "1.0.0")
+SYNTH_COSTLY_TOOL: ToolRegistration = REGISTRY.get("synthetic_costly", "1.0.0")
+SYNTH_CHANGE_TOOL: ToolRegistration = REGISTRY.get("synthetic_change", "1.0.0")
+ALL_PINS = tuple(
+    sorted(
+        (
+            pin_of(READ_TOOL),
+            pin_of(WRITE_TOOL),
+            pin_of(COSTLY_TOOL),
+            pin_of(SYNTH_TOOL),
+            pin_of(SYNTH_COSTLY_TOOL),
+            pin_of(SYNTH_CHANGE_TOOL),
+        ),
+        key=lambda p: (p.tool_id, p.version),
+    )
+)
 
 
 def ref(**overrides: Any) -> AttemptRef:

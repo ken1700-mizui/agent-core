@@ -46,12 +46,12 @@ import re
 import secrets
 import stat
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
 from importlib.abc import SourceLoader
 from importlib.machinery import ModuleSpec
 from pathlib import Path
-from typing import Final, NoReturn
+from typing import Final, NamedTuple, NoReturn
 
 from pydantic import ValidationError
 
@@ -71,7 +71,9 @@ from agent_core.types.files import (
     EntryKind,
     ExecutionTicket,
     FileOperation,
+    FileOutcome,
     SignedWorkspaceManifest,
+    TicketBinding,
     WorkspaceEntry,
     WorkspaceManifest,
 )
@@ -97,6 +99,13 @@ MAX_WRITE_BYTES: Final = 65_536
 
 # WP08-R04: the builtin file tools this broker runs, with the access each one has.
 # Their trusted registry entries must pin ``builtin_artifact_hash()``.
+#
+# WP08-R08, what this does NOT guarantee: the hash covers this module's source as
+# loaded and as it is on disk now (they must agree with the trusted catalog). It
+# does not cover the running Python objects, the bytecode actually executed, the
+# modules this one imports, or the interpreter. It is no defence against code
+# that runs inside this process (it can replace any function). Isolating and
+# pinning executables properly is left to a later phase.
 BUILTIN_FILE_TOOLS: dict[tuple[str, str], ResourceAccess] = {
     ("read_file", "1.0.0"): ResourceAccess.READ,
     ("write_file", "1.0.0"): ResourceAccess.WRITE,
@@ -387,16 +396,18 @@ class PreparedWorkspace:
         if authorization.descriptor != self._descriptor:
             _none("PREPARED_FOR_ANOTHER_OPERATION")
 
-    def _redeem(self, ticket: ExecutionTicket, redeem: Redeem, operation: FileOperation) -> None:
+    def _redeem(
+        self, ticket: ExecutionTicket, redeem: Redeem, operation: FileOperation
+    ) -> TicketBinding:
         """Use the ticket before any part of the target is opened."""
         try:
-            redeem(ticket, operation)
+            return redeem(ticket, operation)
         except PermitRejectedError as exc:
             raise FileOperationFailedError(*exc.reasons, effect=FileEffect.NONE) from None
 
     def read(
         self, authorization: DispatchAuthorization, ticket: ExecutionTicket, redeem: Redeem
-    ) -> bytes:
+    ) -> tuple[FileOutcome, bytes]:
         """The target's bytes, read only from a verified fd of a regular file with one
         link (WP08-R03). Reading changes nothing, so every failure is definite."""
         self._check_still_safe(authorization)
@@ -404,7 +415,7 @@ class PreparedWorkspace:
         if len(targets) != 1 or targets[0].access is not ResourceAccess.READ:
             _none("NOT_A_READ")
         path = targets[0].path
-        self._redeem(
+        binding = self._redeem(
             ticket,
             redeem,
             FileOperation(
@@ -429,7 +440,10 @@ class PreparedWorkspace:
                 os.close(fd)
         if _state(before) != _state(after) or len(data) != after.st_size:
             _none("TARGET_CHANGED_DURING_READ")
-        return data
+        outcome = FileOutcome(
+            binding=binding, result_digest=file_digest(data), result_size=len(data)
+        )
+        return outcome, data
 
     def write(
         self,
@@ -437,7 +451,7 @@ class PreparedWorkspace:
         ticket: ExecutionTicket,
         redeem: Redeem,
         content: bytes,
-    ) -> None:
+    ) -> FileOutcome:
         """One CREATE or REPLACE (WP08-R05). The ticket is used first, for the change
         computed from the actual bytes. Then: the expected state is checked, the
         bytes go to a new temporary file in the same directory (unpredictable name,
@@ -462,7 +476,7 @@ class PreparedWorkspace:
             content_digest=file_digest(content),
             content_size=len(content),
         )
-        self._redeem(
+        binding = self._redeem(
             ticket,
             redeem,
             FileOperation(
@@ -474,8 +488,11 @@ class PreparedWorkspace:
         )
         with self.resolve_parent(change.path) as (parent, name):
             self._check_expected(parent, name, change)
-            temp = _write_temporary(parent, content)
+            temp = _write_temporary(parent, content, authorization.receipt.receipt_id)
             self._commit(parent, name, temp, change, content)
+        return FileOutcome(
+            binding=binding, result_digest=actual.content_digest, result_size=len(content)
+        )
 
     def _check_expected(self, parent: int, name: str, change: WriteChange) -> None:
         if change.op is WriteOp.CREATE:
@@ -547,10 +564,16 @@ def _check_artifact(descriptor: ActionDescriptor) -> None:
         raise FileOperationRefusedError("ARTIFACT_MISMATCH")
 
 
-def _write_temporary(parent: int, content: bytes) -> str:
+def temp_tag(receipt_id: str) -> str:
+    """The 16 hex digits that tie a temporary file to the receipt of its write."""
+    return hashlib.sha256(_TEMP_TAG_DOMAIN + str(receipt_id).encode()).hexdigest()[:16]
+
+
+def _write_temporary(parent: int, content: bytes, receipt_id: str) -> str:
     """A new temporary file in ``parent`` holding ``content``, written in full and
-    fsynced. On failure it is removed again (the target was never touched)."""
-    temp = TEMP_FILE_PREFIX + secrets.token_hex(16)
+    fsynced. Its name is the prefix, the receipt's tag and 16 random hex digits.
+    On failure it is removed again (the target was never touched)."""
+    temp = TEMP_FILE_PREFIX + temp_tag(receipt_id) + secrets.token_hex(8)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
         fd = os.open(temp, flags, 0o600, dir_fd=parent)
@@ -579,7 +602,16 @@ def _discard(parent: int, temp: str) -> None:
         return
 
 
-_TEMP_NAME: Final = re.compile(re.escape(TEMP_FILE_PREFIX) + r"[0-9a-f]{32}")
+_TEMP_NAME: Final = re.compile(re.escape(TEMP_FILE_PREFIX) + r"([0-9a-f]{16})[0-9a-f]{16}")
+_TEMP_TAG_DOMAIN: Final = b"agent-core/broker-temp-tag/v1\x00"
+
+
+class Recovery(NamedTuple):
+    """What ``recover_temporaries`` removed, and the broker-form temporary files it
+    left because no listed receipt accounts for them."""
+
+    removed: tuple[str, ...]
+    kept: tuple[str, ...]
 
 
 class SyntheticFileBroker:
@@ -598,13 +630,22 @@ class SyntheticFileBroker:
     def __init_subclass__(cls, **kwargs: object) -> None:
         raise TypeError("the file broker is not extended (its code is the pinned artifact)")
 
-    def recover_temporaries(self) -> tuple[str, ...]:
-        """Remove the broker's temporary files left by a stopped process. Only names
-        of the exact form (the prefix and 32 hex digits) that are regular files of
-        ours are removed; targets, links and anything else are left alone. Runs
-        under the writer lock (refused while an operation holds it), after the
-        same root and manifest checks as ``prepare``. It never writes or retries."""
+    def recover_temporaries(
+        self, *, policy: Policy | None, tenant_id: str, receipts: Collection[str]
+    ) -> Recovery:
+        """An explicit maintenance operation (WP08-R07; only the composition root can
+        reach the broker): remove the temporary files left by stopped writes whose
+        receipts the caller lists from the ledger (``recovery_receipts``).
+
+        - The tree must be the current policy's trusted tree for the tenant, after
+          the same root and manifest checks as ``prepare``, under the writer lock.
+        - Removed: regular files of ours whose name is the broker form and whose tag
+          names a listed receipt. Kept (reported): broker-form files of no listed
+          receipt, or that are not regular files of ours. Anything else is not
+          looked at. Targets are never removed; nothing is written or retried.
+        Detailed recovery management is WP-12."""
         _require_safe_resolution()
+        tags = {temp_tag(r) for r in receipts}
         area_fd = _open_area(self._area)
         try:
             root_fd = self._open_root(area_fd)
@@ -617,9 +658,16 @@ class SyntheticFileBroker:
                     manifest.root_inode,
                 ) != (root.st_dev, root.st_ino):
                     raise WorkspaceRejectedError("ROOT_IDENTITY_MISMATCH")
+                if (
+                    type(policy) is not Policy
+                    or policy.tenant_id != tenant_id
+                    or manifest_digest(manifest) not in policy.trusted_synthetic_workspaces
+                ):
+                    raise WorkspaceRejectedError("WORKSPACE_NOT_TRUSTED")
                 removed: list[str] = []
-                _sweep(root_fd, "", device, removed)
-                return tuple(sorted(removed))
+                kept: list[str] = []
+                _sweep(root_fd, "", device, tags, removed, kept)
+                return Recovery(tuple(sorted(removed)), tuple(sorted(kept)))
             finally:
                 os.close(root_fd)
         finally:
@@ -706,7 +754,14 @@ class SyntheticFileBroker:
         return verify_manifest(self._key, signed)
 
 
-def _sweep(dir_fd: int, prefix: str, device: int, removed: list[str]) -> None:
+def _sweep(
+    dir_fd: int,
+    prefix: str,
+    device: int,
+    tags: set[str],
+    removed: list[str],
+    kept: list[str],
+) -> None:
     for entry in sorted(os.scandir(dir_fd), key=lambda e: e.name):
         info = entry.stat(follow_symlinks=False)
         if stat.S_ISDIR(info.st_mode):
@@ -714,16 +769,19 @@ def _sweep(dir_fd: int, prefix: str, device: int, removed: list[str]) -> None:
                 continue  # not ours or another file system: never descended into
             child = os.open(entry.name, _dir_flags(), dir_fd=dir_fd)
             try:
-                _sweep(child, f"{prefix}{entry.name}/", device, removed)
+                _sweep(child, f"{prefix}{entry.name}/", device, tags, removed, kept)
             finally:
                 os.close(child)
-        elif (
-            _TEMP_NAME.fullmatch(entry.name)
-            and stat.S_ISREG(info.st_mode)
-            and info.st_uid == os.geteuid()
-        ):
+            continue
+        match = _TEMP_NAME.fullmatch(entry.name)
+        if match is None:
+            continue
+        ours = stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+        if ours and match.group(1) in tags:
             os.unlink(entry.name, dir_fd=dir_fd)
             removed.append(prefix + entry.name)
+        else:
+            kept.append(prefix + entry.name)
     os.fsync(dir_fd)
 
 

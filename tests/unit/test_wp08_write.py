@@ -25,7 +25,8 @@ from typing import Any
 import pytest
 
 from agent_core.adapters import file_broker
-from agent_core.runtime.file_execution import run_file_operation
+from agent_core.adapters.file_broker import temp_tag
+from agent_core.runtime.file_execution import recovery_receipts, run_file_operation
 from agent_core.safety.workspace import file_digest
 from agent_core.types.cost import ReservationState
 from agent_core.types.errors import (
@@ -34,8 +35,10 @@ from agent_core.types.errors import (
     FileOperationRefusedError,
     IllegalTransitionError,
     PermitRejectedError,
+    WorkspaceRejectedError,
 )
 from agent_core.types.files import TEMP_FILE_PREFIX
+from agent_core.types.ids import ReceiptId, TenantId
 from agent_core.types.ledger import RecoverInFlight, RevokeAccess
 from agent_core.types.records import AttemptState
 from agent_core.types.safety import ReceiptState, StopScopeType, ToolContent
@@ -508,22 +511,58 @@ def test_a_stop_or_revocation_after_preparing_prevents_the_write(world: Any, cha
 # ================================================================ temporary files
 
 
-def test_only_broker_temporaries_are_recovered(world: Any) -> None:
+def _policy_now(st: Any) -> Any:
+    return st.journal.policy(b.TENANT)
+
+
+def _temp_named(tree: fw.Tree, where: str, name: str, data: bytes = b"left over\n") -> Path:
+    path = tree.root / where / name
+    path.write_bytes(data)
+    path.chmod(0o600)
+    return path
+
+
+def test_only_temporaries_of_listed_receipts_are_recovered(world: Any) -> None:
+    """WP08-R07: a name of the right form is not enough. Only a temporary file whose
+    tag names a receipt the caller listed (from the ledger) is removed."""
     st, tree = world
-    temp = tree.root / "workspace/out" / (TEMP_FILE_PREFIX + "0" * 32)
-    temp.write_bytes(b"left over\n")
-    temp.chmod(0o600)
-    lookalike = tree.root / "workspace" / (TEMP_FILE_PREFIX + "not-hex")
-    lookalike.write_bytes(b"keep\n")
-    linked = tree.root / "workspace" / (TEMP_FILE_PREFIX + "1" * 32)
+    mine, other = b.new_id(ReceiptId), b.new_id(ReceiptId)
+    listed = _temp_named(tree, "workspace/out", TEMP_FILE_PREFIX + temp_tag(mine) + "0" * 16)
+    unlisted = _temp_named(tree, "workspace/out", TEMP_FILE_PREFIX + temp_tag(other) + "1" * 16)
+    untagged = _temp_named(tree, "workspace", TEMP_FILE_PREFIX + "2" * 32)
+    lookalike = _temp_named(tree, "workspace", TEMP_FILE_PREFIX + "not-hex")
+    linked = tree.root / "workspace" / (TEMP_FILE_PREFIX + temp_tag(mine) + "3" * 16)
     linked.symlink_to(tree.root / OLD)
     before = {p: (tree.root / p).read_bytes() for p in fw.FILES}
-    removed = fw.broker(st.keys.owner, tree).recover_temporaries()
-    assert removed == (f"workspace/out/{TEMP_FILE_PREFIX}{'0' * 32}",)
-    assert not temp.exists()
-    assert lookalike.exists()
-    assert linked.is_symlink()  # only regular files of ours are removed
+    result = fw.broker(st.keys.owner, tree).recover_temporaries(
+        policy=_policy_now(st), tenant_id=b.TENANT, receipts=(mine,)
+    )
+    assert result.removed == (str(listed.relative_to(tree.root)),)
+    assert set(result.kept) == {str(p.relative_to(tree.root)) for p in (unlisted, untagged, linked)}
+    assert not listed.exists()
+    assert unlisted.exists() and untagged.exists() and lookalike.exists()  # noqa: PT018
+    assert linked.is_symlink()  # only regular files of ours are ever removed
     assert {p: (tree.root / p).read_bytes() for p in fw.FILES} == before
+
+
+@pytest.mark.parametrize("policy", ["none", "untrusted", "other-tenant"])
+def test_recovery_needs_the_current_policy_to_trust_the_tree(world: Any, policy: str) -> None:
+    st, tree = world
+    receipt = b.new_id(ReceiptId)
+    temp = _temp_named(tree, "workspace/out", TEMP_FILE_PREFIX + temp_tag(receipt) + "0" * 16)
+    chosen = {
+        "none": None,
+        "untrusted": s.policy(trusted_synthetic_workspaces=()),
+        "other-tenant": s.policy(
+            tenant_id=b.new_id(TenantId), trusted_synthetic_workspaces=(tree.digest,)
+        ),
+    }[policy]
+    with pytest.raises(WorkspaceRejectedError) as excinfo:
+        fw.broker(st.keys.owner, tree).recover_temporaries(
+            policy=chosen, receipts=(receipt,), tenant_id=b.TENANT
+        )
+    assert excinfo.value.reasons == ("WORKSPACE_NOT_TRUSTED",)
+    assert temp.exists()
 
 
 def test_recovery_waits_for_the_writer_lock(world: Any) -> None:
@@ -531,13 +570,36 @@ def test_recovery_waits_for_the_writer_lock(world: Any) -> None:
     attempt = fw.consumed(st, tree, write=True, canonical_input=_create())
     broker = fw.broker(st.keys.owner, tree)
     with (
-        broker.prepare(
-            st.journal.recorded_descriptor(attempt.attempt_id), st.journal.policy(b.TENANT)
-        ),
+        broker.prepare(st.journal.recorded_descriptor(attempt.attempt_id), _policy_now(st)),
         pytest.raises(FileOperationRefusedError) as excinfo,
     ):
-        fw.broker(st.keys.owner, tree).recover_temporaries()
+        fw.broker(st.keys.owner, tree).recover_temporaries(
+            policy=_policy_now(st), tenant_id=b.TENANT, receipts=()
+        )
     assert excinfo.value.reasons == ("WORKSPACE_BUSY",)
+
+
+def test_a_left_temporary_is_tagged_with_its_receipt(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree, write=True, canonical_input=_replace())
+    files = fw.AfterPrepare(fw.broker(st.keys.owner, tree), lambda: _fail_on(monkeypatch, "rename"))
+    with pytest.raises(FileOperationFailedError):
+        _run(st, tree, attempt, b"synthetic replaced\n", files=files)
+    monkeypatch.undo()
+    (left,) = _temps(tree.root)
+    assert Path(left).name.startswith(TEMP_FILE_PREFIX + temp_tag(str(attempt.receipt_id)))
+    # The runtime lists exactly the unknown file operations of this tree.
+    attempts = list(st.sm.state.attempts.values())
+    receipts = recovery_receipts(ledger=st.journal, attempts=attempts, workspace_ref=tree.digest)
+    assert receipts == (str(attempt.receipt_id),)
+    result = fw.broker(st.keys.owner, tree).recover_temporaries(
+        policy=_policy_now(st), tenant_id=b.TENANT, receipts=receipts
+    )
+    assert result.removed == (left,)
+    assert (tree.root / OLD).read_bytes() == OLD_BYTES  # the target is never touched
+    _unknown(st, attempt)  # recovery settles nothing and retries nothing
 
 
 # ================================================================ real process stop
@@ -583,7 +645,7 @@ def _before_permit(st: Any, tree: fw.Tree, canonical_input: str) -> Any:
         st,
         step,
         scopes,
-        write=True,
+        registration=s.WRITE_TOOL,
         workspace_ref=tree.digest,
         canonical_input=canonical_input,
     )
@@ -632,8 +694,17 @@ def test_a_process_stopped_during_a_write(
 
         # Recovery removes only the broker's temporary files; never the target,
         # and nothing is written again.
-        removed = fw.broker(st2.keys.owner, tree).recover_temporaries()
-        assert sorted(removed) == temps
+        receipts = recovery_receipts(
+            ledger=st2.journal,
+            attempts=list(st2.sm.state.attempts.values()),
+            workspace_ref=tree.digest,
+        )
+        assert receipts == (str(stopped.receipt_id),)
+        recovered = fw.broker(st2.keys.owner, tree).recover_temporaries(
+            policy=st2.journal.policy(b.TENANT), tenant_id=b.TENANT, receipts=receipts
+        )
+        assert sorted(recovered.removed) == temps
+        assert recovered.kept == ()
         assert _temps(tree.root) == []
         if committed:
             assert (tree.root / target).read_bytes() == data

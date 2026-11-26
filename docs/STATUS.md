@@ -11,8 +11,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1 の WP-08 の実装を終え、ChatGPT のレビューを待っている**（`impl/phase-1-foundation`）。第1回（`677201d`。目録、ApplyPlan、実行券、S19）は 94/100。第2回で、オーナーが Phase 1 の管理された合成の環境に限って承認した `dir_fd` の方式（ADR-0008。`openat2` と同等とは扱わない）により、1ファイルの読み取りと書き込み（CREATE、REPLACE）を、既存のゲートを通して実装した（WP08-R01〜R05）。条件を満たせない環境では、S19 で拒否する。記録は `docs/design/phase-1/WP-08_FILE_OPS.md` の9章。WP-09 は R07 の再レビューに合格した（`25440d9`）。WP-01 は、CI が未実行のため、完了の条件をすべて満たしたとは記録しない。WP-10、WP-12〜WP-15 の実装は、まだ認められていない |
-| 次の作業 | WP-08 の第2回の実装のレビューを待つ。指示があるまで、次の WP を始めない |
+| 今の段階 | **WP-08 は 95/100 の条件付き合格。限定修正 WP08-R06〜R09 を済ませ、WP-14（最小の Context Engine）を実装している**（`impl/phase-1-foundation`）。WP-08 の記録は `docs/design/phase-1/WP-08_FILE_OPS.md`（9章、10章）と ADR-0008。WP-09 は R07 の再レビューに合格した（`25440d9`）。WP-01 は、CI が未実行のため、完了の条件をすべて満たしたとは記録しない。WP-10、WP-12、WP-13、WP-15 の実装は、まだ認められていない |
+| 次の作業 | WP-14 の実装と記録（`docs/design/phase-1/WP-14_CONTEXT.md`）。その後、ChatGPT のレビューを待つ。WP-15 には進まない |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
