@@ -289,3 +289,61 @@ class StateDivergenceError(AgentCoreError):
 
     code = "STATE_DIVERGENCE"
     fatal = True
+
+
+# ---------------------------------------------------------------- tools (WP-07)
+
+
+class ToolError(AgentCoreError):
+    """Base class of tool registry errors. Nothing was registered or proposed."""
+
+    code = "TOOL_ERROR"
+
+
+class UnknownToolError(ToolError):
+    code = "UNKNOWN_TOOL"
+
+
+class UnknownToolVersionError(ToolError):
+    code = "UNKNOWN_TOOL_VERSION"
+
+
+class ToolNotApprovedError(ToolError):
+    """No matching owner-approved entry (manifest_hash and artifact_hash) exists."""
+
+    code = "TOOL_NOT_APPROVED"
+
+
+class ToolAlreadyRegisteredError(ToolError):
+    """Another manifest is already registered for this tool_id and version."""
+
+    code = "TOOL_ALREADY_REGISTERED"
+
+
+class ToolKindNotAllowedError(ToolError):
+    """The kind or a declared feature is not allowed in the current Phase."""
+
+    code = "TOOL_KIND_NOT_ALLOWED"
+
+
+class ToolManifestError(ToolError):
+    code = "TOOL_MANIFEST_INVALID"
+
+
+class _ToolDataError(ToolError):
+    def __init__(self, issues: tuple[ValidationIssue, ...]) -> None:
+        summary = ", ".join(f"{i.location}: {i.type}" for i in issues) or "invalid"
+        super().__init__(f"{self.code}: {summary}")
+        self.issues = issues
+
+
+class ToolInputError(_ToolDataError):
+    """Tool input does not match the input schema. Names and values are not echoed."""
+
+    code = "TOOL_INPUT_INVALID"
+
+
+class ToolOutputError(_ToolDataError):
+    """Tool output does not match the output schema or size limit."""
+
+    code = "TOOL_OUTPUT_INVALID"
