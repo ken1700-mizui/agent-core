@@ -16,7 +16,9 @@ module depends on ports only, never on a concrete adapter.
 
 from __future__ import annotations
 
-from typing import Any
+import threading
+from collections.abc import Callable
+from typing import Any, Concatenate
 
 from agent_core.identity.generator import IdGenerator
 from agent_core.ports.clock import Clock
@@ -44,6 +46,7 @@ from agent_core.types.errors import (
     JournalHeadMismatchError,
     JournalStorageError,
     RunTenantMismatchError,
+    RuntimeReentryError,
     RuntimeReloadRequiredError,
     StaleEventEpochError,
     StaleStateError,
@@ -90,6 +93,31 @@ _NOTHING_STORED = (
 EVENT_LABELS = ("synthetic",)
 
 
+def _exclusive[**P, T](
+    method: Callable[Concatenate[RuntimeStateMachine, P], T],
+) -> Callable[Concatenate[RuntimeStateMachine, P], T]:
+    """Run one command at a time (WP04-R06).
+
+    A command called while another is in progress (re-entry from an evidence
+    verifier, or another thread) is refused with ``RuntimeReentryError``. The
+    state and head the command plans from are fixed at its start.
+    """
+
+    def wrapper(self: RuntimeStateMachine, /, *args: P.args, **kwargs: P.kwargs) -> T:
+        if not self._command_lock.acquire(blocking=False):
+            raise RuntimeReentryError("another command of this runtime is in progress")
+        try:
+            self._base = (self._state, self._head)
+            return method(self, *args, **kwargs)
+        finally:
+            self._base = None
+            self._command_lock.release()
+
+    wrapper.__name__ = method.__name__
+    wrapper.__doc__ = method.__doc__
+    return wrapper
+
+
 class RuntimeStateMachine:
     def __init__(
         self,
@@ -116,6 +144,8 @@ class RuntimeStateMachine:
         self._head = head
         self._late = False
         self._reload_required = False
+        self._command_lock = threading.Lock()
+        self._base: tuple[RuntimeState, HeadExpectation] | None = None
 
     @classmethod
     def load(
@@ -174,6 +204,7 @@ class RuntimeStateMachine:
 
     # ------------------------------------------------------------ tasks
 
+    @_exclusive
     def create_task(
         self,
         *,
@@ -194,12 +225,14 @@ class RuntimeStateMachine:
         self._commit((plan_task_create(self._state, task),))
         return self._state.tasks[task.task_id]
 
+    @_exclusive
     def set_task_status(self, task: Task, target: TaskStatus) -> Task:
         self._commit((plan_task_status(self._state, task, target),))
         return self._state.tasks[task.task_id]
 
     # ------------------------------------------------------------ runs
 
+    @_exclusive
     def start_run(self, task: Task, *, run_grant_ref: RunGrantId) -> Run:
         """Create the next Run of ``task``; the Task's budget and caps carry over unchanged."""
         transitions: list[Transition] = []
@@ -223,6 +256,7 @@ class RuntimeStateMachine:
         self._commit(tuple(transitions))
         return self._state.runs[run.run_id]
 
+    @_exclusive
     def set_run_status(
         self, run: Run, target: RunStatus, evidence: RunEvidence | None = None
     ) -> Run:
@@ -232,6 +266,7 @@ class RuntimeStateMachine:
 
     # ------------------------------------------------------------ steps
 
+    @_exclusive
     def create_step(self, run: Run, kind: StepKind) -> Step:
         step = Step(
             step_id=self._ids.new(StepId),
@@ -243,12 +278,14 @@ class RuntimeStateMachine:
         self._commit((plan_step_create(self._state, step),))
         return self._state.steps[step.step_id]
 
+    @_exclusive
     def set_step_status(self, step: Step, target: StepStatus) -> Step:
         self._commit((plan_step_status(self._state, step, target),))
         return self._state.steps[step.step_id]
 
     # ------------------------------------------------------------ attempts
 
+    @_exclusive
     def create_attempt(self, step: Step) -> Attempt:
         attempt = Attempt(
             attempt_id=self._ids.new(AttemptId),
@@ -263,6 +300,7 @@ class RuntimeStateMachine:
         self._commit((plan_attempt_create(self._state, attempt),))
         return self._state.attempts[attempt.attempt_id]
 
+    @_exclusive
     def advance_attempt(
         self,
         attempt: Attempt,
@@ -286,11 +324,19 @@ class RuntimeStateMachine:
     def _commit(self, transitions: tuple[Transition, ...]) -> Event:
         if self._reload_required:
             raise RuntimeReloadRequiredError("reload the runtime from the journal")
+        if self._base is None:
+            raise RuntimeReentryError("commit outside a runtime command")
+        # The state and head the transitions were planned from (fixed at the
+        # start of the command, before any evidence is checked).
+        base_state, expected = self._base
         payload = RuntimePayload(transitions=transitions)
-        # Dry run of the whole payload on the current state (no I/O, no change).
-        _, run_id = apply_payload(self._state, payload)
+        # Dry run of the whole payload on the planning state (no I/O, no change).
+        _, run_id = apply_payload(base_state, payload)
         self._verify_evidence(transitions)
-        expected = self._head
+        if self._state is not base_state or self._head is not expected:
+            # Something changed the runtime while evidence was being checked.
+            self._reload_required = True
+            raise StaleStateError("the runtime state changed during verification")
 
         def write(event_id: EventId) -> Event:
             draft = EventDraft(
@@ -328,9 +374,13 @@ class RuntimeStateMachine:
         try:
             if event.tenant_seq != expected.tenant_seq + 1 or event.prev_hash != expected.head_hash:
                 raise StateRebuildError("stored event is not the next position")
-            self._state = apply_event(self._state, event)
-        except StateRebuildError as exc:
+            self._state = apply_event(base_state, event)
+        except Exception as exc:
+            # Committed but not applied: never continue from the old state.
             self._reload_required = True
             raise StateDivergenceError("stored event does not fold into the state") from exc
+        except BaseException:
+            self._reload_required = True
+            raise
         self._head = HeadExpectation(tenant_seq=event.tenant_seq, head_hash=event_hash(event))
         return event

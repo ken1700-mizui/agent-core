@@ -700,7 +700,7 @@ def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
         if event.type != RUNTIME_EVENT_TYPE:
             raise StateRebuildError("unknown event type")
         if event.schema_version != RUNTIME_EVENT_SCHEMA_VERSION or event.payload is None:
-            raise StateRebuildError("runtime events need schema_version 2 and a payload")
+            raise StateRebuildError("runtime events need schema_version 3 and a payload")
         if event.run_id is not None:
             expected = state.run_seqs.get(event.run_id, 0) + 1
             if event.run_seq != expected:

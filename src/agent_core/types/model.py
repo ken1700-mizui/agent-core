@@ -24,6 +24,7 @@ from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from agent_core.types.base import FrozenModel, ImmutableRecord
 from agent_core.types.ids import AttemptId, ModelRequestId
+from agent_core.types.serialization import StrictJsonError, parse_strict_json
 from agent_core.types.values import Budget, Count, Digest, Identifier, SemVer
 
 MAX_TEXT_CHARS = 1_000_000
@@ -86,19 +87,6 @@ class TextBlock(FrozenModel):
         return value
 
 
-def _reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate key in tool arguments")
-        result[key] = value
-    return result
-
-
-def _reject_constant(_name: str) -> object:
-    raise ValueError("non-finite number in tool arguments")
-
-
 class ToolUseBlock(FrozenModel):
     """A tool request from the model. Data only: it is never executed from here."""
 
@@ -111,12 +99,13 @@ class ToolUseBlock(FrozenModel):
     @field_validator("arguments")
     @classmethod
     def _canonical_object(cls, value: str) -> str:
+        # The same strict rules as load_json (WP02-R01): duplicate keys,
+        # non-finite numbers, invalid strings and excessive nesting are rejected.
+        # The error names only the rule, never the input.
         try:
-            parsed = json.loads(
-                value, object_pairs_hook=_reject_duplicates, parse_constant=_reject_constant
-            )
-        except ValueError:
-            raise ValueError("tool arguments must be valid JSON") from None
+            parsed = parse_strict_json(value)
+        except StrictJsonError as exc:
+            raise ValueError(f"tool arguments rejected: {exc.issue_type}") from None
         if not isinstance(parsed, dict):
             raise ValueError("tool arguments must be a JSON object")
         canonical = json.dumps(
@@ -263,14 +252,19 @@ class ModelRequest(ImmutableRecord):
         if len(set(names)) != len(names):
             raise ValueError("tool names must be unique")
         asked: set[str] = set()
+        answered: set[str] = set()
         for message in self.messages:
             for block in message.content:
                 if isinstance(block, ToolUseBlock):
                     if block.id in asked:
                         raise ValueError("tool_use ids must be unique")
                     asked.add(block.id)
-                elif isinstance(block, ToolResultBlock) and block.tool_use_id not in asked:
-                    raise ValueError("a tool result must answer an earlier tool_use")
+                elif isinstance(block, ToolResultBlock):
+                    if block.tool_use_id not in asked:
+                        raise ValueError("a tool result must answer an earlier tool_use")
+                    if block.tool_use_id in answered:
+                        raise ValueError("a tool_use is answered at most once")
+                    answered.add(block.tool_use_id)
         return self
 
 
@@ -283,13 +277,27 @@ class UsageStatus(StrEnum):
     UNKNOWN = "UNKNOWN"  # nothing known; never treated as zero
 
 
+class CostStatus(StrEnum):
+    """Status of the bill, independent of the token usage (WP05-R01)."""
+
+    FINAL = "FINAL"
+    UNKNOWN = "UNKNOWN"
+
+
 class Usage(FrozenModel):
+    """Token usage and cost, each with its own status.
+
+    Zero tokens do not imply a known zero cost, and an unknown token usage does
+    not exclude a final bill reported separately by a provider.
+    """
+
     status: UsageStatus
     input_tokens: TokenCount | None
     output_tokens: TokenCount | None
     total_tokens: TokenCount | None
     # Integer minimum units; Phase 1 allows only XTU (Currency).
     cost: Budget | None
+    cost_status: CostStatus
     # True for Fake Provider values: synthetic test data, not a real measurement.
     synthetic: bool
 
@@ -302,10 +310,12 @@ class Usage(FrozenModel):
             if self.total_tokens != (self.input_tokens or 0) + (self.output_tokens or 0):
                 raise ValueError("total_tokens must equal input_tokens + output_tokens")
         elif self.status is UsageStatus.UNKNOWN:
-            if any(n is not None for n in numbers) or self.cost is not None:
-                raise ValueError("unknown usage carries no numbers (it is not zero)")
+            if any(n is not None for n in numbers):
+                raise ValueError("unknown usage carries no token numbers (it is not zero)")
         elif self.total_tokens is not None:
             raise ValueError("partial usage has no total")
+        if (self.cost is None) != (self.cost_status is CostStatus.UNKNOWN):
+            raise ValueError("a cost is present exactly when the cost status is FINAL")
         return self
 
     @classmethod
@@ -316,6 +326,7 @@ class Usage(FrozenModel):
             output_tokens=None,
             total_tokens=None,
             cost=None,
+            cost_status=CostStatus.UNKNOWN,
             synthetic=synthetic,
         )
 
@@ -339,7 +350,10 @@ class ModelResponse(ImmutableRecord):
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        uses_tool = any(isinstance(b, ToolUseBlock) for b in self.content)
+        tool_ids = [b.id for b in self.content if isinstance(b, ToolUseBlock)]
+        if len(set(tool_ids)) != len(tool_ids):
+            raise ValueError("tool_use ids must be unique within a response")
+        uses_tool = bool(tool_ids)
         if uses_tool != (self.stop_reason is StopReason.TOOL_USE):
             raise ValueError("stop_reason TOOL_USE exactly when a tool is requested")
         if self.final_usage != (self.usage.status is UsageStatus.FINAL):

@@ -22,6 +22,7 @@ from agent_core.adapters.fake_model import (
 )
 from agent_core.ports.model import ModelPort
 from agent_core.types.model import (
+    CostStatus,
     GenerationParams,
     ModelCallOutcome,
     ModelResponse,
@@ -30,6 +31,7 @@ from agent_core.types.model import (
     StopReason,
     TextBlock,
     ToolUseBlock,
+    Usage,
     UsageStatus,
 )
 from agent_core.types.model_errors import (
@@ -37,11 +39,13 @@ from agent_core.types.model_errors import (
     ModelDefiniteFailureError,
     ModelError,
     ModelInvalidRequestError,
+    ModelNotSentError,
     ModelOutcomeUnknownError,
     ModelResponseInvalidError,
     ModelTimeoutError,
     ModelUnsupportedError,
 )
+from agent_core.types.values import Budget, Currency
 from support import model_world as m
 
 PRICE = FakePrice(input_micro_xtu_per_mtok=1_000_000, output_micro_xtu_per_mtok=4_000_000)
@@ -162,8 +166,8 @@ def test_exhausted_sequence_is_an_explicit_error() -> None:
     [
         (
             FakeFaultKind.FAILED_BEFORE_SEND,
-            ModelDefiniteFailureError,
-            ModelCallOutcome.FAILED_DEFINITE,
+            ModelNotSentError,
+            ModelCallOutcome.NOT_SENT,
         ),
         (
             FakeFaultKind.PROVIDER_REJECTED,
@@ -187,9 +191,19 @@ def test_faults_become_typed_errors_with_a_clear_outcome(
         # Unknown is never reported as a known zero.
         assert excinfo.value.usage.status in (UsageStatus.UNKNOWN, UsageStatus.PARTIAL)
         assert excinfo.value.usage.total_tokens is None
-    else:
+    elif outcome is ModelCallOutcome.NOT_SENT:
+        # Nothing left the process: zero tokens and a known zero cost.
         assert excinfo.value.usage.status is UsageStatus.FINAL
         assert excinfo.value.usage.total_tokens == 0
+        assert excinfo.value.usage.cost_status is CostStatus.FINAL
+        assert excinfo.value.usage.cost is not None
+        assert excinfo.value.usage.cost.micro_units == 0
+    else:
+        # Not processed: zero tokens, but a zero bill is not known (WP05-R01).
+        assert excinfo.value.usage.status is UsageStatus.FINAL
+        assert excinfo.value.usage.total_tokens == 0
+        assert excinfo.value.usage.cost_status is CostStatus.UNKNOWN
+        assert excinfo.value.usage.cost is None
 
 
 def test_stream_interruption_reports_partial_usage() -> None:
@@ -219,7 +233,7 @@ def test_timeout_is_decided_from_synthetic_elapsed_time() -> None:
 
 def test_errors_never_retry_inside_the_provider() -> None:
     request = m.request()
-    provider = _provider(_script(request, _fault(FakeFaultKind.FAILED_BEFORE_SEND), _reply()))
+    provider = _provider(_script(request, _fault(FakeFaultKind.PROVIDER_REJECTED), _reply()))
     with pytest.raises(ModelDefiniteFailureError):
         provider.complete(request)
     assert provider.calls == 1
@@ -269,3 +283,19 @@ def test_no_network_is_needed() -> None:
         socket.socket()
     request = m.request()
     assert _provider(_script(request, _reply())).complete(request).final_usage
+
+
+def test_unknown_outcome_may_carry_a_final_bill_from_an_adapter() -> None:
+    # WP05-R01: the contract does not exclude separately known billing data.
+    usage = Usage(
+        status=UsageStatus.UNKNOWN,
+        input_tokens=None,
+        output_tokens=None,
+        total_tokens=None,
+        cost=Budget(currency=Currency.XTU, micro_units=12),
+        cost_status=CostStatus.FINAL,
+        synthetic=True,
+    )
+    error = ModelOutcomeUnknownError("synthetic", usage=usage)
+    assert error.outcome is ModelCallOutcome.UNKNOWN
+    assert error.usage.cost is not None

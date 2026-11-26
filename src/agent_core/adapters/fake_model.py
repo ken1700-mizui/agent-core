@@ -30,6 +30,7 @@ from pydantic import Field, ValidationError
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.model import (
+    CostStatus,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -44,6 +45,7 @@ from agent_core.types.model_errors import (
     FakeScriptMissError,
     ModelDefiniteFailureError,
     ModelInvalidRequestError,
+    ModelNotSentError,
     ModelOutcomeUnknownError,
     ModelResponseInvalidError,
     ModelTimeoutError,
@@ -72,8 +74,8 @@ class FakeReply(FrozenModel):
 
 
 class FakeFaultKind(StrEnum):
-    FAILED_BEFORE_SEND = "FAILED_BEFORE_SEND"  # e.g. connection refused before any content
-    PROVIDER_REJECTED = "PROVIDER_REJECTED"  # a provider-specific refusal, converted
+    FAILED_BEFORE_SEND = "FAILED_BEFORE_SEND"  # nothing sent (connection refused): NOT_SENT
+    PROVIDER_REJECTED = "PROVIDER_REJECTED"  # sent, refused unprocessed: FAILED_DEFINITE
     STREAM_INTERRUPTED = "STREAM_INTERRUPTED"  # broken after content was sent
     OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"  # e.g. connection lost waiting for the reply
     INVALID_RESPONSE = "INVALID_RESPONSE"  # the provider answers with malformed data
@@ -174,7 +176,7 @@ class FakeModelProvider:
 
     def _raise_fault(self, fault: FakeFault) -> None:
         if fault.fault is FakeFaultKind.FAILED_BEFORE_SEND:
-            raise ModelDefiniteFailureError("synthetic failure before sending")
+            raise ModelNotSentError("synthetic failure before sending")
         if fault.fault is FakeFaultKind.PROVIDER_REJECTED:
             raise _SyntheticProviderError("synthetic provider rejection")
         if fault.fault is FakeFaultKind.STREAM_INTERRUPTED:
@@ -184,6 +186,7 @@ class FakeModelProvider:
                 output_tokens=None,
                 total_tokens=None,
                 cost=None,
+                cost_status=CostStatus.UNKNOWN,
                 synthetic=True,
             )
             raise ModelOutcomeUnknownError("synthetic stream interruption", usage=partial)
@@ -213,6 +216,7 @@ class FakeModelProvider:
                 "currency": Currency.XTU.value,
                 "micro_units": -(-cost_numerator // _PER_MILLION),
             },
+            "cost_status": CostStatus.FINAL.value,
             "synthetic": True,
         }
         return self._validate_or_unknown(

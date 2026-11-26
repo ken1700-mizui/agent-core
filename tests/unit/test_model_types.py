@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from agent_core.types.errors import RecordValidationError
 from agent_core.types.ids import ModelRequestId, RunId
 from agent_core.types.model import (
+    CostStatus,
     Message,
     ModelRequest,
     ModelResponse,
@@ -38,6 +39,7 @@ def _usage(**overrides: Any) -> Usage:
         "output_tokens": 5,
         "total_tokens": 15,
         "cost": Budget(currency=Currency.XTU, micro_units=30),
+        "cost_status": CostStatus.FINAL,
         "synthetic": True,
     }
     values.update(overrides)
@@ -210,10 +212,28 @@ def test_unknown_usage_is_not_zero() -> None:
         output_tokens=None,
         total_tokens=None,
         cost=None,
+        cost_status=CostStatus.UNKNOWN,
     )
     assert unknown.input_tokens is None
     with pytest.raises(ValidationError):
         _usage(status=UsageStatus.UNKNOWN, input_tokens=0, output_tokens=0, total_tokens=0)
+
+
+def test_token_usage_and_cost_are_independent() -> None:
+    # WP05-R01: a provider may report a final bill while token usage is unknown,
+    # and zero tokens do not imply a known zero cost.
+    billed = _usage(
+        status=UsageStatus.UNKNOWN, input_tokens=None, output_tokens=None, total_tokens=None
+    )
+    assert billed.cost is not None
+    zero_tokens = _usage(
+        input_tokens=0, output_tokens=0, total_tokens=0, cost=None, cost_status=CostStatus.UNKNOWN
+    )
+    assert zero_tokens.cost is None
+    with pytest.raises(ValidationError):
+        _usage(cost=None, cost_status=CostStatus.FINAL)
+    with pytest.raises(ValidationError):
+        _usage(cost_status=CostStatus.UNKNOWN)
 
 
 @pytest.mark.parametrize(
@@ -235,7 +255,9 @@ def test_invalid_final_usage_is_rejected(overrides: dict[str, Any]) -> None:
 def test_final_usage_flag_matches_the_usage_status() -> None:
     with pytest.raises(ValidationError):
         _response(final_usage=False)
-    partial = _usage(status=UsageStatus.PARTIAL, total_tokens=None, cost=None)
+    partial = _usage(
+        status=UsageStatus.PARTIAL, total_tokens=None, cost=None, cost_status=CostStatus.UNKNOWN
+    )
     with pytest.raises(ValidationError):
         _response(usage=partial, final_usage=True)
     assert _response(usage=partial, final_usage=False).final_usage is False
@@ -245,3 +267,84 @@ def test_model_records_grant_nothing() -> None:
     response = _response(content=(_tool_use(),), stop_reason=StopReason.TOOL_USE)
     public = {name for name in dir(response) if not name.startswith("_")}
     assert not {n for n in public if n.startswith(("execute", "run", "dispatch", "authorize"))}
+
+
+# ---------------------------------------------------------------- WP05-R02: tool ids and results
+
+
+def _result(tool_id: str) -> ToolResultBlock:
+    return ToolResultBlock(
+        type="tool_result",
+        tool_use_id=tool_id,
+        content=(TextBlock(type="text", text="r"),),
+        is_error=False,
+    )
+
+
+def test_response_rejects_duplicate_tool_use_ids() -> None:
+    with pytest.raises(ValidationError):
+        _response(
+            content=(_tool_use("call_1"), _tool_use("call_1")), stop_reason=StopReason.TOOL_USE
+        )
+
+
+def test_request_rejects_two_results_for_one_tool_use() -> None:
+    asked = Message(role=Role.ASSISTANT, content=(_tool_use("call_1"),))
+    answered = Message(role=Role.USER, content=(_result("call_1"),))
+    with pytest.raises(ValidationError):
+        m.request(
+            m.user("q"), asked, answered, Message(role=Role.USER, content=(_result("call_1"),))
+        )
+    with pytest.raises(ValidationError):
+        m.request(
+            m.user("q"),
+            asked,
+            Message(role=Role.USER, content=(_result("call_1"), _result("call_1"))),
+        )
+
+
+def test_multi_tool_conversation_is_accepted() -> None:
+    asked = Message(role=Role.ASSISTANT, content=(_tool_use("call_1"), _tool_use("call_2")))
+    answered = Message(role=Role.USER, content=(_result("call_2"), _result("call_1")))
+    follow_up = Message(role=Role.ASSISTANT, content=(_tool_use("call_3"),))
+    final = Message(role=Role.USER, content=(_result("call_3"),))
+    request = m.request(m.user("q"), asked, answered, follow_up, final)
+    assert len(request.messages) == 5
+
+
+# ---------------------------------------------------------------- WP05-R03: strict JSON arguments
+
+
+MARKER = "synthetic-secret-" + "Pq4" * 6
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        '{"a":"\\ud800"}',
+        "[" * 100 + "]" * 100,
+        '{"a":' * 80 + "1" + "}" * 80,
+        '{"a":1e400}',
+    ],
+    ids=["lone-surrogate", "deep-array", "deep-object", "overflow"],
+)
+def test_tool_arguments_use_the_strict_json_rules(arguments: str) -> None:
+    with pytest.raises(ValidationError):
+        ToolUseBlock(type="tool_use", id="call_1", name="read_file", arguments=arguments)
+
+
+def test_invalid_arguments_do_not_leak_through_typed_errors() -> None:
+    data = json.loads(dump_json(_response()))
+    data["content"] = [
+        {
+            "type": "tool_use",
+            "id": "call_1",
+            "name": "read_file",
+            "arguments": f'{{"{MARKER}":1,"{MARKER}":2}}',
+        }
+    ]
+    data["stop_reason"] = "TOOL_USE"
+    with pytest.raises(RecordValidationError) as excinfo:
+        load_json(ModelResponse, json.dumps(data))
+    assert MARKER not in str(excinfo.value)
+    assert MARKER not in repr(excinfo.value.issues)

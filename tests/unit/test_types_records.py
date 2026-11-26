@@ -294,7 +294,7 @@ def test_event_hash_chain_start_is_explicit() -> None:
     assert b.event(tenant_seq=2, prev_hash=b.digest("x")).tenant_seq == 2
 
 
-@pytest.mark.parametrize("version", [0, 3, 99, "1", 1.0, True])
+@pytest.mark.parametrize("version", [0, 2, 4, 99, "1", 1.0, True])
 def test_unknown_schema_version_is_rejected(version: object) -> None:
     with pytest.raises(ValidationError):
         b.event(schema_version=version)

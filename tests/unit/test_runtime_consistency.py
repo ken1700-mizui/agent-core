@@ -14,6 +14,7 @@ from agent_core.runtime import service as service_module
 from agent_core.runtime.state_machine import rebuild
 from agent_core.types.errors import (
     JournalWriteOutcomeUnknownError,
+    RuntimeReentryError,
     RuntimeReloadRequiredError,
     StaleStateError,
     StateDivergenceError,
@@ -410,3 +411,66 @@ def test_unknown_outcome_blocks_cancelled_even_after_reconciliation_state() -> N
     reconciling = sm.set_run_status(cancelling, R.RECONCILIATION_REQUIRED, _trigger())
     with pytest.raises(TransitionPreconditionError):
         sm.set_run_status(reconciling, R.CANCELLED, _resolution(ResolutionDecision.CANCEL))
+
+
+# ---------------------------------------------------------------- WP04-R06: evidence and re-entry
+
+
+def test_reentrant_command_from_the_verifier_is_refused() -> None:
+    journal = InMemoryJournal()
+    holder: dict[str, Any] = {}
+
+    class ReentrantVerifier:
+        def verify(self, evidence: Any, *, subject: Any) -> None:
+            w.task(holder["sm"])  # the same runtime, while it is committing
+
+    sm = w.machine(journal, verifier=ReentrantVerifier())
+    holder["sm"] = sm
+    step = w.step_in_progress(sm, w.running_run(sm))
+    attempt = sm.create_attempt(step)
+    before = _events(journal)
+    with pytest.raises(RuntimeReentryError):
+        sm.advance_attempt(attempt, A.VALIDATED, w.evidence_for(attempt, A.VALIDATED))
+    assert _events(journal) == before
+    assert sm.state.attempts[attempt.attempt_id].state is A.PROPOSED
+
+
+def test_state_changed_during_verification_is_not_written() -> None:
+    journal = InMemoryJournal()
+    holder: dict[str, Any] = {}
+
+    class SwappingVerifier:
+        def verify(self, evidence: Any, *, subject: Any) -> None:
+            # Simulates any change of the runtime's state while evidence is checked.
+            sm = holder["sm"]
+            sm._state = rebuild(_events(journal))
+
+    sm = w.machine(journal, verifier=SwappingVerifier())
+    holder["sm"] = sm
+    step = w.step_in_progress(sm, w.running_run(sm))
+    attempt = sm.create_attempt(step)
+    before = _events(journal)
+    with pytest.raises(StaleStateError):
+        sm.advance_attempt(attempt, A.VALIDATED, w.evidence_for(attempt, A.VALIDATED))
+    assert _events(journal) == before
+    with pytest.raises(RuntimeReloadRequiredError):
+        w.task(sm)
+
+
+def test_unexpected_error_while_applying_after_commit_requires_a_reload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = InMemoryJournal()
+    sm = w.machine(journal)
+    run = w.running_run(sm)
+
+    def exploding_apply(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("synthetic unexpected failure")
+
+    monkeypatch.setattr(service_module, "apply_event", exploding_apply)
+    with pytest.raises(StateDivergenceError):
+        sm.set_run_status(run, R.WAITING_TOOL)
+    monkeypatch.undo()
+    with pytest.raises(RuntimeReloadRequiredError):
+        sm.set_run_status(run, R.WAITING_TOOL)
+    assert w.machine(journal).state.runs[run.run_id].status is R.WAITING_TOOL

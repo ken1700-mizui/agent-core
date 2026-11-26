@@ -50,8 +50,9 @@ def test_restored_ids_are_typed() -> None:
         (Step, lambda d: d.update(run_seq=0), "greater_than_equal"),
         (Step, lambda d: d.update(run_seq="1"), "int_type"),
         (Run, lambda d: d.update(extra=1), "extra_forbidden"),
-        (Event, lambda d: d.update(schema_version=3), "unsupported_schema_version"),
-        (Event, lambda d: d.update(schema_version=2), "payload_required"),
+        (Event, lambda d: d.update(schema_version=4), "unsupported_schema_version"),
+        (Event, lambda d: d.update(schema_version=3), "payload_required"),
+        (Event, lambda d: d.update(schema_version=2), "superseded_schema_version"),
         (Attempt, lambda d: d.update(attempt_id="att_dev01_" + "0" * 31), "invalid_id"),
     ],
 )

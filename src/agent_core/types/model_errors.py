@@ -1,9 +1,16 @@
-"""Typed model-call errors (WP-05).
+"""Typed model-call errors (WP-05, WP05-R01).
 
 Every ModelPort adapter converts provider-specific failures into one of these.
-Each error states its ``outcome`` (``NOT_SENT``, ``FAILED_DEFINITE`` or
-``UNKNOWN``) and the usage known at that point. An unknown outcome carries
-unknown usage, never zero. Messages never include request or response text.
+Each error states its ``outcome``:
+
+- ``NOT_SENT``: certainly nothing left this process. Zero tokens, known zero cost.
+- ``FAILED_DEFINITE``: sent, but certainly not processed by the provider.
+  Zero tokens; whether the refusal is billed is not known here (cost unknown).
+- ``UNKNOWN``: may have been processed (and billed).
+
+The usage attached to an error is independent of the outcome: an unknown outcome
+may still carry billing data a provider reported separately. Zero tokens never
+imply a known zero cost. Messages never include request or response text.
 """
 
 from __future__ import annotations
@@ -11,16 +18,19 @@ from __future__ import annotations
 from typing import ClassVar
 
 from agent_core.types.errors import AgentCoreError
-from agent_core.types.model import ModelCallOutcome, Usage, UsageStatus
+from agent_core.types.model import CostStatus, ModelCallOutcome, Usage, UsageStatus
+from agent_core.types.values import Budget, Currency
 
 
-def _known_zero(*, synthetic: bool) -> Usage:
+def _no_tokens(*, cost_known_zero: bool, synthetic: bool) -> Usage:
+    """Zero tokens. The cost is a known zero only when nothing left the process."""
     return Usage(
         status=UsageStatus.FINAL,
         input_tokens=0,
         output_tokens=0,
         total_tokens=0,
-        cost=None,
+        cost=Budget(currency=Currency.XTU, micro_units=0) if cost_known_zero else None,
+        cost_status=CostStatus.FINAL if cost_known_zero else CostStatus.UNKNOWN,
         synthetic=synthetic,
     )
 
@@ -31,8 +41,6 @@ class ModelError(AgentCoreError):
 
     def __init__(self, message: str, *, usage: Usage) -> None:
         super().__init__(message)
-        if self.outcome is ModelCallOutcome.UNKNOWN and usage.status is UsageStatus.FINAL:
-            raise ValueError("an unknown outcome cannot carry final usage")
         self.usage = usage
 
 
@@ -40,7 +48,7 @@ class _NotSentError(ModelError):
     outcome = ModelCallOutcome.NOT_SENT
 
     def __init__(self, message: str, *, synthetic: bool = True) -> None:
-        super().__init__(message, usage=_known_zero(synthetic=synthetic))
+        super().__init__(message, usage=_no_tokens(cost_known_zero=True, synthetic=synthetic))
 
 
 class ModelInvalidRequestError(_NotSentError):
@@ -55,6 +63,12 @@ class ModelUnsupportedError(_NotSentError):
     code = "MODEL_UNSUPPORTED"
 
 
+class ModelNotSentError(_NotSentError):
+    """Certainly nothing was sent (for example the connection was refused)."""
+
+    code = "MODEL_NOT_SENT"
+
+
 class FakeScriptMissError(_NotSentError):
     """The Fake Provider has no scripted outcome for this input. It never guesses."""
 
@@ -62,13 +76,16 @@ class FakeScriptMissError(_NotSentError):
 
 
 class ModelDefiniteFailureError(ModelError):
-    """Certainly not processed by the provider (refused before any content was used)."""
+    """Sent, but certainly not processed by the provider (for example refused).
+
+    No tokens were used, but whether such a refusal is billed is not known here,
+    so the cost stays unknown until reconciled (WP-09)."""
 
     code = "MODEL_FAILED_DEFINITE"
     outcome = ModelCallOutcome.FAILED_DEFINITE
 
     def __init__(self, message: str, *, synthetic: bool = True) -> None:
-        super().__init__(message, usage=_known_zero(synthetic=synthetic))
+        super().__init__(message, usage=_no_tokens(cost_known_zero=False, synthetic=synthetic))
 
 
 class ModelOutcomeUnknownError(ModelError):

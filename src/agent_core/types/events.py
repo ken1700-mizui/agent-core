@@ -4,8 +4,14 @@ Versions (``schema_version``):
 
 - 1: the WP-03 format. No payload. Its serialized bytes, and therefore its
   hashes, are unchanged by later versions.
-- 2: adds ``payload``: a typed ``RuntimePayload`` of state transitions (WP-04).
-  Required in version 2. Still no content body or secret.
+- 2: RETIRED. Written by the WP-04 draft (9f1a799) and then, with a different
+  Run shape (``cancel_requested`` added), by 635e0b3: one number, two meanings.
+  It cannot be restored safely (the transition rules also changed), so it is
+  rejected with ``superseded_schema_version``; it is never reinterpreted.
+  Only synthetic development data was ever written in it.
+- 3: adds ``payload``: a typed ``RuntimePayload`` of state transitions (WP-04
+  with WP04-R04: Run carries ``cancel_requested``). Required in version 3.
+  Still no content body or secret.
 
 Unknown versions are rejected. Readers never reinterpret one version as another.
 """
@@ -39,7 +45,9 @@ from agent_core.types.values import (
 )
 
 # Event schema versions this code can read. Unknown versions are rejected.
-SUPPORTED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({1, 2})
+SUPPORTED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({1, 3})
+# Versions that existed but can no longer be read (see the module docstring).
+RETIRED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({2})
 
 
 def _invalid(code: str, message: str) -> PydanticCustomError:
@@ -47,6 +55,11 @@ def _invalid(code: str, message: str) -> PydanticCustomError:
 
 
 def _check_schema_version(value: object) -> int:
+    if type(value) is int and value in RETIRED_EVENT_SCHEMA_VERSIONS:
+        raise _invalid(
+            "superseded_schema_version",
+            "event schema_version 2 is retired (WP-04 draft format); it cannot be restored",
+        )
     if type(value) is not int or value not in SUPPORTED_EVENT_SCHEMA_VERSIONS:
         raise _invalid("unsupported_schema_version", "unsupported event schema_version")
     return value
@@ -70,7 +83,7 @@ class _EventFields(ImmutableRecord):
     keyed_hashes: tuple[KeyedHash, ...]
     # A 2 lists ``ts``; it records time for people and never orders events.
     recorded_at_ms: TimestampMs
-    # Typed runtime metadata (schema_version 2 only). Absent in version 1, and then
+    # Typed runtime metadata (schema_version 3 only). Absent in version 1, and then
     # also absent from the serialized form, so version 1 bytes and hashes are unchanged.
     payload: RuntimePayload | None = None
 
@@ -85,8 +98,8 @@ class _EventFields(ImmutableRecord):
     def _payload_matches_version(self) -> Self:
         if self.schema_version == 1 and self.payload is not None:
             raise _invalid("payload_not_allowed", "schema_version 1 events carry no payload")
-        if self.schema_version == 2 and self.payload is None:
-            raise _invalid("payload_required", "schema_version 2 events carry a payload")
+        if self.schema_version == 3 and self.payload is None:
+            raise _invalid("payload_required", "schema_version 3 events carry a payload")
         return self
 
     @field_validator("schema_version", mode="plain")

@@ -260,4 +260,4 @@ def test_runtime_events_survive_the_sqlite_journal_verification(tmp_path: Path) 
         versions = {row[0] for row in conn.execute("SELECT body FROM events")}
     finally:
         conn.close()
-    assert all('"schema_version":2' in body for body in versions)
+    assert all('"schema_version":3' in body for body in versions)

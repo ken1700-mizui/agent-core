@@ -256,6 +256,13 @@ class DuplicateEntityError(StateTransitionError):
     code = "DUPLICATE_ENTITY"
 
 
+class RuntimeReentryError(StateTransitionError):
+    """A runtime command was called while another command of the same runtime was
+    in progress (for example from an evidence verifier). Nothing was written."""
+
+    code = "RUNTIME_REENTRY"
+
+
 class EvidenceRejectedError(StateTransitionError):
     """The evidence verifier did not confirm the evidence."""
 

@@ -1,6 +1,6 @@
 """Typed transition records stored in runtime journal events (WP-04).
 
-A runtime event (``type`` = ``RUNTIME_EVENT_TYPE``, ``schema_version`` 2)
+A runtime event (``type`` = ``RUNTIME_EVENT_TYPE``, ``schema_version`` 3)
 carries a ``RuntimePayload``: one or more transitions applied atomically. Each
 transition names the snapshot before and after, the action, and the evidence
 the transition required. Everything here is metadata (IDs, digests, enums,
@@ -24,7 +24,8 @@ from agent_core.types.records import Attempt, Run, Step, Task
 from agent_core.types.values import Digest, PolicyVersion
 
 RUNTIME_EVENT_TYPE = "runtime.transition"
-RUNTIME_EVENT_SCHEMA_VERSION = 2
+# Version 2 is retired (see agent_core.types.events).
+RUNTIME_EVENT_SCHEMA_VERSION = 3
 
 
 class AbortReason(StrEnum):

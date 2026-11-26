@@ -33,6 +33,8 @@ from pydantic import BaseModel, ValidationError
 from agent_core.types.errors import RecordValidationError, ValidationIssue
 
 UNKNOWN_LOCATION = "<unknown>"
+# Deeper nesting is rejected (records and tool arguments never need more).
+MAX_JSON_DEPTH = 64
 
 
 def dump_json(record: BaseModel) -> bytes:
@@ -42,10 +44,15 @@ def dump_json(record: BaseModel) -> bytes:
     ).encode("utf-8")
 
 
-class _InputRejectedError(Exception):
+class StrictJsonError(ValueError):
+    """Input rejected by the strict JSON rules. The message is only the issue type."""
+
     def __init__(self, issue_type: str) -> None:
         super().__init__(issue_type)
         self.issue_type = issue_type
+
+
+_InputRejectedError = StrictJsonError
 
 
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -69,22 +76,31 @@ def _finite_float(text: str) -> float:
 
 
 def _check_strings(value: Any) -> None:
-    stack = [value]
+    stack: list[tuple[Any, int]] = [(value, 0)]
     while stack:
-        item = stack.pop()
+        item, depth = stack.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise _InputRejectedError("json_too_deep")
         if isinstance(item, str):
             try:
                 item.encode("utf-8")
             except UnicodeEncodeError:
                 raise _InputRejectedError("json_invalid_string") from None
         elif isinstance(item, dict):
-            stack.extend(item.keys())
-            stack.extend(item.values())
+            stack.extend((k, depth + 1) for k in item)
+            stack.extend((v, depth + 1) for v in item.values())
         elif isinstance(item, list):
-            stack.extend(item)
+            stack.extend((v, depth + 1) for v in item)
 
 
-def _precheck(data: bytes | str) -> None:
+def parse_strict_json(data: bytes | str) -> Any:
+    """Parse JSON under the strict rules of ``load_json`` (duplicate keys, non-finite
+    numbers, invalid strings or encodings, nesting deeper than ``MAX_JSON_DEPTH``).
+    Raises ``StrictJsonError`` whose message is only the issue type."""
+    return _precheck(data)
+
+
+def _precheck(data: bytes | str) -> Any:
     if isinstance(data, bytes):
         try:
             text = data.decode("utf-8")
@@ -101,9 +117,14 @@ def _precheck(data: bytes | str) -> None:
             parse_constant=_reject_constant,
             parse_float=_finite_float,
         )
+    except RecursionError:
+        raise _InputRejectedError("json_too_deep") from None
+    except _InputRejectedError:
+        raise
     except ValueError:
         raise _InputRejectedError("json_invalid") from None
     _check_strings(parsed)
+    return parsed
 
 
 def _model_types(annotation: Any) -> list[type[BaseModel]]:
