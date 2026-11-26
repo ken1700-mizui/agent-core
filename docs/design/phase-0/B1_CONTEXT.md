@@ -805,3 +805,11 @@ Orchestrator：Step を計画する
 - **不変条件と Strategy の呼び方：**
   - この文書の不変条件は、`B1.C1`〜`B1.C26` と呼ぶ。
   - 圧縮の Strategy の S1〜S6 は、`B1.ST1`〜`B1.ST6` と読み替える（C1 の S1〜S27 とぶつからないようにするため）。
+
+## 16. E3 での統合（2026-11-26、DRAFT。E3 の審査待ち）
+
+この章は、`E_INTEGRATION.md`（E3 の版。第2部）との整合のための注記である。本文で食い違う部分は、E の側を優先する。
+
+- **B1-P03（削除した記憶の派生データ）：** E の19章で設計した。Context IR、変換済みの文脈、リクエストの記録は、系譜で特定する。blob ごとの鍵を破棄して、blob を削除する。
+- **Context IR の保存：** IR は暗号化した blob（正本）として保存し、Manifest は Journal に記録する（E の15章）。
+- **古い HMAC の鍵を破棄した場合：** その鍵のハッシュは照合できなくなる。そのため、Replay は `REPLAY_UNAVAILABLE` になる。HMAC の鍵は、`hash_verifiable_until` まで残す（E の20.6）。
