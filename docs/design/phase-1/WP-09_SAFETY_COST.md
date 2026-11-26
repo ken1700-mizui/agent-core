@@ -240,6 +240,7 @@ RECONCILED、RELEASED、VOID：終わり
 - PEP（WP-08 のファイルの Broker）が受け取るのは `DispatchAuthorization`（Receipt、`action_hash`、記録した Descriptor）である。
 - **実際の実行の直前に**、`SqliteJournal.verify_dispatch(receipt_id, pep_instance_id, action_hash)` で、信頼する記録と照合する。照合する内容は、Receipt が `CLAIMED` であること、PEP のインスタンス、失効の世代、停止の状態、期限、承認、`action_hash` である。
 - ファイルの操作そのものは実装していない。
+- **追記（2026-11-26）：** `verify_dispatch` は WP09-R03 で廃止し、同じプロセスの中の実行ゲートに置き換えた（14章）。WP-08 での接続（開始の前の検査、実行券、S19 による拒否）は、`WP-08_FILE_OPS.md` の3.3〜3.5 に記録した。
 
 ### 6.5 必須の監査の記録
 

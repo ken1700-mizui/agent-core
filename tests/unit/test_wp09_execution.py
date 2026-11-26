@@ -116,7 +116,7 @@ def test_one_receipt_starts_execution_once(st: Any) -> None:
     attempt = _consumed(st)
     calls: list[Any] = []
 
-    def run(authorization: Any) -> SyntheticResult:
+    def run(authorization: Any, _ticket: Any) -> SyntheticResult:
         calls.append(authorization)
         return _ok(authorization)
 
@@ -141,7 +141,7 @@ def test_the_actual_operation_must_match_at_execution(st: Any) -> None:
     other = ToolContent(kind="tool", canonical_input='{"path":"workspace/other.txt"}')
     calls: list[Any] = []
 
-    def run(authorization: Any) -> SyntheticResult:
+    def run(authorization: Any, _ticket: Any) -> SyntheticResult:
         calls.append(authorization)
         return _ok(authorization)
 
@@ -175,7 +175,7 @@ def test_the_gate_cannot_be_reentered_from_the_callback(st: Any) -> None:
     seen: list[str] = []
     run_id = st.sm.state.steps[attempt.step_id].run_id
 
-    def run(authorization: Any) -> SyntheticResult:
+    def run(authorization: Any, _ticket: Any) -> SyntheticResult:
         for call in (
             lambda: gate.stop(st.signed(lw.stop_op(StopScopeType.RUN, str(run_id)))),
             lambda: gate.start(st.sm.state.attempts[attempt.attempt_id]),

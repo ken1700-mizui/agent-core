@@ -121,6 +121,16 @@ source_modules = [
 forbidden_modules = ["sqlite3", "fcntl", "agent_core.adapters"]
 
 [[tool.importlinter.contracts]]
+id = "file-broker-composition-root"
+name = "WP-08: no agent_core module imports the file broker; the runtime uses FileOperationPort"
+type = "forbidden"
+# "agent_core.**" names every module one by one. A plain "agent_core" (or
+# "agent_core.adapters") is an ancestor of the broker, and import-linter then
+# skips the imports inside it without reporting anything.
+source_modules = ["agent_core.**"]
+forbidden_modules = ["agent_core.adapters.file_broker"]
+
+[[tool.importlinter.contracts]]
 id = "phase1-no-network-or-process"
 name = "Phase 1: agent_core has no network, provider SDK or process-spawning code path"
 type = "forbidden"

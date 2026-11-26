@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from agent_core.types.ledger import LedgerBatch, LedgerOp
-from agent_core.types.safety import ActionDescriptor, Receipt, ReceiptState
+from agent_core.types.safety import ActionDescriptor, Policy, Receipt, ReceiptState
 
 
 @runtime_checkable
@@ -19,6 +19,8 @@ class LedgerPort(Protocol):
     def receipt_state(self, receipt_id: str) -> ReceiptState | None: ...
 
     def recorded_descriptor(self, attempt_id: str) -> ActionDescriptor | None: ...
+
+    def policy(self, tenant_id: str) -> Policy | None: ...
 
     def apply_ledger(self, ledger: tuple[LedgerOp, ...]) -> None: ...
 

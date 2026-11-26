@@ -35,6 +35,9 @@ class AbortReason(StrEnum):
     REVOKED = "REVOKED"
     EXPIRED = "EXPIRED"
     STOPPED = "STOPPED"
+    # WP-08: refused before the start by the file broker's preflight.
+    WORKSPACE_REJECTED = "WORKSPACE_REJECTED"
+    SAFE_FILE_ACCESS_UNAVAILABLE = "SAFE_FILE_ACCESS_UNAVAILABLE"
 
 
 class ReconciledOutcome(StrEnum):

@@ -56,6 +56,7 @@ from support import builders as b
 from support import ledger_world as lw
 from support import runtime_world as w
 from support import safety_world as s
+from support import tool_world as tw
 
 A = AttemptState
 R = ReservationState
@@ -348,7 +349,7 @@ def test_changing_content_cost_or_attempt_voids_the_approval(st: Any, change: st
     if change == "content":
         other = s.write_descriptor(
             at,
-            canonical_input='{"path":"workspace/out/x.txt"}',
+            canonical_input=tw.write_input("workspace/out/x.txt"),
             reservation_id=attempt.reservation_id,
             cost_cap=lw.xtu(5_000),
         )

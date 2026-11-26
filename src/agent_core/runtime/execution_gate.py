@@ -9,7 +9,12 @@ The single place where a consumed permit turns into one execution:
    (once) and every live check runs again: stop, revocation, owner epoch, gate
    instance, expiry, elapsed time and approval.
 3. The callback runs once, with a ``DispatchAuthorization`` that is information
-   only: nothing accepts it back.
+   only (nothing accepts it back) and, for an operation on one file target, an
+   execution ticket (WP-08). The ticket is issued after the start is committed,
+   is redeemed by ``redeem`` at most once, only while the callback runs and only
+   for the exact operation it was bound to (access, path and, for a write, the
+   ``WriteChange``: content digest and size, expected state). A mismatch uses it
+   up. When the callback returns or raises, the ticket is closed.
 4. ``finish`` records the outcome with a MAC-signed execution report; the ledger
    derives the cost itself. A callback that raises leaves the outcome unknown
    (hold kept).
@@ -23,12 +28,13 @@ it (they fail closed).
 Not claimed: atomicity between the database and the real operation. A process
 that stops right before or after the callback leaves DISPATCH_STARTED (or
 PERMIT_CONSUMED), which recovery treats as an unknown outcome with the hold
-kept. Real file operations are WP-08; the callback here is synthetic.
+kept. Real file operations (WP-08) are refused in this environment (C1.S19).
 """
 
 from __future__ import annotations
 
 import threading
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Literal
@@ -39,6 +45,7 @@ from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.safety import reports
 from agent_core.types.base import FrozenModel
 from agent_core.types.errors import PermitRejectedError
+from agent_core.types.files import ExecutionTicket, FileOperation, TicketBinding
 from agent_core.types.ids import PepInstanceId
 from agent_core.types.ledger import (
     ClaimReceipt,
@@ -60,7 +67,7 @@ from agent_core.types.safety import (
     Receipt,
     ReceiptState,
 )
-from agent_core.types.tools import ToolRegistration
+from agent_core.types.tools import ResourceAccess, ToolRegistration
 from agent_core.types.transitions import (
     AbortEvidence,
     AbortReason,
@@ -79,6 +86,15 @@ class SyntheticResult(FrozenModel):
     outcome: Literal["COMPLETED", "FAILED_DEFINITE"]
     usage: Usage
     final: bool
+
+
+class _OpenTicket:
+    __slots__ = ("binding", "ticket", "used")
+
+    def __init__(self, ticket: ExecutionTicket, binding: TicketBinding) -> None:
+        self.ticket = ticket
+        self.binding = binding
+        self.used = False
 
 
 class SyntheticExecutionGate:
@@ -100,6 +116,10 @@ class SyntheticExecutionGate:
         self._clock = clock
         self._lock = threading.Lock()
         self._usage_events = 0
+        # WP-08 tickets: at most one open, inside the running callback.
+        self._ticket_lock = threading.Lock()
+        self._open: _OpenTicket | None = None
+        self._issued: weakref.WeakSet[ExecutionTicket] = weakref.WeakSet()
 
     @property
     def pep_instance_id(self) -> PepInstanceId:
@@ -189,18 +209,64 @@ class SyntheticExecutionGate:
         *,
         content: ActionContent,
         registration: ToolRegistration | None,
-        run: Callable[[DispatchAuthorization], SyntheticResult],
+        run: Callable[[DispatchAuthorization, ExecutionTicket | None], SyntheticResult],
     ) -> Attempt:
-        """Claim, start, run the callback once, record the outcome."""
+        """Claim, start, run the callback once, record the outcome. The callback gets
+        the execution ticket for its one file operation (None without one target)."""
         with self._exclusive():
             claimed = self._claim(attempt, content, registration)
             started, authorization = self._start(claimed)
             try:
-                result = run(authorization)
+                ticket = self._open_ticket(authorization)
+                try:
+                    result = run(authorization, ticket)
+                finally:
+                    self._close_ticket()
             except BaseException:
                 self._unknown(started)
                 raise
             return self._finish(started, result)
+
+    # ------------------------------------------------------------ tickets (WP-08)
+
+    def _open_ticket(self, authorization: DispatchAuthorization) -> ExecutionTicket | None:
+        """Issued after the start was committed (the receipt is USED)."""
+        descriptor = authorization.descriptor
+        if len(descriptor.target_resources) != 1:
+            return None
+        target = descriptor.target_resources[0]
+        change = descriptor.apply_change if target.access is ResourceAccess.WRITE else None
+        binding = TicketBinding(
+            receipt_id=authorization.receipt.receipt_id,
+            attempt_id=descriptor.attempt_id,
+            action_hash=authorization.action_hash,
+            operation=FileOperation(access=target.access, path=target.path, change=change),
+        )
+        ticket = ExecutionTicket()
+        with self._ticket_lock:
+            self._open = _OpenTicket(ticket, binding)
+            self._issued.add(ticket)
+        return ticket
+
+    def _close_ticket(self) -> None:
+        with self._ticket_lock:
+            self._open = None
+
+    def redeem(self, ticket: ExecutionTicket, operation: FileOperation) -> TicketBinding:
+        """Use the open ticket once for the operation it was bound to. Any refusal
+        names a fixed reason; a mismatch uses the ticket up."""
+        with self._ticket_lock:
+            current = self._open
+            if current is None or current.ticket is not ticket:
+                if type(ticket) is ExecutionTicket and ticket in self._issued:
+                    raise PermitRejectedError(PermitReason.TICKET_CLOSED)
+                raise PermitRejectedError(PermitReason.TICKET_UNKNOWN)
+            if current.used:
+                raise PermitRejectedError(PermitReason.TICKET_USED)
+            current.used = True
+            if type(operation) is not FileOperation or operation != current.binding.operation:
+                raise PermitRejectedError(PermitReason.TICKET_MISMATCH)
+            return current.binding
 
     def _unknown(self, attempt: Attempt) -> None:
         """The callback failed after the start: the outcome is unknown (hold kept)."""

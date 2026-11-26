@@ -24,11 +24,17 @@ WP09-R01/R06:
   ceilings verified from the request record and the rendered input it names.
 - ``rebuild`` builds the descriptor again from its content; the ledger uses it
   to refuse a descriptor that was not built from that content.
+
+WP-08 (descriptor version 3): a write's ApplyPlan (``WriteChange``) is derived
+from the arguments the manifest marks (``FieldSpec.apply``): the target, the
+operation (``absent`` -> CREATE, a file digest -> REPLACE with that expected
+state) and the digest and size of the content. It is part of ``action_hash``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
 
 from pydantic import ValidationError
 
@@ -48,9 +54,13 @@ from agent_core.types.safety import (
     ToolContent,
     ToolCostBasis,
     ToolPin,
+    WriteChange,
+    WriteOp,
 )
 from agent_core.types.serialization import StrictJsonError, parse_strict_json
 from agent_core.types.tools import (
+    ApplyField,
+    ResourceAccess,
     ToolEffectClass,
     ToolProposal,
     ToolRegistration,
@@ -60,6 +70,8 @@ from agent_core.types.tools import (
 from agent_core.types.values import Budget, Currency
 
 _MODEL_ARGS_DOMAIN = b"agent-core/model-call-args/v1\x00"
+_ABSENT = "absent"
+_FILE_DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 class AttemptRef:
@@ -140,6 +152,42 @@ def tool_targets(
     return tuple(targets)
 
 
+def write_change(registration: ToolRegistration, data: dict[str, object]) -> WriteChange | None:
+    """The write's ApplyPlan from the marked arguments, or None for a tool that
+    does not write. The manifest guarantees one target, one content and one
+    expected-state argument for every write tool."""
+    fields = registration.manifest.input_schema.fields
+    target = [f for f in fields if f.resource is ResourceAccess.WRITE]
+    if not target:
+        return None
+    by_role = {f.apply: f for f in fields if f.apply is not None}
+    path = data.get(target[0].name)
+    content = data.get(by_role[ApplyField.CONTENT].name)
+    expected = data.get(by_role[ApplyField.EXPECTED_STATE].name)
+    if type(path) is not str or type(content) is not str or type(expected) is not str:
+        raise ActionDescriptorError("APPLY_ARGUMENT_MISSING")
+    if expected == _ABSENT:
+        op, pre = WriteOp.CREATE, None
+    elif _FILE_DIGEST.fullmatch(expected) is not None:
+        op, pre = WriteOp.REPLACE, expected
+    else:
+        raise ActionDescriptorError("EXPECTED_STATE_INVALID")
+    try:
+        body = content.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ActionDescriptorError("APPLY_CONTENT_INVALID") from None
+    try:
+        return WriteChange(
+            op=op,
+            path=path,
+            expected_pre=pre,
+            content_digest="sha256:" + hashlib.sha256(body).hexdigest(),
+            content_size=len(body),
+        )
+    except ValidationError:
+        raise ActionDescriptorError("APPLY_CHANGE_INVALID") from None
+
+
 def tool_action(
     *,
     registration: ToolRegistration,
@@ -190,10 +238,11 @@ def tool_action(
     parsed = parse_strict_json(data)
     assert isinstance(parsed, dict)  # noqa: S101 (checked by _canonical_input)
     targets = tool_targets(registration, parsed)
+    change = write_change(registration, parsed)
     _check_cost(cost_cap)
     try:
         return ActionDescriptor(
-            descriptor_version=2,
+            descriptor_version=3,
             hash_scheme=HashScheme.SYNTHETIC_SHA256,
             kind=ActionKind.TOOL_CALL,
             tenant_id=attempt.tenant_id,
@@ -216,6 +265,7 @@ def tool_action(
             cost_basis=ToolCostBasis(kind="tool", estimate=manifest.cost_estimate),
             reservation_id=reservation_id,
             expires_at_ms=expires_at_ms,
+            apply_change=change,
         )
     except ValidationError:
         raise ActionDescriptorError("DESCRIPTOR_INVALID") from None
@@ -262,7 +312,7 @@ def model_action(
             max_output_tokens=record.params.max_output_tokens,
         )
         return ActionDescriptor(
-            descriptor_version=2,
+            descriptor_version=3,
             hash_scheme=HashScheme.SYNTHETIC_SHA256,
             kind=ActionKind.MODEL_CALL,
             tenant_id=attempt.tenant_id,
@@ -285,6 +335,7 @@ def model_action(
             cost_basis=basis,
             reservation_id=reservation_id,
             expires_at_ms=expires_at_ms,
+            apply_change=None,
         )
     except ValidationError:
         raise ActionDescriptorError("DESCRIPTOR_INVALID") from None

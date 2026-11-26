@@ -49,6 +49,8 @@ OWNER = b.new_id(UserId)
 WORKSPACE = b.digest("synthetic-workspace-tree")
 PROFILE = ProfileRef(model_id="scripted-model-small", profile_version="0.1.0")
 READ_MANIFEST = tw.manifest()
+# The default write: create workspace/out/r.txt with synthetic content (WP-08).
+WRITE_INPUT = tw.write_input("workspace/out/r.txt")
 WRITE_MANIFEST = tw.manifest(**tw.WRITE_BODY)
 # A read tool with a synthetic manifest cost of 300 micro XTU (WP09-R01 tests).
 COSTLY_MANIFEST = tw.manifest(
@@ -166,7 +168,7 @@ def read_descriptor(at: AttemptRef, **overrides: Any) -> ActionDescriptor:
 def write_descriptor(at: AttemptRef, **overrides: Any) -> ActionDescriptor:
     values: dict[str, Any] = {
         "registration": WRITE_TOOL,
-        "canonical_input": '{"path":"workspace/out/r.txt"}',
+        "canonical_input": WRITE_INPUT,
     }
     values.update(overrides)
     return read_descriptor(at, **values)

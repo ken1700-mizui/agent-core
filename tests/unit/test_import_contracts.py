@@ -300,3 +300,20 @@ def test_core_cannot_depend_on_sqlite_or_os_locks(
     result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
     assert result.returncode == 1
     assert expected in result.stdout
+
+
+# ---------------------------------------------------- WP-08: the file broker's one way in
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["agent_core.adapters.planted", "agent_core.runtime.planted", "agent_core.planted"],
+)
+def test_no_agent_core_module_imports_the_file_broker(tmp_path: Path, module: str) -> None:
+    """Only the composition root (outside agent_core) builds a file broker; the
+    runtime reaches it through the FileOperationPort."""
+    src = _copy_real_package(tmp_path)
+    _plant(src, module, "from agent_core.adapters import file_broker")
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert f"{module} -> agent_core.adapters.file_broker" in result.stdout

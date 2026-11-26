@@ -295,7 +295,7 @@ def test_output_is_validated_against_schema_and_size() -> None:
 def test_write_tool_proposal_requires_approval_and_is_not_a_permit() -> None:
     write = t.manifest(**t.WRITE_BODY)
     registry = _registry(write)
-    proposal = _propose(registry, '{"path":"workspace/a.txt"}', tool_id="write_file")
+    proposal = _propose(registry, t.write_input("workspace/a.txt"), tool_id="write_file")
     assert proposal.requires_approval is True
     assert proposal.effect_class is ToolEffectClass.IRREVERSIBLE
     public = {n for n in dir(proposal) if not n.startswith("_")}
@@ -420,7 +420,7 @@ def test_on_write_applies_to_declared_writes_only() -> None:
     assert proposal.requires_approval is False  # no write declared
     write = t.manifest(**{**t.WRITE_BODY, "effect_class": ToolEffectClass.IDEMPOTENT})
     registry = _registry(write)
-    proposal = _propose(registry, '{"path":"workspace/a"}', tool_id="write_file")
+    proposal = _propose(registry, t.write_input("workspace/a"), tool_id="write_file")
     assert proposal.requires_approval is True
 
 

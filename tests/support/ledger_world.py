@@ -142,9 +142,11 @@ def setup(
     *,
     price_table: bool = True,
     final_usage_is_complete: bool = True,
+    keys: LedgerKeys | None = None,
+    policy: Any = None,
 ) -> Setup:
     clock = ManualClock()
-    keys = new_keys()
+    keys = keys if keys is not None else new_keys()
     path = tmp_path / name
     journal = open_journal(path, clock, keys)
     st = Setup(path, journal, w.machine(journal), keys, clock, OwnerApprovalChannel(keys.owner))
@@ -153,7 +155,9 @@ def setup(
             update={"final_usage_is_complete": final_usage_is_complete}
         )
         st.owner(InstallPriceTable(op="install_price_table", table=table))
-    st.owner(InstallPolicy(op="install_policy", policy=s.policy()))
+    st.owner(
+        InstallPolicy(op="install_policy", policy=policy if policy is not None else s.policy())
+    )
     return st
 
 
@@ -299,7 +303,7 @@ def fixed_attempt(
         registration = None
     else:
         if write:
-            registration, default_input = s.WRITE_TOOL, '{"path":"workspace/out/r.txt"}'
+            registration, default_input = s.WRITE_TOOL, s.WRITE_INPUT
         elif costly:
             registration, default_input = s.COSTLY_TOOL, '{"path":"workspace/a.txt"}'
         else:

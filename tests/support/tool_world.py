@@ -6,6 +6,7 @@ from typing import Any
 
 from agent_core.tool.registry import TrustedToolCatalog, TrustedToolEntry
 from agent_core.types.tools import (
+    ApplyField,
     ApprovalCondition,
     ExternalGuarantee,
     FieldSpec,
@@ -18,6 +19,7 @@ from agent_core.types.tools import (
     ToolManifest,
     ToolManifestBody,
     ToolPermission,
+    canonical_json,
 )
 from agent_core.types.values import Budget, Currency
 from support import builders as b
@@ -96,9 +98,45 @@ def input_schema(access: ResourceAccess) -> ObjectSchema:
     )
 
 
+def write_schema() -> ObjectSchema:
+    """A write tool's input: the target, the content and the expected state (WP-08)."""
+    return ObjectSchema(
+        fields=(
+            FieldSpec(
+                name="content",
+                type=FieldType.STRING,
+                required=True,
+                max_length=65_536,
+                apply=ApplyField.CONTENT,
+            ),
+            FieldSpec(
+                name="expected",
+                type=FieldType.STRING,
+                required=True,
+                max_length=71,
+                apply=ApplyField.EXPECTED_STATE,
+            ),
+            FieldSpec(
+                name="path",
+                type=FieldType.STRING,
+                required=True,
+                max_length=256,
+                resource=ResourceAccess.WRITE,
+            ),
+        ),
+        max_bytes=70_000,
+    )
+
+
+def write_input(path: str, *, content: str = "synthetic", expected: str = "absent") -> str:
+    """Canonical arguments of the write tool: ``expected`` is ``absent`` (create) or
+    the sha256 digest of the file being replaced."""
+    return canonical_json({"content": content, "expected": expected, "path": path}).decode()
+
+
 WRITE_BODY: dict[str, Any] = {
     "tool_id": "write_file",
-    "input_schema": input_schema(ResourceAccess.WRITE),
+    "input_schema": write_schema(),
     "effect_class": ToolEffectClass.IRREVERSIBLE,
     "required_permissions": (ToolPermission.FILE_WRITE,),
     "resources": (ResourceSpec(path_pattern="workspace/**", access=ResourceAccess.WRITE),),

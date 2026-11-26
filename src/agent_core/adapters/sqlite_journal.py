@@ -91,6 +91,7 @@ from agent_core.types.safety import (
     LedgerKeys,
     Permit,
     PermitState,
+    Policy,
     Receipt,
     ReceiptState,
     StopEntry,
@@ -98,7 +99,7 @@ from agent_core.types.safety import (
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 5
+JOURNAL_SCHEMA_VERSION: Final = 6
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -426,6 +427,11 @@ class SqliteJournal:
     def approval_uses(self, approval_id: str) -> int | None:
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.read_approval_uses(cur, str(approval_id))
+
+    def policy(self, tenant_id: str) -> Policy | None:
+        """The tenant's installed policy (owner-trusted), or None."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_policy(cur, str(tenant_id))
 
     def recorded_descriptor(self, attempt_id: str) -> ActionDescriptor | None:
         """The descriptor the ledger recorded for an attempt (its trusted content)."""

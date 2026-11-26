@@ -555,6 +555,20 @@ class OwnerAuthorizationError(CostError):
 # ---------------------------------------------------------------- permits (WP-09C)
 
 
+class WorkspaceRejectedError(SafetyError):
+    """WP-08: the work tree is not the signed, trusted synthetic tree the operation
+    names (manifest MAC, root identity, policy trust)."""
+
+    code = "WORKSPACE_REJECTED"
+
+
+class FileOperationRefusedError(SafetyError):
+    """WP-08: the file operation was refused before any target was opened (for
+    example C1.S19: no safe path resolution in this environment)."""
+
+    code = "FILE_OPERATION_REFUSED"
+
+
 class PermitRejectedError(SafetyError):
     """A permit was not issued or not consumed, or a receipt not claimed. The whole
     transaction is rolled back."""

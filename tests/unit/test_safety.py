@@ -161,7 +161,7 @@ def test_resources_beyond_the_grant_or_on_the_deny_list_are_denied(
 ) -> None:
     at = s.ref()
     registration = s.WRITE_TOOL if access is ResourceAccess.WRITE else s.READ_TOOL
-    canonical = f'{{"path":"{path}"}}'
+    canonical = tw.write_input(path) if access is ResourceAccess.WRITE else f'{{"path":"{path}"}}'
     descriptor = s.read_descriptor(
         at,
         registration=registration,
@@ -329,7 +329,7 @@ def test_model_claims_and_proposals_are_not_authority() -> None:
     proposal = s.REGISTRY.propose(
         tool_id="write_file",
         version="1.0.0",
-        arguments='{"path":"workspace/out/r.txt"}',
+        arguments=s.WRITE_INPUT,
         attempt_id=at.attempt_id,
     )
     # The registry's suggestion is not the decision: the PDP derives its own.
@@ -461,7 +461,7 @@ def test_owner_channel_approval_is_valid_for_its_action_only() -> None:
     assert _check(signed, key, action).action_hash == action
     other = s.write_descriptor(
         at,
-        canonical_input='{"path":"workspace/out/x.txt"}',
+        canonical_input=tw.write_input("workspace/out/x.txt"),
     )
     assert ApprovalReason.WRONG_ACTION in _reasons(lambda: _check(signed, key, other.action_hash()))
 

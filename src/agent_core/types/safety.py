@@ -243,6 +243,37 @@ class TargetResource(FrozenModel):
         return self
 
 
+class WriteOp(StrEnum):
+    """WP-08: how a write changes its target."""
+
+    CREATE = "CREATE"  # the target must not exist
+    REPLACE = "REPLACE"  # the target must have the expected content (``expected_pre``)
+
+
+class WriteChange(FrozenModel):
+    """WP-08 minimal ApplyPlan: one write in the managed work tree. Derived by the
+    trusted descriptor builder from the arguments; part of ``action_hash``, so an
+    approval, a permit and the execution ticket are for exactly this change.
+
+    ``content_digest`` and ``expected_pre`` are plain ``sha256:`` digests of file
+    bytes, so the broker can compare them with what it reads and writes."""
+
+    op: WriteOp
+    path: RelPath
+    expected_pre: Digest | None
+    content_digest: Digest
+    content_size: Annotated[int, Field(strict=True, ge=0, le=1_048_576)]
+
+    @model_validator(mode="after")
+    def _state_fits_op(self) -> Self:
+        _no_dotdot((self.path,))
+        if "*" in self.path:
+            raise ValueError("a write names a concrete path")
+        if (self.op is WriteOp.CREATE) != (self.expected_pre is None):
+            raise ValueError("CREATE expects no file; REPLACE expects the file's digest")
+        return self
+
+
 class ModelTarget(FrozenModel):
     profile: ProfileRef
     provider: ModelProviderKind
@@ -358,8 +389,9 @@ class RunGrant(FrozenModel):
 class ActionDescriptor(FrozenModel):
     """The normalized content of one operation (C1 7.1, E 38.1)."""
 
-    # Version 2 adds ``cost_basis`` (WP09-R01). Version 1 is not accepted.
-    descriptor_version: Literal[2]
+    # Version 2 added ``cost_basis`` (WP09-R01); version 3 adds ``apply_change``
+    # (WP-08). Earlier versions are not accepted.
+    descriptor_version: Literal[3]
     hash_scheme: HashScheme
     kind: ActionKind
     tenant_id: TenantId
@@ -382,6 +414,9 @@ class ActionDescriptor(FrozenModel):
     cost_basis: CostBasis
     reservation_id: ReservationId
     expires_at_ms: TimestampMs
+    # WP-08: the write's ApplyPlan. Present exactly when the operation writes, and
+    # for its (single) write target.
+    apply_change: WriteChange | None
 
     @model_validator(mode="after")
     def _shape(self) -> Self:
@@ -403,6 +438,12 @@ class ActionDescriptor(FrozenModel):
             ):
                 raise ValueError("a model call is priced by the price table for its model")
         require_unique([(r.path, r.access) for r in self.target_resources], "target resources")
+        writes = [r.path for r in self.target_resources if r.access is ResourceAccess.WRITE]
+        if self.apply_change is None:
+            if writes:
+                raise ValueError("a write carries its ApplyPlan")
+        elif writes != [self.apply_change.path]:
+            raise ValueError("the ApplyPlan is for the operation's one write target")
         return self
 
     def action_hash(self) -> str:
@@ -546,6 +587,11 @@ class PermitReason(StrEnum):
     RUN_CANCELLED = "RUN_CANCELLED"
     ELAPSED_MS = "ELAPSED_MS"
     GRANT_EXPIRED = "GRANT_EXPIRED"
+    # WP-08 execution tickets
+    TICKET_UNKNOWN = "TICKET_UNKNOWN"
+    TICKET_CLOSED = "TICKET_CLOSED"
+    TICKET_USED = "TICKET_USED"
+    TICKET_MISMATCH = "TICKET_MISMATCH"
 
 
 class PermitBody(FrozenModel):

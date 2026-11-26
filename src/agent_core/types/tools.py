@@ -79,6 +79,16 @@ class ResourceAccess(StrEnum):
     WRITE = "WRITE"
 
 
+class ApplyField(StrEnum):
+    """WP-08: an argument that fixes part of a write's ApplyPlan (``WriteChange``)."""
+
+    # The full text to write (UTF-8).
+    CONTENT = "CONTENT"
+    # ``absent`` (the target must not exist: create) or the sha256 digest of the
+    # file the write replaces.
+    EXPECTED_STATE = "EXPECTED_STATE"
+
+
 class ApprovalCondition(StrEnum):
     ALWAYS = "ALWAYS"
     ON_WRITE = "ON_WRITE"
@@ -102,11 +112,18 @@ class FieldSpec(FrozenModel):
     # The trusted descriptor builder derives the operation's targets from these
     # arguments; a caller cannot state the targets itself.
     resource: ResourceAccess | None = None
+    # WP-08: this argument is part of the write's ApplyPlan. The trusted descriptor
+    # builder derives the ``WriteChange`` from it.
+    apply: ApplyField | None = None
 
     @model_validator(mode="after")
     def _constraints_fit_type(self) -> Self:
         if self.resource is not None and (self.type is not FieldType.STRING or not self.required):
             raise ValueError("a resource argument is a required STRING field")
+        if self.apply is not None and (self.type is not FieldType.STRING or not self.required):
+            raise ValueError("an ApplyPlan argument is a required STRING field")
+        if self.apply is not None and self.resource is not None:
+            raise ValueError("an argument is either a resource or part of the ApplyPlan")
         if self.max_length is not None and self.type is not FieldType.STRING:
             raise ValueError("max_length applies to STRING fields only")
         if (self.minimum is not None or self.maximum is not None) and (
@@ -203,6 +220,18 @@ class ToolManifestBody(FrozenModel):
             if access not in marked:
                 # Without a resource argument the targets could not be derived (WP09-R06).
                 raise ValueError("each declared resource access needs a resource argument")
+        fields = self.input_schema.fields
+        write_targets = [f for f in fields if f.resource is ResourceAccess.WRITE]
+        applies = [f.apply for f in fields if f.apply is not None]
+        if writes:
+            # WP-08: one write target, and exactly one content and one expected-state
+            # argument, so the ApplyPlan of every call can be derived.
+            if len(write_targets) != 1 or sorted(applies) != sorted(ApplyField):
+                raise ValueError(
+                    "a write tool has one write target, one content and one expected state"
+                )
+        elif applies:
+            raise ValueError("ApplyPlan arguments belong to write tools only")
         return self
 
     @property
