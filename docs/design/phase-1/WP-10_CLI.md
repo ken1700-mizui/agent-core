@@ -338,3 +338,7 @@ Run の結果の理由（`reason`）は WP-15 のもの（`VERIFIED`、`WAITING_
 
 1937 件から 1983 件（WP10-R01〜R04 で 36 件、WP15-R06 で 10 件）。8種類の検査が、すべて成功した。
 
+## 16. WP-12 で加えたコマンド
+
+復旧の確認と操作のコマンドを加えた（詳しくは `WP-12_RECOVERY.md` の10章）：最上位の `recovery --home DIR [--json]`（読み取り専用）、シェルの `recovery`、`recover`、`reconcile <attempt>`、`declare-unresolved <run>`、`recover-temporaries`。新しい理由コード：`ATTEMPT_NOT_FOUND`、`RECOVERY_REFUSED`、`RECONCILIATION_EVIDENCE_INVALID`。状態の確認だけで復旧を始めることはない。
+

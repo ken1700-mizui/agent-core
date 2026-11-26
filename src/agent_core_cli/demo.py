@@ -31,6 +31,7 @@ from agent_core.adapters.fake_model import (
 from agent_core.adapters.file_broker import BUILTIN_FILE_TOOLS, builtin_artifact_hash
 from agent_core.context.estimator import SYNTHETIC_ESTIMATOR
 from agent_core.runtime.agent_loop import LoopLimits
+from agent_core.runtime.recovery import RecoveryDeadlines
 from agent_core.runtime.verification import FileCriterion
 from agent_core.safety.descriptor import pin_of
 from agent_core.safety.workspace import file_digest
@@ -96,6 +97,10 @@ WIDE_CAP: Final = 100_000_000  # tenant, user, period
 COUNTER_CAP: Final = 100
 RUN_WINDOW_MS: Final = 3_600_000
 GRANT_TTL_MS: Final = 3_600_000
+
+# WP-12: how long a Run may stay RECOVERING or CANCELLING before it is escalated
+# (A.I17). Synthetic test values, not owner-approved operating values.
+RECOVERY_DEADLINES: Final = RecoveryDeadlines(recovering_ms=600_000, cancelling_ms=600_000)
 
 LIMITS: Final = LoopLimits(
     max_repairs=3,  # provisional test value, not an owner-approved operating limit

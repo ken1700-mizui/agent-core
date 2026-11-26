@@ -51,6 +51,16 @@ from agent_core.ports.model import ModelPort
 from agent_core.runtime.agent_loop import AgentLoop, LoopConfig, LoopDeps, LoopOutcome, TaskProfile
 from agent_core.runtime.context_assembly import RuleCatalog
 from agent_core.runtime.execution_gate import SyntheticExecutionGate
+from agent_core.runtime.recovery import (
+    Reconciled,
+    RecoveryDeps,
+    RecoveryReport,
+    TemporaryRecovery,
+    declare_unresolved,
+    reconcile,
+    recover,
+    recover_temporaries,
+)
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.runtime.verification import CriteriaCatalog
 from agent_core.safety.approval import OwnerApprovalChannel
@@ -62,6 +72,7 @@ from agent_core.types.cost import BudgetScopeType, CounterKind
 from agent_core.types.errors import WorkspaceRejectedError
 from agent_core.types.ids import (
     ApprovalId,
+    AttemptId,
     PepInstanceId,
     RunGrantId,
     RunId,
@@ -439,6 +450,8 @@ class Session:
     tools: tuple[ToolRegistration, ...]
     hooks: Hooks
     home_dir: Home | None = None
+    report_key: SecretKey | None = None
+    broker: SyntheticFileBroker | None = None
     runs: dict[RunId, _RunEntry] = field(default_factory=dict)
     current: RunId | None = None
     closed: bool = False
@@ -669,6 +682,42 @@ class Session:
         )
         self._owner_ops(*ops)
 
+    # -------------------------------------------------------- recovery (WP-12)
+
+    def recovery_deps(self) -> RecoveryDeps:
+        return RecoveryDeps(
+            sm=self.sm,
+            ledger=self.journal,
+            owner=self._owner_ops,
+            clock=self.clock,
+            report_key=self.report_key,
+            journal=self.journal,
+        )
+
+    def recover(self) -> RecoveryReport:
+        """The owner's explicit recovery (never started by a status view)."""
+        return recover(self.recovery_deps(), deadlines=demo.RECOVERY_DEADLINES)
+
+    def reconcile(self, attempt_ref: str) -> Reconciled:
+        attempt_id = self._attempt(attempt_ref)
+        return reconcile(self.recovery_deps(), attempt_id, None).outcome
+
+    def declare_unresolved(self, run_id: RunId) -> Run:
+        return declare_unresolved(self.recovery_deps(), run_id)
+
+    def recover_temporaries(self) -> TemporaryRecovery:
+        if self.broker is None:
+            raise CliError("RECOVERY_REFUSED")
+        return recover_temporaries(
+            self.recovery_deps(), self.broker, workspace_ref=self.config.workspace_ref
+        )
+
+    def _attempt(self, ref: str) -> AttemptId:
+        for attempt_id in self.sm.state.attempts:
+            if str(attempt_id) == ref:
+                return attempt_id
+        raise CliError("ATTEMPT_NOT_FOUND")
+
     # -------------------------------------------------------- approval
 
     def pending(self) -> list[Attempt]:
@@ -837,6 +886,8 @@ def open_session(
             tools=tools,
             hooks=hooks or Hooks(),
             home_dir=h,
+            report_key=keys.permit,
+            broker=broker,
         )
         if session.hooks.files_wrapper is not None:
             session.files = session.hooks.files_wrapper(broker, session)

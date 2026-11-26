@@ -13,9 +13,11 @@ from __future__ import annotations
 from typing import Any, Final
 
 from agent_core.runtime.agent_loop import LoopOutcome
+from agent_core.runtime.file_execution import recovery_receipts
+from agent_core.runtime.recovery import assess
 from agent_core.types.cost import BudgetScopeType, CounterKind, ReservationState
 from agent_core.types.ids import RunId
-from agent_core.types.records import Attempt, RunStatus, TaskStatus
+from agent_core.types.records import Attempt, AttemptState, RunStatus, TaskStatus
 from agent_core_cli import render
 from agent_core_cli.environment import Session, Snapshot
 
@@ -239,4 +241,50 @@ def stops(session: View) -> dict[str, Any]:
             }
             for e in session.journal.stop_entries()
         ]
+    }
+
+
+def recovery(session: View) -> dict[str, Any]:
+    """What needs recovery (read only; nothing is started by looking)."""
+    plan = assess(session.sm.state)
+    runs = [
+        {
+            "run_id": str(r.run_id),
+            "status": r.status.value,
+            "resumable": session.continues(r.run_id),
+            "attempts": [
+                {
+                    "attempt_id": str(a.attempt_id),
+                    "state": a.state.value,
+                    "rule": a.rule,
+                    "action": a.action,
+                }
+                for a in r.attempts
+            ],
+        }
+        for r in plan.runs
+    ]
+    unknown = []
+    for attempt in session.sm.state.attempts.values():
+        if attempt.state is not AttemptState.OUTCOME_UNKNOWN:
+            continue
+        view = _reservation(session, attempt)
+        unknown.append(
+            {
+                "attempt_id": str(attempt.attempt_id),
+                "run_id": str(session.sm.state.steps[attempt.step_id].run_id),
+                "reservation_state": view.state.value if view else None,
+                "hold_micro": view.hold_micro if view else 0,
+            }
+        )
+    receipts = recovery_receipts(
+        ledger=session.journal,
+        attempts=session.sm.state.attempts.values(),
+        workspace_ref=session.config.workspace_ref,
+    )
+    return {
+        "runs": runs,
+        "unknown": unknown,
+        "temporary_receipts": list(receipts),
+        "unit": UNIT,
     }

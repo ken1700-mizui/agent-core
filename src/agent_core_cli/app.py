@@ -31,7 +31,8 @@ from typing import Any, Final, NoReturn, TextIO
 
 from agent_core.adapters.system import SystemClock
 from agent_core.ports.clock import Clock
-from agent_core.types.errors import JournalError, RuntimeLockHeldError
+from agent_core.runtime.recovery import RecoveryError
+from agent_core.types.errors import JournalError, RuntimeLockHeldError, WorkspaceRejectedError
 from agent_core.types.ids import RunId
 from agent_core.types.records import RunStatus
 from agent_core_cli import demo, views
@@ -62,8 +63,20 @@ _DONE_FAILED: Final = frozenset({RunStatus.FAILED, RunStatus.ABORTED_SAFETY})
 HELP: Final = (
     "commands: start <" + "|".join(demo.DEMOS) + ">; status; steps [run]; budget [run]; "
     "pending; approve <action_hash>; stop run [run|last]; stop tenant; stop global; stops; "
-    "resume-scope run <run> <stop_seq>; resume-scope tenant|global <stop_seq>; help; quit"
+    "resume-scope run <run> <stop_seq>; resume-scope tenant|global <stop_seq>; "
+    "recovery; recover; reconcile <attempt>; declare-unresolved <run>; recover-temporaries; "
+    "help; quit"
 )
+
+
+def _recovery_call[T](call: Callable[[], T]) -> T:
+    """A recovery refusal is shown by its fixed code."""
+    try:
+        return call()
+    except RecoveryError as refused:
+        raise CliError(refused.code, str(refused.args[0]) if refused.args else None) from None
+    except WorkspaceRejectedError as refused:
+        raise CliError("RECOVERY_REFUSED", "WORKSPACE_REJECTED") from refused
 
 
 class _UsageError(Exception):
@@ -105,6 +118,7 @@ def _parser(out: TextIO, err: TextIO) -> _Parser:
     for name, text in (
         ("init", "create a new synthetic home"),
         ("status", "show the Tasks and Runs (takes the Runtime lock briefly)"),
+        ("recovery", "show what needs recovery, read only (takes the Runtime lock briefly)"),
         ("shell", "open the Runtime and read commands (one session)"),
     ):
         cmd = sub.add_parser(name, help=text, out=out, err=err, allow_abbrev=False)
@@ -140,7 +154,7 @@ def main(
             init_home(home, clock=the_clock)
             stdout.write("initialized a synthetic home\n")
             return EXIT_OK
-        if args.command == "status":
+        if args.command in ("status", "recovery"):
             opened: Session | Snapshot = open_snapshot(home, clock=the_clock)
         else:
             opened = open_session(home, clock=the_clock, monotonic=the_monotonic, hooks=hooks)
@@ -149,7 +163,10 @@ def main(
     printer = Printer(stdout, as_json=bool(args.json))
     try:
         if isinstance(opened, Snapshot):
-            printer.event("status", **views.status(opened))
+            if args.command == "recovery":
+                printer.event("recovery", **views.recovery(opened))
+            else:
+                printer.event("status", **views.status(opened))
             code = EXIT_OK
         else:
             code = _Shell(opened, printer, reader, stdout).run()
@@ -352,6 +369,57 @@ class _Shell:
         self._session.resume_scope(rest[0], run_id, int(rest[-1]))
         self._printer.event("stops", **views.stops(self._session))
 
+    # -------------------------------------------------------- recovery (WP-12)
+
+    def recovery(self, rest: list[str]) -> None:
+        if rest:
+            raise CliError("USAGE_INVALID_ARGUMENTS")
+        self._printer.event("recovery", **views.recovery(self._session))
+
+    def recover(self, rest: list[str]) -> None:
+        """The owner's explicit recovery of every unfinished Run."""
+        if rest:
+            raise CliError("USAGE_INVALID_ARGUMENTS")
+        report = _recovery_call(self._session.recover)
+        self._printer.event("recovered", changed=report.changed)
+        for plan in report.runs:
+            run = self._session.sm.state.runs[plan.run_id]
+            self._acted = plan.run_id
+            self._printer.event(
+                "run_recovered",
+                run_id=str(plan.run_id),
+                before=plan.status.value,
+                after=run.status.value,
+            )
+
+    def reconcile(self, rest: list[str]) -> None:
+        if len(rest) != 1:
+            raise CliError("USAGE_INVALID_ARGUMENTS")
+        outcome = _recovery_call(lambda: self._session.reconcile(rest[0]))
+        self._printer.event("reconciled", attempt_id=rest[0], outcome=outcome.value)
+
+    def declare_unresolved(self, rest: list[str]) -> None:
+        run_id = self._run_ref(rest)
+        run = _recovery_call(lambda: self._session.declare_unresolved(run_id))
+        self._acted = run_id
+        self._printer.event(
+            "run_recovered",
+            run_id=str(run_id),
+            before="RECONCILIATION_REQUIRED",
+            after=run.status.value,
+        )
+
+    def recover_temporaries(self, rest: list[str]) -> None:
+        if rest:
+            raise CliError("USAGE_INVALID_ARGUMENTS")
+        result = _recovery_call(self._session.recover_temporaries)
+        self._printer.event(
+            "temporaries",
+            removed=list(result.removed),
+            kept=list(result.kept),
+            listed_receipts=list(result.listed_receipts),
+        )
+
     def help(self, rest: list[str]) -> None:
         self._printer.event("help", text=HELP)
 
@@ -371,6 +439,11 @@ _COMMANDS: Final[dict[str, Callable[[_Shell, list[str]], int | None]]] = {
     "stop": _Shell.stop,
     "stops": _Shell.stops,
     "resume-scope": _Shell.resume_scope,
+    "recovery": _Shell.recovery,
+    "recover": _Shell.recover,
+    "reconcile": _Shell.reconcile,
+    "declare-unresolved": _Shell.declare_unresolved,
+    "recover-temporaries": _Shell.recover_temporaries,
     "help": _Shell.help,
     "quit": _Shell.quit,
     "exit": _Shell.quit,
