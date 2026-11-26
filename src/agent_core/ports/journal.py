@@ -17,8 +17,8 @@ from __future__ import annotations
 from typing import Protocol, runtime_checkable
 
 from agent_core.types.base import FrozenModel
+from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
-from agent_core.types.records import Event, EventDraft
 from agent_core.types.values import Digest, Seq
 
 
@@ -32,6 +32,11 @@ class JournalHead(FrozenModel):
 
 @runtime_checkable
 class JournalPort(Protocol):
+    @property
+    def owner_epoch(self) -> int:
+        """The current owner epoch; every draft must carry it."""
+        ...
+
     def append(self, draft: EventDraft) -> Event:
         """Store the draft at the next position, or raise ``DuplicateIdError``."""
         ...

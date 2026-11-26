@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import hashlib
 
-from agent_core.types.records import Event
+from agent_core.types.events import Event
 from agent_core.types.serialization import dump_json
 
 EVENT_HASH_VERSION = 1

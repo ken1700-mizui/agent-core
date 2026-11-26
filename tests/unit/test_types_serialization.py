@@ -9,8 +9,9 @@ from typing import Any
 import pytest
 
 from agent_core.types.errors import RecordValidationError
+from agent_core.types.events import Event
 from agent_core.types.ids import RunId
-from agent_core.types.records import Attempt, EngineRequest, Event, Run, Step, Task
+from agent_core.types.records import Attempt, EngineRequest, Run, Step, Task
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import Budget, Currency, sha256_digest
 from support import builders as b
@@ -49,7 +50,8 @@ def test_restored_ids_are_typed() -> None:
         (Step, lambda d: d.update(run_seq=0), "greater_than_equal"),
         (Step, lambda d: d.update(run_seq="1"), "int_type"),
         (Run, lambda d: d.update(extra=1), "extra_forbidden"),
-        (Event, lambda d: d.update(schema_version=2), "unsupported_schema_version"),
+        (Event, lambda d: d.update(schema_version=3), "unsupported_schema_version"),
+        (Event, lambda d: d.update(schema_version=2), "payload_required"),
         (Attempt, lambda d: d.update(attempt_id="att_dev01_" + "0" * 31), "invalid_id"),
     ],
 )

@@ -42,8 +42,8 @@ from agent_core.types.errors import (
     StaleEventEpochError,
 )
 from agent_core.types.event_hash import event_hash
+from agent_core.types.events import Event
 from agent_core.types.ids import EventId, RunId, TenantId
-from agent_core.types.records import Event
 from agent_core.types.values import MAX_INT64
 from support import builders as b
 from support.fakes import ScriptedRandomSource

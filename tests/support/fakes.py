@@ -12,8 +12,8 @@ from collections.abc import Iterable, Iterator
 from agent_core.ports.journal import JournalHead
 from agent_core.types.errors import DuplicateIdError
 from agent_core.types.event_hash import event_hash
+from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import EntityId, EventId, RunId, TenantId
-from agent_core.types.records import Event, EventDraft
 from agent_core.types.values import Digest
 
 
@@ -67,6 +67,7 @@ class InMemoryJournal:
     """
 
     def __init__(self) -> None:
+        self.owner_epoch = 1
         self._events: dict[TenantId, list[Event]] = {}
         self._event_ids: set[EventId] = set()
         self._run_seq: dict[RunId, int] = {}

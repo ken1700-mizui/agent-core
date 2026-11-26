@@ -1,4 +1,6 @@
-"""Common records (E_INTEGRATION 8): Task, Run, Step, Attempt, Event, EngineRequest.
+"""Common records (E_INTEGRATION 8): Task, Run, Step, Attempt, EngineRequest.
+
+Event and EventDraft live in ``agent_core.types.events``.
 
 Field names follow E_INTEGRATION 8. Statuses follow A 6 (Run) and E 3.1
 (Attempt). Task and Step statuses and Step kinds are not fixed by the design;
@@ -20,7 +22,6 @@ from pydantic_core import PydanticCustomError
 from agent_core.types.base import ImmutableRecord, StateSnapshot
 from agent_core.types.ids import (
     AttemptId,
-    EventId,
     PermitId,
     ReceiptId,
     RequestId,
@@ -37,19 +38,13 @@ from agent_core.types.values import (
     EngineVersion,
     Epoch,
     Identifier,
-    KeyedHash,
     Label,
     NonMonetaryCaps,
     PolicyVersion,
     Seq,
-    TimestampMs,
     require_sorted_unique,
     require_unique,
 )
-
-# Event schema versions this code can read. Unknown versions are rejected.
-SUPPORTED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({1})
-
 
 # ---------------------------------------------------------------- statuses
 
@@ -143,6 +138,7 @@ _PERMIT_REQUIRED = frozenset(
         AttemptState.OUTCOME_UNKNOWN,
     }
 )
+_APPROVAL_STATES = frozenset({AttemptState.APPROVAL_PENDING, AttemptState.APPROVED})
 # Reached only through PERMIT_CONSUMED, so a receipt must exist.
 _RECEIPT_REQUIRED = _PERMIT_REQUIRED - {AttemptState.PERMIT_ISSUED}
 
@@ -157,7 +153,10 @@ def _invalid(code: str, message: str) -> PydanticCustomError:
 class Task(StateSnapshot):
     """A long-running unit of work (E 9). Budgets and caps apply to the whole Task."""
 
-    IDENTITY_FIELDS: ClassVar[frozenset[str]] = frozenset({"task_id"})
+    # The Task-wide budget and caps never change: a new Run cannot reset them (E 9).
+    IDENTITY_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"task_id", "goal_ref", "done_criteria", "budget_total", "caps_total"}
+    )
 
     task_id: TaskId
     goal_ref: Digest
@@ -216,7 +215,7 @@ class Attempt(StateSnapshot):
 
     IDENTITY_FIELDS: ClassVar[frozenset[str]] = frozenset({"attempt_id", "step_id"})
     WRITE_ONCE_FIELDS: ClassVar[frozenset[str]] = frozenset(
-        {"action_hash", "permit_id", "receipt_id", "reservation_id"}
+        {"action_hash", "permit_id", "receipt_id", "reservation_id", "approval_required"}
     )
 
     attempt_id: AttemptId
@@ -226,10 +225,15 @@ class Attempt(StateSnapshot):
     permit_id: PermitId | None
     receipt_id: ReceiptId | None
     reservation_id: ReservationId | None
+    # Fixed by the policy decision at POLICY_ALLOWED (WP-04): whether this attempt
+    # must pass APPROVAL_PENDING -> APPROVED. None until the decision.
+    approval_required: bool | None
 
     @model_validator(mode="after")
     def _ids_match_state(self) -> Self:
         state = self.state
+        if state in _APPROVAL_STATES and self.approval_required is not True:
+            raise _invalid("approval_not_required", "approval states need approval_required")
         if (
             self.action_hash is None
             and state not in _BEFORE_CONTENT_FIXED
@@ -256,83 +260,6 @@ class Attempt(StateSnapshot):
 
 
 # ---------------------------------------------------------------- immutable records
-
-
-def _check_schema_version(value: object) -> int:
-    if type(value) is not int or value not in SUPPORTED_EVENT_SCHEMA_VERSIONS:
-        raise _invalid("unsupported_schema_version", "unsupported event schema_version")
-    return value
-
-
-class _EventFields(ImmutableRecord):
-    """Fields shared by EventDraft and Event."""
-
-    event_id: EventId
-    type: Identifier
-    schema_version: int
-    tenant_id: TenantId
-    run_id: RunId | None
-    engine: EngineVersion
-    policy_version: PolicyVersion
-    access_epoch: Epoch
-    owner_epoch: Epoch
-    revocation_gen: Epoch
-    labels: tuple[Label, ...]
-    refs: tuple[Digest, ...]
-    keyed_hashes: tuple[KeyedHash, ...]
-    # A 2 lists ``ts``; it records time for people and never orders events.
-    recorded_at_ms: TimestampMs
-
-    @field_validator("schema_version", mode="plain")
-    @classmethod
-    def _schema_version(cls, value: object) -> int:
-        return _check_schema_version(value)
-
-    @field_validator("labels", "refs")
-    @classmethod
-    def _canonical(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        require_sorted_unique(value, "items")
-        return value
-
-    @field_validator("keyed_hashes")
-    @classmethod
-    def _keyed_names(cls, value: tuple[KeyedHash, ...]) -> tuple[KeyedHash, ...]:
-        require_sorted_unique([h.name for h in value], "keyed hash names")
-        return value
-
-
-class EventDraft(_EventFields):
-    """An event before the Journal assigns its positions (``tenant_seq``, ``run_seq``,
-    ``prev_hash``). Only the Journal turns a draft into an Event (WP-03)."""
-
-
-class Event(_EventFields):
-    """A Journal event (E 8). Append-only; positions are assigned by the Journal."""
-
-    run_seq: Seq | None
-    tenant_seq: Seq
-    prev_hash: Digest | None
-
-    @model_validator(mode="after")
-    def _positions(self) -> Self:
-        if (self.run_id is None) != (self.run_seq is None):
-            raise _invalid("run_position", "run_id and run_seq must be set together")
-        if (self.tenant_seq == 1) != (self.prev_hash is None):
-            raise _invalid("hash_chain_start", "only tenant_seq 1 has no prev_hash")
-        return self
-
-    @classmethod
-    def from_draft(
-        cls,
-        draft: EventDraft,
-        *,
-        tenant_seq: int,
-        run_seq: int | None,
-        prev_hash: str | None,
-    ) -> Event:
-        values = {name: getattr(draft, name) for name in EventDraft.model_fields}
-        values.update(tenant_seq=tenant_seq, run_seq=run_seq, prev_hash=prev_hash)
-        return cls.model_validate(values)
 
 
 class EngineRequest(ImmutableRecord):

@@ -134,6 +134,7 @@ def test_real_layer_contract_is_configured_and_kept(tmp_path: Path) -> None:
     result = _lint_imports(REPO_ROOT / "pyproject.toml", REPO_ROOT / "src", tmp_path)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Ports & Adapters layers" in result.stdout
+    assert "runtime" in result.stdout
     assert "KEPT" in result.stdout
 
 
@@ -200,6 +201,22 @@ def test_cycle_between_layers_breaks_the_real_contract(tmp_path: Path) -> None:
         ("agent_core.types.planted", "import sqlite3", "agent_core.types.planted -> sqlite3"),
         ("agent_core.ports.planted", "import sqlite3", "agent_core.ports.planted -> sqlite3"),
         ("agent_core.identity.planted", "import fcntl", "agent_core.identity.planted -> fcntl"),
+        ("agent_core.runtime.planted", "import sqlite3", "agent_core.runtime.planted -> sqlite3"),
+        (
+            "agent_core.runtime.planted",
+            "from agent_core.adapters import sqlite_journal",
+            "agent_core.runtime.planted -> agent_core.adapters.sqlite_journal",
+        ),
+        (
+            "agent_core.types.planted",
+            "from agent_core.runtime import state_machine",
+            "agent_core.types.planted -> agent_core.runtime.state_machine",
+        ),
+        (
+            "agent_core.identity.planted",
+            "from agent_core.runtime import service",
+            "agent_core.identity.planted -> agent_core.runtime.service",
+        ),
         (
             "agent_core.ports.planted",
             "from agent_core.adapters import sqlite_journal",

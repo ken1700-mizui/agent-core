@@ -11,7 +11,7 @@ Agent Core は、オーナー自身が使うための、専用の AI エージ�
 
 ## 今の状態
 
-- Phase 1 の WP-01（プロジェクトの構成と CI）、WP-02（共通の型と Ports）、WP-03（SQLite の Journal）を実装した。Engine の機能は、まだない（設計の記録は `docs/design/phase-1/`）。
+- Phase 1 の WP-01（プロジェクトの構成と CI）、WP-02（共通の型と Ports）、WP-03（SQLite の Journal）、WP-04（状態機械）を実装した。Engine の機能は、まだない（設計の記録は `docs/design/phase-1/`）。
 - Phase 1 は、合成のデータだけを使う。実 API、認証情報、外部への通信は使わない（費用は 0 ドル）。
 
 ## 開発の環境（Linux）
@@ -89,8 +89,9 @@ python3 -I tools/secret_scan.py --mode index
 ```
 src/agent_core/
   types/             共通の型（ID、値、記録、エラー、書き出しと復元）。最も下の層
-  ports/             接続口（Clock、RandomSource、IdRegistry、JournalPort）
+  ports/             接続口（Clock、RandomSource、IdRegistry、JournalPort、EvidenceVerifier）
   identity/          ID の生成
+  runtime/           Task、Run、Step、Attempt の状態機械（純粋な判断と、Journal への記録）
   adapters/          接続口の実装（システムの時計、OS の乱数、SQLite の Journal、OS のロック）
 tests/support/       試験だけで使う、合成の偽の実装
 tests/unit/          単体の試験（合成のデータだけ。Python の通信は試験の中で遮断する）

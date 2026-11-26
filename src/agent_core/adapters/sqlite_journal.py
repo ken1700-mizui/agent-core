@@ -59,8 +59,8 @@ from agent_core.types.errors import (
     StaleEventEpochError,
 )
 from agent_core.types.event_hash import EVENT_HASH_VERSION, event_hash
+from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
-from agent_core.types.records import Event, EventDraft
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 

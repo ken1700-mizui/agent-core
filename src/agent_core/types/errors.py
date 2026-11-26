@@ -206,3 +206,62 @@ class JournalFileChangedError(JournalError):
     """The database path no longer names the opened file, or it gained a hard link."""
 
     code = "JOURNAL_FILE_CHANGED"
+
+
+# ---------------------------------------------------------------- runtime state machine (WP-04)
+
+
+class StateTransitionError(AgentCoreError):
+    """Base class of rejected state transitions. Nothing was recorded."""
+
+    code = "STATE_TRANSITION_REJECTED"
+
+
+class IllegalTransitionError(StateTransitionError):
+    """The transition is not an edge of the transition table."""
+
+    code = "ILLEGAL_TRANSITION"
+
+
+class TransitionPreconditionError(StateTransitionError):
+    """The edge exists, but its preconditions or required evidence are not met."""
+
+    code = "TRANSITION_PRECONDITION_FAILED"
+
+
+class StaleStateError(StateTransitionError):
+    """The caller's snapshot is not the current state (stale or repeated update)."""
+
+    code = "STALE_STATE"
+
+
+class UnknownEntityError(StateTransitionError):
+    """The referenced Task, Run, Step or Attempt does not exist."""
+
+    code = "UNKNOWN_ENTITY"
+
+
+class DuplicateEntityError(StateTransitionError):
+    """An entity with this ID already exists (an attempt is never reused)."""
+
+    code = "DUPLICATE_ENTITY"
+
+
+class EvidenceRejectedError(StateTransitionError):
+    """The evidence verifier did not confirm the evidence."""
+
+    code = "EVIDENCE_REJECTED"
+
+
+class StateRebuildError(AgentCoreError):
+    """Journal events cannot be folded into a valid state. Never ignored."""
+
+    code = "STATE_REBUILD_FAILED"
+    fatal = True
+
+
+class StateDivergenceError(AgentCoreError):
+    """The journal stored an event whose position differs from the one planned."""
+
+    code = "STATE_DIVERGENCE"
+    fatal = True

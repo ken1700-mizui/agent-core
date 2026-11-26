@@ -1,0 +1,680 @@
+"""Pure state machine for Task, Run, Step and Attempt (WP-04). No I/O.
+
+- Transition tables (``*_TRANSITIONS``) list every allowed edge explicitly.
+  Terminal states have no outgoing edge (A.I7).
+- Planners (``plan_*``) take the current ``RuntimeState``, a snapshot and a
+  target, check the edge, the preconditions and the evidence, and return the
+  transition record with the computed ``after`` snapshot. They never trust a
+  caller-made ``after``.
+- ``apply_transition`` re-plans a recorded transition and requires it to be
+  identical, so a journal event cannot smuggle in a state or field change.
+- ``apply_event`` / ``rebuild`` fold journal events; anything unknown or
+  inconsistent raises ``StateRebuildError`` and is never skipped.
+
+Evidence is checked for consistency only (IDs, hashes, kinds). Confirming that
+it is genuine is the ``EvidenceVerifier`` port's job (runtime/service.py).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import Any
+
+from agent_core.types.errors import (
+    DuplicateEntityError,
+    IllegalTransitionError,
+    StaleStateError,
+    StateRebuildError,
+    StateTransitionError,
+    TransitionPreconditionError,
+    UnknownEntityError,
+)
+from agent_core.types.events import Event
+from agent_core.types.ids import AttemptId, RunId, StepId, TaskId
+from agent_core.types.records import (
+    TERMINAL_RUN_STATUSES,
+    Attempt,
+    AttemptState,
+    Run,
+    RunStatus,
+    Step,
+    StepStatus,
+    Task,
+    TaskStatus,
+)
+from agent_core.types.transitions import (
+    RUNTIME_EVENT_SCHEMA_VERSION,
+    RUNTIME_EVENT_TYPE,
+    AbortEvidence,
+    ApprovalEvidence,
+    AttemptEvidence,
+    AttemptTransition,
+    ContentFixedEvidence,
+    DispatchEvidence,
+    EntityAction,
+    IntentEvidence,
+    OutcomeEvidence,
+    PermitConsumedEvidence,
+    PermitIssuedEvidence,
+    PolicyDecisionEvidence,
+    ReconciledOutcome,
+    ReconciliationEvidence,
+    ReconciliationResolution,
+    ReconciliationTrigger,
+    ReconciliationTriggerReason,
+    ReservationEvidence,
+    ResolutionDecision,
+    RunEvidence,
+    RuntimePayload,
+    RunTransition,
+    StepTransition,
+    TaskAction,
+    TaskTransition,
+    Termination,
+    Transition,
+    ValidationEvidence,
+    VerificationEvidence,
+)
+
+A, R, S, T = AttemptState, RunStatus, StepStatus, TaskStatus
+
+
+def _table[E](edges: dict[E, set[E]]) -> Mapping[E, frozenset[E]]:
+    return MappingProxyType({k: frozenset(v) for k, v in edges.items()})
+
+
+_STOP = {R.FAILED, R.ABORTED_SAFETY}
+
+# A 6. PAUSED_BUDGET -> CANCELLING is a WP-04 decision (the diagram shows WAITING_*).
+RUN_TRANSITIONS: Mapping[RunStatus, frozenset[RunStatus]] = _table(
+    {
+        R.CREATED: {R.QUEUED} | _STOP,
+        R.QUEUED: {R.RUNNING, R.RECOVERING} | _STOP,
+        R.RUNNING: {
+            R.WAITING_TOOL,
+            R.WAITING_APPROVAL,
+            R.PAUSED_BUDGET,
+            R.VERIFYING,
+            R.CANCELLING,
+            R.RECONCILIATION_REQUIRED,
+            R.RECOVERING,
+        }
+        | _STOP,
+        R.WAITING_TOOL: {R.RUNNING, R.CANCELLING, R.RECOVERING} | _STOP,
+        R.WAITING_APPROVAL: {R.RUNNING, R.CANCELLING, R.RECOVERING} | _STOP,
+        R.PAUSED_BUDGET: {R.RUNNING, R.CANCELLING, R.RECOVERING} | _STOP,
+        R.VERIFYING: {R.COMPLETED, R.RUNNING, R.RECOVERING} | _STOP,
+        R.RECOVERING: {R.QUEUED, R.RECONCILIATION_REQUIRED} | _STOP,
+        R.CANCELLING: {R.CANCELLED, R.RECONCILIATION_REQUIRED} | _STOP,
+        R.RECONCILIATION_REQUIRED: {R.RUNNING, R.CANCELLED} | _STOP,
+        R.COMPLETED: set(),
+        R.CANCELLED: set(),
+        R.FAILED: set(),
+        R.ABORTED_SAFETY: set(),
+    }
+)
+
+_ABORT = A.ABORTED_BEFORE_DISPATCH
+# E 3.1 with E 38 (reservation ID allocated at CONTENT_FIXED).
+ATTEMPT_TRANSITIONS: Mapping[AttemptState, frozenset[AttemptState]] = _table(
+    {
+        A.PROPOSED: {A.VALIDATED, _ABORT},
+        A.VALIDATED: {A.CONTENT_FIXED, _ABORT},
+        A.CONTENT_FIXED: {A.POLICY_ALLOWED, _ABORT},
+        A.POLICY_ALLOWED: {A.APPROVAL_PENDING, A.BUDGET_RESERVED, _ABORT},
+        A.APPROVAL_PENDING: {A.APPROVED, _ABORT},
+        A.APPROVED: {A.BUDGET_RESERVED, _ABORT},
+        A.BUDGET_RESERVED: {A.INTENT_RECORDED, _ABORT},
+        A.INTENT_RECORDED: {A.PERMIT_ISSUED, _ABORT},
+        A.PERMIT_ISSUED: {A.PERMIT_CONSUMED, _ABORT},
+        A.PERMIT_CONSUMED: {A.DISPATCH_AUTHORIZED, A.OUTCOME_UNKNOWN, _ABORT},
+        A.DISPATCH_AUTHORIZED: {A.DISPATCH_STARTED, A.OUTCOME_UNKNOWN, _ABORT},
+        A.DISPATCH_STARTED: {A.COMPLETED, A.FAILED_DEFINITE, A.OUTCOME_UNKNOWN},
+        A.OUTCOME_UNKNOWN: {A.COMPLETED, A.FAILED_DEFINITE},
+        A.COMPLETED: set(),
+        A.FAILED_DEFINITE: set(),
+        _ABORT: set(),
+    }
+)
+
+STEP_TRANSITIONS: Mapping[StepStatus, frozenset[StepStatus]] = _table(
+    {
+        S.PLANNED: {S.IN_PROGRESS, S.CANCELLED},
+        S.IN_PROGRESS: {S.COMMITTED, S.FAILED, S.RECONCILIATION_REQUIRED, S.CANCELLED},
+        S.RECONCILIATION_REQUIRED: {S.COMMITTED, S.FAILED, S.CANCELLED},
+        S.COMMITTED: set(),
+        S.FAILED: set(),
+        S.CANCELLED: set(),
+    }
+)
+
+TASK_TRANSITIONS: Mapping[TaskStatus, frozenset[TaskStatus]] = _table(
+    {
+        T.CREATED: {T.ACTIVE, T.CANCELLED, T.FAILED},
+        T.ACTIVE: {T.PAUSED, T.COMPLETED, T.FAILED, T.CANCELLED},
+        T.PAUSED: {T.ACTIVE, T.FAILED, T.CANCELLED},
+        T.COMPLETED: set(),
+        T.FAILED: set(),
+        T.CANCELLED: set(),
+    }
+)
+
+TERMINAL_TASK_STATUSES = frozenset({T.COMPLETED, T.FAILED, T.CANCELLED})
+TERMINAL_STEP_STATUSES = frozenset({S.COMMITTED, S.FAILED, S.CANCELLED})
+FINAL_ATTEMPT_STATES = frozenset({A.COMPLETED, A.FAILED_DEFINITE, _ABORT})
+_OUTCOME_TARGETS = frozenset({A.COMPLETED, A.FAILED_DEFINITE, A.OUTCOME_UNKNOWN, _ABORT})
+_PEP_INVOLVED = frozenset({A.PERMIT_CONSUMED, A.DISPATCH_AUTHORIZED})
+# Run states in which attempts may make progress, and in which results may arrive.
+_ACTIVE_RUN = frozenset({R.RUNNING, R.WAITING_TOOL, R.WAITING_APPROVAL})
+_RESULT_RUN = _ACTIVE_RUN | {R.CANCELLING, R.RECONCILIATION_REQUIRED, R.RECOVERING}
+
+
+def check_edge(table: Mapping[Any, frozenset[Any]], current: Any, target: Any, what: str) -> None:
+    if target not in table[current]:
+        raise IllegalTransitionError(f"{what}: {current} -> {target} is not allowed")
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise TransitionPreconditionError(message)
+
+
+def _frozen[K, V](items: dict[K, V]) -> Mapping[K, V]:
+    return MappingProxyType(items)
+
+
+# ---------------------------------------------------------------- state
+
+
+@dataclass(frozen=True)
+class RuntimeState:
+    """Immutable view of all entities of one tenant, folded from the Journal."""
+
+    tasks: Mapping[TaskId, Task] = field(default_factory=lambda: _frozen({}))
+    runs: Mapping[RunId, Run] = field(default_factory=lambda: _frozen({}))
+    steps: Mapping[StepId, Step] = field(default_factory=lambda: _frozen({}))
+    attempts: Mapping[AttemptId, Attempt] = field(default_factory=lambda: _frozen({}))
+    run_steps: Mapping[RunId, tuple[StepId, ...]] = field(default_factory=lambda: _frozen({}))
+    step_attempts: Mapping[StepId, tuple[AttemptId, ...]] = field(
+        default_factory=lambda: _frozen({})
+    )
+    # Last journal run_seq per run (positions come from the Journal, never from IDs).
+    run_seqs: Mapping[RunId, int] = field(default_factory=lambda: _frozen({}))
+
+    @classmethod
+    def empty(cls) -> RuntimeState:
+        return cls()
+
+    def steps_of_run(self, run_id: RunId) -> tuple[Step, ...]:
+        return tuple(self.steps[s] for s in self.run_steps.get(run_id, ()))
+
+    def attempts_of_step(self, step_id: StepId) -> tuple[Attempt, ...]:
+        return tuple(self.attempts[a] for a in self.step_attempts.get(step_id, ()))
+
+    def attempts_of_run(self, run_id: RunId) -> tuple[Attempt, ...]:
+        return tuple(a for s in self.run_steps.get(run_id, ()) for a in self.attempts_of_step(s))
+
+    def run_of_attempt(self, attempt: Attempt) -> Run:
+        return self.runs[self.steps[attempt.step_id].run_id]
+
+    def _replace(self, **changes: Mapping[Any, Any]) -> RuntimeState:
+        values = {name: getattr(self, name) for name in self.__dataclass_fields__}
+        values.update(changes)
+        return RuntimeState(**values)
+
+    def _with(self, name: str, key: Any, value: Any) -> RuntimeState:
+        items = dict(getattr(self, name))
+        items[key] = value
+        return self._replace(**{name: _frozen(items)})
+
+
+def _current[K, V](items: Mapping[K, V], key: K, before: V, what: str) -> V:
+    if key not in items:
+        raise UnknownEntityError(f"unknown {what}")
+    if items[key] != before:
+        raise StaleStateError(f"{what} snapshot is not the current state")
+    return items[key]
+
+
+def _all_final(attempts: Iterable[Attempt]) -> bool:
+    return all(a.state in FINAL_ATTEMPT_STATES for a in attempts)
+
+
+# ---------------------------------------------------------------- tasks
+
+
+def plan_task_create(state: RuntimeState, task: Task) -> TaskTransition:
+    if task.task_id in state.tasks:
+        raise DuplicateEntityError("task already exists")
+    _require(task.status is T.CREATED and task.runs == (), "a new task starts CREATED, no runs")
+    return TaskTransition(entity="task", action=TaskAction.CREATE, before=None, after=task)
+
+
+def plan_task_status(state: RuntimeState, before: Task, target: TaskStatus) -> TaskTransition:
+    _current(state.tasks, before.task_id, before, "task")
+    check_edge(TASK_TRANSITIONS, before.status, target, "task")
+    runs = [state.runs[r] for r in before.runs]
+    if target is T.COMPLETED:
+        _require(bool(runs), "a task completes only through a completed run")
+        _require(runs[-1].status is R.COMPLETED, "the last run must be COMPLETED")
+    if target in (T.COMPLETED, T.CANCELLED, T.FAILED, T.PAUSED):
+        _require(all(r.status in TERMINAL_RUN_STATUSES for r in runs), "a run is still open")
+    after = before.evolve(status=target)
+    return TaskTransition(entity="task", action=TaskAction.SET_STATUS, before=before, after=after)
+
+
+def plan_task_attach(state: RuntimeState, before: Task, run_id: RunId) -> TaskTransition:
+    _current(state.tasks, before.task_id, before, "task")
+    _require(before.status is T.ACTIVE, "runs attach only to an ACTIVE task")
+    run = state.runs.get(run_id)
+    _require(run is not None and run.task_id == before.task_id, "run belongs to another task")
+    _require(run_id not in before.runs, "run is already attached")
+    after = before.evolve(runs=(*before.runs, run_id))
+    return TaskTransition(entity="task", action=TaskAction.ATTACH_RUN, before=before, after=after)
+
+
+# ---------------------------------------------------------------- runs
+
+
+def plan_run_create(state: RuntimeState, run: Run) -> RunTransition:
+    if run.run_id in state.runs:
+        raise DuplicateEntityError("run already exists")
+    task = state.tasks.get(run.task_id)
+    if task is None:
+        raise UnknownEntityError("unknown task")
+    _require(task.status is T.ACTIVE, "a run starts only in an ACTIVE task")
+    _require(
+        all(state.runs[r].status in TERMINAL_RUN_STATUSES for r in task.runs),
+        "the task already has an open run",
+    )
+    expected_parent = task.runs[-1] if task.runs else None
+    _require(run.parent_run_id == expected_parent, "a new run continues from the task's last run")
+    _require(run.status is R.CREATED, "a new run starts CREATED")
+    return RunTransition(
+        entity="run", action=EntityAction.CREATE, before=None, after=run, evidence=None
+    )
+
+
+def _no_evidence(evidence: object) -> None:
+    _require(evidence is None, "this transition takes no evidence")
+
+
+def plan_run_status(
+    state: RuntimeState, before: Run, target: RunStatus, evidence: RunEvidence | None
+) -> RunTransition:
+    _current(state.runs, before.run_id, before, "run")
+    check_edge(RUN_TRANSITIONS, before.status, target, "run")
+    task = state.tasks[before.task_id]
+    attempts = state.attempts_of_run(before.run_id)
+    steps = state.steps_of_run(before.run_id)
+    settled = _all_final(attempts) and all(s.status in TERMINAL_STEP_STATUSES for s in steps)
+    unknown = any(a.state is A.OUTCOME_UNKNOWN for a in attempts)
+    source = before.status
+
+    if target in (R.FAILED, R.ABORTED_SAFETY):
+        _require(isinstance(evidence, Termination), "a termination reason is required")
+    elif target is R.COMPLETED:
+        verification = _evidence(evidence, VerificationEvidence)
+        _require(verification.passed, "verification did not pass")
+        refs = [c.criterion_ref for c in verification.criteria]
+        _require(
+            len(set(refs)) == len(refs) and set(refs) == set(task.done_criteria),
+            "verification must cover exactly the task's done criteria",
+        )
+        _require(settled, "unsettled attempts, reservations or steps remain (A.I16)")
+    elif target is R.VERIFYING:
+        _no_evidence(evidence)
+        _require(settled, "attempts and steps must be settled before verification")
+    elif target is R.RECONCILIATION_REQUIRED:
+        trigger = _evidence(evidence, ReconciliationTrigger)
+        if trigger.reason is ReconciliationTriggerReason.OUTCOME_UNKNOWN:
+            _require(unknown, "no attempt has an unknown outcome")
+    elif target is R.CANCELLED:
+        if source is R.RECONCILIATION_REQUIRED:
+            _require(
+                isinstance(evidence, ReconciliationResolution)
+                and evidence.decision is ResolutionDecision.CANCEL,
+                "a CANCEL resolution is required",
+            )
+        else:
+            _no_evidence(evidence)
+        _require(settled, "unsettled attempts or steps remain (A.I16)")
+    elif target is R.RUNNING and source is R.VERIFYING:
+        _require(
+            isinstance(evidence, VerificationEvidence) and not evidence.passed,
+            "returning to RUNNING needs a failed verification",
+        )
+    elif target is R.RUNNING and source is R.RECONCILIATION_REQUIRED:
+        _require(
+            isinstance(evidence, ReconciliationResolution)
+            and evidence.decision is ResolutionDecision.RESUME,
+            "a RESUME resolution is required",
+        )
+        _require(not unknown, "unknown outcomes must be reconciled first")
+    elif target is R.QUEUED and source is R.RECOVERING:
+        _no_evidence(evidence)
+        _require(not unknown, "unknown outcomes need reconciliation, not a restart")
+    else:
+        _no_evidence(evidence)
+    if target in (R.QUEUED, R.RUNNING):
+        _require(task.status is T.ACTIVE, "the task is not ACTIVE")
+    after = before.evolve(status=target)
+    return RunTransition(
+        entity="run", action=EntityAction.SET_STATUS, before=before, after=after, evidence=evidence
+    )
+
+
+# ---------------------------------------------------------------- steps
+
+
+def plan_step_create(state: RuntimeState, step: Step) -> StepTransition:
+    if step.step_id in state.steps:
+        raise DuplicateEntityError("step already exists")
+    run = state.runs.get(step.run_id)
+    if run is None:
+        raise UnknownEntityError("unknown run")
+    _require(run.status is R.RUNNING, "steps are created only while the run is RUNNING")
+    _require(step.status is S.PLANNED, "a new step starts PLANNED")
+    _require(
+        step.run_seq == state.run_seqs.get(step.run_id, 0) + 1,
+        "step run_seq must be the journal position of its creation",
+    )
+    return StepTransition(entity="step", action=EntityAction.CREATE, before=None, after=step)
+
+
+def plan_step_status(state: RuntimeState, before: Step, target: StepStatus) -> StepTransition:
+    _current(state.steps, before.step_id, before, "step")
+    check_edge(STEP_TRANSITIONS, before.status, target, "step")
+    run = state.runs[before.run_id]
+    attempts = state.attempts_of_step(before.step_id)
+    if target is S.IN_PROGRESS:
+        _require(run.status is R.RUNNING, "the run is not RUNNING")
+    elif target is S.COMMITTED:
+        _require(
+            run.status in (R.RUNNING, R.RECONCILIATION_REQUIRED),
+            "results are not used while the run is not RUNNING (late results)",
+        )
+        _require(
+            bool(attempts) and _all_final(attempts) and attempts[-1].state is A.COMPLETED,
+            "a step commits only after its latest attempt COMPLETED",
+        )
+    elif target is S.FAILED:
+        _require(run.status in (R.RUNNING, R.RECONCILIATION_REQUIRED), "the run is not RUNNING")
+        _require(_all_final(attempts), "attempts are still open or unknown")
+    elif target is S.RECONCILIATION_REQUIRED:
+        _require(any(a.state is A.OUTCOME_UNKNOWN for a in attempts), "no unknown outcome")
+    elif target is S.CANCELLED:
+        _require(run.status in (R.RUNNING, R.CANCELLING), "the run is not RUNNING or CANCELLING")
+        _require(_all_final(attempts), "attempts are still open or unknown")
+    after = before.evolve(status=target)
+    return StepTransition(entity="step", action=EntityAction.SET_STATUS, before=before, after=after)
+
+
+# ---------------------------------------------------------------- attempts
+
+
+def plan_attempt_create(state: RuntimeState, attempt: Attempt) -> AttemptTransition:
+    if attempt.attempt_id in state.attempts:
+        raise DuplicateEntityError("attempt already exists; a retry needs a new attempt")
+    step = state.steps.get(attempt.step_id)
+    if step is None:
+        raise UnknownEntityError("unknown step")
+    run = state.runs[step.run_id]
+    _require(run.status is R.RUNNING, "attempts are created only while the run is RUNNING")
+    _require(step.status is S.IN_PROGRESS, "the step is not IN_PROGRESS")
+    previous = state.attempts_of_step(step.step_id)
+    _require(_all_final(previous), "an earlier attempt is still open or unknown (A.I4)")
+    _require(not previous or previous[-1].state is not A.COMPLETED, "the step already succeeded")
+    fresh = (
+        attempt.state is A.PROPOSED
+        and attempt.action_hash is None
+        and attempt.permit_id is None
+        and attempt.receipt_id is None
+        and attempt.reservation_id is None
+        and attempt.approval_required is None
+    )
+    _require(fresh, "a new attempt starts PROPOSED with nothing fixed")
+    return AttemptTransition(
+        entity="attempt",
+        action=EntityAction.CREATE,
+        before=None,
+        after=attempt,
+        evidence=None,
+        late=False,
+    )
+
+
+def _evidence[E](evidence: object, kind: type[E]) -> E:
+    if not isinstance(evidence, kind):
+        raise TransitionPreconditionError(f"{kind.__name__} is required")
+    return evidence
+
+
+def _unused(state: RuntimeState, name: str, value: object) -> None:
+    _require(
+        all(getattr(a, name) != value for a in state.attempts.values()),
+        f"{name} is already used by another attempt",
+    )
+
+
+def plan_attempt_status(
+    state: RuntimeState,
+    before: Attempt,
+    target: AttemptState,
+    evidence: AttemptEvidence | None,
+) -> AttemptTransition:
+    _current(state.attempts, before.attempt_id, before, "attempt")
+    check_edge(ATTEMPT_TRANSITIONS, before.state, target, "attempt")
+    run = state.run_of_attempt(before)
+    if target in _OUTCOME_TARGETS:
+        _require(run.status in _RESULT_RUN, "the run cannot accept results now")
+    else:
+        _require(run.status in _ACTIVE_RUN, "attempts progress only while the run is active")
+    late = run.status is R.CANCELLING and target in _OUTCOME_TARGETS
+    action = before.action_hash
+    changes: dict[str, Any] = {}
+
+    if target is A.VALIDATED:
+        _evidence(evidence, ValidationEvidence)
+    elif target is A.CONTENT_FIXED:
+        ev_fixed = _evidence(evidence, ContentFixedEvidence)
+        _unused(state, "reservation_id", ev_fixed.reservation_id)
+        changes = {"action_hash": ev_fixed.action_hash, "reservation_id": ev_fixed.reservation_id}
+    elif target is A.POLICY_ALLOWED:
+        ev_policy = _evidence(evidence, PolicyDecisionEvidence)
+        _require(ev_policy.action_hash == action, "policy decision is for another action")
+        changes = {"approval_required": ev_policy.approval_required}
+    elif target is A.APPROVAL_PENDING:
+        _no_evidence(evidence)
+        _require(before.approval_required is True, "this attempt does not require approval")
+    elif target is A.APPROVED:
+        ev_approval = _evidence(evidence, ApprovalEvidence)
+        _require(ev_approval.action_hash == action, "approval is for another action")
+        _require(
+            ev_approval.reservation_id == before.reservation_id,
+            "approval is for another reservation (AUDIT-01)",
+        )
+    elif target is A.BUDGET_RESERVED:
+        ev_reserve = _evidence(evidence, ReservationEvidence)
+        if before.state is A.POLICY_ALLOWED:
+            _require(before.approval_required is False, "approval is required first")
+        _require(ev_reserve.action_hash == action, "reservation is for another action")
+        _require(
+            ev_reserve.reservation_id == before.reservation_id,
+            "reservation must activate the allocated ID (AUDIT-01)",
+        )
+    elif target is A.INTENT_RECORDED:
+        ev_intent = _evidence(evidence, IntentEvidence)
+        _require(ev_intent.action_hash == action, "intent is for another action")
+    elif target is A.PERMIT_ISSUED:
+        ev_permit = _evidence(evidence, PermitIssuedEvidence)
+        _require(ev_permit.action_hash == action, "permit is for another action")
+        _require(
+            ev_permit.reservation_id == before.reservation_id, "permit names another reservation"
+        )
+        _unused(state, "permit_id", ev_permit.permit_id)
+        changes = {"permit_id": ev_permit.permit_id}
+    elif target is A.PERMIT_CONSUMED:
+        ev_consumed = _evidence(evidence, PermitConsumedEvidence)
+        _require(ev_consumed.permit_id == before.permit_id, "receipt is for another permit")
+        _unused(state, "receipt_id", ev_consumed.receipt_id)
+        changes = {"receipt_id": ev_consumed.receipt_id}
+    elif target in (A.DISPATCH_AUTHORIZED, A.DISPATCH_STARTED):
+        ev_dispatch = _evidence(evidence, DispatchEvidence)
+        _require(ev_dispatch.receipt_id == before.receipt_id, "report is for another receipt")
+    elif target in (A.COMPLETED, A.FAILED_DEFINITE) and before.state is A.OUTCOME_UNKNOWN:
+        ev_rec = _evidence(evidence, ReconciliationEvidence)
+        wanted = ReconciledOutcome.COMPLETED if target is A.COMPLETED else ReconciledOutcome.FAILED
+        _require(ev_rec.outcome is wanted, "reconciliation reached another outcome")
+    elif target in (A.COMPLETED, A.FAILED_DEFINITE, A.OUTCOME_UNKNOWN):
+        ev_outcome = _evidence(evidence, OutcomeEvidence)
+        _require(ev_outcome.receipt_id == before.receipt_id, "result is for another receipt")
+    elif target is _ABORT:
+        ev_abort = _evidence(evidence, AbortEvidence)
+        if before.state in _PEP_INVOLVED:
+            _require(
+                ev_abort.not_dispatched_ref is not None,
+                "after consumption, a live PEP must report that nothing was sent",
+            )
+    after = before.evolve(state=target, **changes)
+    return AttemptTransition(
+        entity="attempt",
+        action=EntityAction.SET_STATUS,
+        before=before,
+        after=after,
+        evidence=evidence,
+        late=late,
+    )
+
+
+# ---------------------------------------------------------------- applying
+
+
+def _install(state: RuntimeState, transition: Transition) -> RuntimeState:
+    if isinstance(transition, TaskTransition):
+        return state._with("tasks", transition.after.task_id, transition.after)
+    if isinstance(transition, RunTransition):
+        return state._with("runs", transition.after.run_id, transition.after)
+    if isinstance(transition, StepTransition):
+        step = transition.after
+        state = state._with("steps", step.step_id, step)
+        if transition.action is EntityAction.CREATE:
+            ordered = (*state.run_steps.get(step.run_id, ()), step.step_id)
+            state = state._with("run_steps", step.run_id, ordered)
+        return state
+    attempt = transition.after
+    state = state._with("attempts", attempt.attempt_id, attempt)
+    if transition.action is EntityAction.CREATE:
+        ordered_attempts = (*state.step_attempts.get(attempt.step_id, ()), attempt.attempt_id)
+        state = state._with("step_attempts", attempt.step_id, ordered_attempts)
+    return state
+
+
+def _replan(state: RuntimeState, transition: Transition) -> Transition:
+    if isinstance(transition, TaskTransition):
+        if transition.action is TaskAction.CREATE:
+            return plan_task_create(state, transition.after)
+        if transition.before is None:
+            raise TransitionPreconditionError("missing 'before' snapshot")
+        if transition.action is TaskAction.ATTACH_RUN:
+            added = transition.after.runs[len(transition.before.runs) :]
+            _require(len(added) == 1, "exactly one run is attached")
+            return plan_task_attach(state, transition.before, added[0])
+        return plan_task_status(state, transition.before, transition.after.status)
+    if isinstance(transition, RunTransition):
+        if transition.action is EntityAction.CREATE:
+            return plan_run_create(state, transition.after)
+        if transition.before is None:
+            raise TransitionPreconditionError("missing 'before' snapshot")
+        return plan_run_status(
+            state, transition.before, transition.after.status, transition.evidence
+        )
+    if isinstance(transition, StepTransition):
+        if transition.action is EntityAction.CREATE:
+            return plan_step_create(state, transition.after)
+        if transition.before is None:
+            raise TransitionPreconditionError("missing 'before' snapshot")
+        return plan_step_status(state, transition.before, transition.after.status)
+    if transition.action is EntityAction.CREATE:
+        return plan_attempt_create(state, transition.after)
+    if transition.before is None:
+        raise TransitionPreconditionError("missing 'before' snapshot")
+    return plan_attempt_status(
+        state, transition.before, transition.after.state, transition.evidence
+    )
+
+
+def apply_transition(state: RuntimeState, transition: Transition) -> RuntimeState:
+    """Re-plan ``transition`` against ``state``; it must match exactly."""
+    if _replan(state, transition) != transition:
+        raise TransitionPreconditionError("recorded transition does not follow the rules")
+    return _install(state, transition)
+
+
+def _run_of(state: RuntimeState, transition: Transition) -> RunId | None:
+    if isinstance(transition, TaskTransition):
+        if transition.action is TaskAction.ATTACH_RUN:
+            return transition.after.runs[-1]
+        return None
+    if isinstance(transition, (RunTransition, StepTransition)):
+        return transition.after.run_id
+    step = state.steps.get(transition.after.step_id)
+    return None if step is None else step.run_id
+
+
+def apply_payload(
+    state: RuntimeState, payload: RuntimePayload
+) -> tuple[RuntimeState, RunId | None]:
+    """Apply every transition of one event atomically. Returns the event's run.
+
+    A created step's ``run_seq`` is checked by ``plan_step_create`` against the
+    run's next position; ``apply_event`` checks that the event has that position.
+    """
+    runs: set[RunId] = set()
+    for transition in payload.transitions:
+        run_id = _run_of(state, transition)
+        if run_id is not None:
+            runs.add(run_id)
+        state = apply_transition(state, transition)
+    _require(len(runs) <= 1, "one event covers at most one run")
+    return state, next(iter(runs), None)
+
+
+def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
+    """Fold one stored journal event. Anything unknown or inconsistent is an error."""
+    try:
+        if event.type != RUNTIME_EVENT_TYPE:
+            raise StateRebuildError("unknown event type")
+        if event.schema_version != RUNTIME_EVENT_SCHEMA_VERSION or event.payload is None:
+            raise StateRebuildError("runtime events need schema_version 2 and a payload")
+        if event.run_id is not None:
+            expected = state.run_seqs.get(event.run_id, 0) + 1
+            if event.run_seq != expected:
+                raise StateRebuildError("run_seq is not the next position of the run")
+        new_state, run_id = apply_payload(state, event.payload)
+        if run_id != event.run_id:
+            raise StateRebuildError("event run_id does not match its transitions")
+    except StateTransitionError as exc:
+        raise StateRebuildError(f"invalid transition in event: {exc.code}") from exc
+    if event.run_id is not None and event.run_seq is not None:
+        new_state = new_state._with("run_seqs", event.run_id, event.run_seq)
+    return new_state
+
+
+def rebuild(events: Iterable[Event]) -> RuntimeState:
+    """Fold events in ``tenant_seq`` order into a state. Deterministic."""
+    state = RuntimeState.empty()
+    tenant = None
+    expected_seq = None
+    for event in events:
+        if tenant is None:
+            tenant = event.tenant_id
+        elif event.tenant_id != tenant:
+            raise StateRebuildError("events of several tenants")
+        if expected_seq is not None and event.tenant_seq != expected_seq:
+            raise StateRebuildError("events are not consecutive in tenant_seq")
+        expected_seq = event.tenant_seq + 1
+        state = apply_event(state, event)
+    return state

@@ -9,11 +9,11 @@ import pytest
 from pydantic import ValidationError
 
 from agent_core.types.errors import ImmutableFieldError
+from agent_core.types.events import Event
 from agent_core.types.ids import AttemptId, PermitId, ReceiptId, ReservationId, RunId, StepId
 from agent_core.types.records import (
     TERMINAL_RUN_STATUSES,
     AttemptState,
-    Event,
     RunStatus,
     StepStatus,
     TaskStatus,
@@ -218,9 +218,18 @@ def test_run_cannot_be_its_own_parent() -> None:
     "state", [AttemptState.CONTENT_FIXED, AttemptState.POLICY_ALLOWED, AttemptState.APPROVED]
 )
 def test_attempt_needs_action_hash_once_content_is_fixed(state: AttemptState) -> None:
+    approval = True if state is AttemptState.APPROVED else None
     with pytest.raises(ValidationError):
-        b.attempt(state=state, action_hash=None)
-    assert b.attempt(state=state, action_hash=b.digest("action")).state is state
+        b.attempt(state=state, action_hash=None, approval_required=approval)
+    fixed = b.attempt(state=state, action_hash=b.digest("action"), approval_required=approval)
+    assert fixed.state is state
+
+
+@pytest.mark.parametrize("state", [AttemptState.APPROVAL_PENDING, AttemptState.APPROVED])
+def test_approval_states_require_the_approval_path(state: AttemptState) -> None:
+    for flag in (None, False):
+        with pytest.raises(ValidationError):
+            b.attempt(state=state, action_hash=b.digest("a"), approval_required=flag)
 
 
 def test_attempt_needs_permit_from_permit_issued() -> None:
@@ -285,7 +294,7 @@ def test_event_hash_chain_start_is_explicit() -> None:
     assert b.event(tenant_seq=2, prev_hash=b.digest("x")).tenant_seq == 2
 
 
-@pytest.mark.parametrize("version", [0, 2, 99, "1", 1.0, True])
+@pytest.mark.parametrize("version", [0, 3, 99, "1", 1.0, True])
 def test_unknown_schema_version_is_rejected(version: object) -> None:
     with pytest.raises(ValidationError):
         b.event(schema_version=version)

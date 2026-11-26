@@ -5,6 +5,7 @@ from __future__ import annotations
 from itertools import count
 from typing import Any
 
+from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import (
     AttemptId,
     EntityId,
@@ -24,8 +25,6 @@ from agent_core.types.records import (
     Attempt,
     AttemptState,
     EngineRequest,
-    Event,
-    EventDraft,
     Run,
     RunStatus,
     Step,
@@ -123,6 +122,7 @@ def attempt(**overrides: Any) -> Attempt:
         "permit_id": None,
         "receipt_id": None,
         "reservation_id": None,
+        "approval_required": None,
     }
     values.update(overrides)
     return Attempt(**values)

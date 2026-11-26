@@ -15,8 +15,8 @@ from agent_core.ports.id_registry import IdRegistry
 from agent_core.ports.journal import JournalPort
 from agent_core.ports.randomness import RandomSource
 from agent_core.types.errors import DuplicateIdError
+from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import MAX_TIMESTAMP_MS, MIN_GENERATION_TIMESTAMP_MS, EventId, RunId
-from agent_core.types.records import Event, EventDraft
 from support import builders as b
 from support.fakes import (
     InMemoryIdRegistry,
