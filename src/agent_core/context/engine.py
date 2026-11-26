@@ -64,6 +64,7 @@ from agent_core.types.context import (
 )
 from agent_core.types.errors import (
     ContextBudgetExceededError,
+    ContextError,
     ContextInputError,
     ContextProfileError,
     ContextVerificationError,
@@ -443,7 +444,54 @@ def _input_items(inputs: ContextInputs) -> list[_Placed]:
         placed.append(_Placed(entry, block, item.seq, role))
     if latest != 1:
         raise ContextInputError("LATEST_INPUT_INVALID")
-    return placed
+    return _check_pairs(inputs.items, placed)
+
+
+def _check_pairs(items: tuple[ContextInput, ...], placed: list[_Placed]) -> list[_Placed]:
+    """WP14-R05: one call (the model's, in the history) and at most one later result
+    (the tool's, in the history) per pair. The current pair (the latest call) and a
+    call still waiting for its result are kept whatever the budget."""
+    groups: dict[str, list[ContextInput]] = {}
+    for item in items:
+        if item.pair_id is not None:
+            groups.setdefault(item.pair_id, []).append(item)
+    protect: set[str] = set()
+    latest_call: tuple[int, str] | None = None
+    for pair_id, members in groups.items():
+        calls = [m for m in members if m.pair_role == "CALL"]
+        results = [m for m in members if m.pair_role == "RESULT"]
+        if len(calls) != 1 or len(results) > 1:
+            raise ContextInputError("PAIR_INVALID")
+        call = calls[0]
+        if (
+            call.kind is not InputKind.HISTORY
+            or call.provenance.channel is not Channel.MODEL_OUTPUT
+        ):
+            raise ContextInputError("PAIR_INVALID")
+        for result in results:
+            if (
+                result.kind is not InputKind.HISTORY
+                or result.provenance.channel is not Channel.TOOL_OUTPUT
+                or result.seq <= call.seq
+            ):
+                raise ContextInputError("PAIR_INVALID")
+        if not results:
+            protect.add(pair_id)  # a call waiting for its result
+        if latest_call is None or (call.seq, pair_id) > latest_call:
+            latest_call = (call.seq, pair_id)
+    if latest_call is not None:
+        protect.add(latest_call[1])
+    kept: list[_Placed] = []
+    for p in placed:
+        if p.entry.pair_id in protect and p.entry.priority is not Priority.MUST:
+            p = _Placed(
+                p.entry.model_copy(update={"priority": Priority.MUST}),
+                p.block,
+                p.seq,
+                p.history_role,
+            )
+        kept.append(p)
+    return kept
 
 
 def _layout(placed: Iterable[_Placed]) -> list[_Placed]:
@@ -710,18 +758,50 @@ def _finish(
         key_version=None,
     )
     result = ContextBuildResult(ir, manifest, request, ir_blob, rendered_blob, record_blob)
-    verify_build(result)  # nothing unverified leaves the engine
+    reasons = _structure_reasons(result, profile, params)
+    if reasons:  # nothing unverified leaves the engine
+        raise ContextVerificationError(*reasons)
     return result
 
 
 # ---------------------------------------------------------------- verification
 
 
-def verify_build(result: ContextBuildResult) -> None:
-    """Recompute each hash from its own bytes and check that the IR, the rendered
-    input, the request record, the request and the manifest agree, and that the
-    rendered request passes the token check (B1 4.4, 6.2, C6, C10). Hash strings
-    copied from elsewhere prove nothing."""
+def _expected_check(
+    messages: tuple[Message, ...],
+    tools: tuple[ToolSpec, ...],
+    profile: ContextProfile,
+    params: GenerationParams,
+) -> TokenCheck:
+    """The token check recomputed from the trusted profile and parameters alone."""
+    reserve = _check_profile(profile, params)
+    window = profile.model.context_window
+    limit = max(0, window - reserve)
+    counted = _rendered_tokens(messages, tools, profile)
+    margin = _margin(counted, profile)
+    return TokenCheck(
+        method=TokenizerMethod.ESTIMATE,
+        exact=False,
+        estimator=profile.estimator,
+        context_window=window,
+        reserved_output=reserve,
+        limit=limit,
+        per_message_overhead=profile.per_message_overhead,
+        tool_def_overhead=profile.tool_def_overhead,
+        input_tokens=counted,
+        margin=margin,
+        margin_percent=profile.safety_margin_percent,
+        passed=counted + margin <= limit,
+    )
+
+
+def _structure_reasons(
+    result: ContextBuildResult, profile: ContextProfile, params: GenerationParams
+) -> list[str]:
+    """Each hash from its own bytes; the IR, the rendered input, the request record,
+    the request and the manifest agree with one another; every IR entry is one
+    rendered text block, in order; the token check is recomputed from the trusted
+    profile and parameters (B1 4.4, 6.2, C6, C10; WP14-R03, R04)."""
     reasons: list[str] = []
 
     def fail(reason: str) -> None:
@@ -735,15 +815,28 @@ def verify_build(result: ContextBuildResult) -> None:
         fail("RENDERING_HASH_MISMATCH")
     if request_hash(result.request_record_blob) != request.request_hash:
         fail("REQUEST_HASH_MISMATCH")
+    ir = result.ir
     try:
         parse_strict_json(result.ir_blob)
-        ir = ContextIR.model_validate_json(result.ir_blob)
-        if dump_json(ir) != result.ir_blob or ir != result.ir:
+        parsed = ContextIR.model_validate_json(result.ir_blob)
+        if dump_json(parsed) != result.ir_blob or parsed != ir:
             fail("IR_INVALID")
-        if (ir.profile, ir.params, ir.tools) != (request.profile, request.params, request.tools):
-            fail("IR_REQUEST_MISMATCH")
     except (StrictJsonError, ValidationError):
         fail("IR_INVALID")
+    if (ir.profile, ir.params, ir.tools) != (request.profile, request.params, request.tools):
+        fail("IR_REQUEST_MISMATCH")
+    try:
+        reserve = _check_profile(profile, params)
+    except ContextProfileError:
+        fail("TOKEN_CHECK_FAILED")
+        reserve = -1
+    if (ir.profile, ir.params, ir.estimator, ir.reserved_output) != (
+        profile.model.ref,
+        params,
+        profile.estimator,
+        reserve,
+    ):
+        fail("IR_REQUEST_MISMATCH")
     try:
         parse_strict_json(result.rendered_blob)
         rendered = ReplayRenderedInput.model_validate_json(result.rendered_blob)
@@ -767,33 +860,79 @@ def verify_build(result: ContextBuildResult) -> None:
             fail("REQUEST_RECORD_MISMATCH")
     except (StrictJsonError, ValidationError):
         fail("REQUEST_RECORD_MISMATCH")
-    if (manifest.context_hash, manifest.rendering_hash, manifest.request_hash) != (
-        request.context_hash,
-        request.rendering_hash,
-        request.request_hash,
+    # The manifest describes exactly this IR.
+    included = tuple(
+        ManifestEntry(
+            item_id=e.item_id,
+            content_hash=e.content_hash,
+            tokens=e.tokens.value,
+            position=i,
+            section=e.section,
+            tier=e.tier,
+            provenance_class=e.provenance_class,
+        )
+        for i, e in enumerate(ir.entries)
+    )
+    coverage = tuple(sorted(e.protected_fact for e in ir.entries if e.protected_fact is not None))
+    excluded_ids = [e.item_id for e in manifest.excluded]
+    if (
+        manifest.included != included
+        or manifest.protected_coverage != coverage
+        or len(set(excluded_ids)) != len(excluded_ids)
+        or set(excluded_ids) & {e.item_id for e in ir.entries}
+        or (manifest.engine_version, manifest.policy_version, manifest.profile)
+        != (ir.engine_version, ir.policy_version, ir.profile)
+        or (manifest.context_hash, manifest.rendering_hash, manifest.request_hash)
+        != (request.context_hash, request.rendering_hash, request.request_hash)
     ):
         fail("MANIFEST_MISMATCH")
-    check = manifest.token_check
-    blocks = sum(
-        estimate_text(block.text)
-        for message in request.messages
-        for block in message.content
-        if isinstance(block, TextBlock)
-    )
-    tools = sum(
-        check.tool_def_overhead + estimate_text(f"{t.name} {t.input_schema_ref}")
-        for t in request.tools
-    )
-    counted = blocks + check.per_message_overhead * len(request.messages) + tools
-    percent_margin = -(-counted * check.margin_percent // 100)
-    if (
-        counted != check.input_tokens
-        or check.margin < percent_margin
-        or counted + check.margin > check.limit
-        or check.limit != max(0, check.context_window - check.reserved_output)
-        or check.reserved_output not in (0, request.params.max_output_tokens)
-        or not check.passed
+    # Every IR entry is exactly one rendered text block, in the same order.
+    blocks: list[str] = []
+    for message in request.messages:
+        for block in message.content:
+            if isinstance(block, TextBlock):
+                blocks.append(block.text)
+            else:
+                fail("UNSUPPORTED_BLOCK")  # never counted silently
+    if len(blocks) != len(ir.entries) or any(
+        estimate_text(text) != entry.tokens.value
+        for text, entry in zip(blocks, ir.entries, strict=False)
     ):
-        fail("TOKEN_CHECK_FAILED")
+        fail("IR_RENDER_MISMATCH")
+    if "TOKEN_CHECK_FAILED" not in reasons:
+        expected = _expected_check(request.messages, request.tools, profile, params)
+        if manifest.token_check != expected or not expected.passed:
+            fail("TOKEN_CHECK_FAILED")
+    return reasons
+
+
+def verify_build(
+    result: ContextBuildResult,
+    *,
+    inputs: ContextInputs,
+    profile: ContextProfile,
+    params: GenerationParams,
+) -> None:
+    """WP14-R03: a result is accepted only when it is exactly what the engine builds
+    from the trusted inputs, profile and parameters (rebuilt and compared), and
+    when its own structure checks (``_structure_reasons``). Self-consistent hashes
+    over other data, or a manifest's own numbers, prove nothing."""
+    reasons = _structure_reasons(result, profile, params)
+    known = {i.item_id for i in inputs.items}
+    if not {e.item_id for e in result.manifest.excluded} <= known:
+        reasons.append("MANIFEST_MISMATCH")
+    try:
+        rebuilt = build_context(
+            inputs=inputs,
+            profile=profile,
+            params=params,
+            attempt_id=result.request.attempt_id,
+            model_request_id=result.request.model_request_id,
+        )
+    except ContextError:
+        reasons.append("REBUILD_FAILED")
+    else:
+        if tuple(rebuilt) != tuple(result):
+            reasons.append("REBUILD_MISMATCH")
     if reasons:
-        raise ContextVerificationError(*reasons)
+        raise ContextVerificationError(*dict.fromkeys(reasons))

@@ -9,10 +9,10 @@ trusted synthetic texts whose digests the Journal records:
   OUTCOME_UNKNOWN, and ``APPROVAL_STATE`` from attempts waiting for approval
   (authority: the runtime, which observed them).
 
-Every derived fact is OPEN and required in every context. Changes follow B1 3.4:
-a model can never change a fact; the runtime may resolve an open error with
-evidence (a new version; the old one stays as it was). Updating, expiring and
-superseding need an owner path that does not exist yet, so they are refused.
+Every derived fact is OPEN and required in every context. Changes (B1 3.4):
+a model can never change a fact. Resolution is disabled (WP14-R02): an evidence
+reference alone is not proof, and checking it against the Journal is not built
+yet. Updating, expiring and superseding need an owner path that does not exist.
 """
 
 from __future__ import annotations
@@ -114,25 +114,13 @@ def facts_from_journal(
 
 
 def apply_fact_change(fact: ProtectedFact, change: FactChange) -> ProtectedFact:
-    """The next version of ``fact`` after ``change``, or a refusal (B1 3.4)."""
+    """WP14-R02: no change is accepted yet. A model can never change a fact
+    (``FACT_CHANGE_BY_MODEL``). Resolving an open error needs a check that the
+    Journal holds a runtime observation of a successful verification for the same
+    Task, Run and error; until that check exists, every change is refused
+    (``FACT_CHANGE_UNSUPPORTED``) and the fact stays OPEN. Facts are always
+    derived again from the Journal, so every version can be rebuilt."""
+    del fact
     if change.actor == "MODEL":
         raise ProtectedFactError("FACT_CHANGE_BY_MODEL")
-    if not (
-        change.kind == "RESOLVE"
-        and change.actor == "RUNTIME"
-        and fact.category is FactCategory.OPEN_ERROR
-    ):
-        raise ProtectedFactError("FACT_CHANGE_UNSUPPORTED")
-    if fact.status is not FactStatus.OPEN:
-        raise ProtectedFactError("FACT_NOT_OPEN")
-    if change.evidence_ref is None:
-        raise ProtectedFactError("FACT_EVIDENCE_REQUIRED")
-    return ProtectedFact.model_validate(
-        {
-            **fact.model_dump(),
-            "version": fact.version + 1,
-            "previous_version": fact.version,
-            "status": FactStatus.RESOLVED,
-            "resolution_evidence": change.evidence_ref,
-        }
-    )
+    raise ProtectedFactError("FACT_CHANGE_UNSUPPORTED")

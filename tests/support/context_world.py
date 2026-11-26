@@ -102,6 +102,7 @@ def item(
     source_ref: str | None = None,
     derived_from: tuple[str, ...] = (),
     pair_id: str | None = None,
+    pair_role: Any = None,
 ) -> ContextInput:
     return ContextInput(
         item_id=item_id,
@@ -116,6 +117,7 @@ def item(
         priority=priority,
         seq=seq,
         pair_id=pair_id,
+        pair_role=pair_role,
     )
 
 
@@ -228,4 +230,16 @@ def build(ctx: ContextInputs | None = None, prof: ContextProfile | None = None, 
         params=kw.pop("params", PARAMS),
         attempt_id=kw.pop("attempt_id", ATTEMPT_ID),
         model_request_id=kw.pop("model_request_id", REQUEST_ID),
+    )
+
+
+def verify(result: Any, ctx: Any = None, prof: Any = None, params: Any = None) -> None:
+    """verify_build against the trusted inputs, profile and parameters of a build."""
+    from agent_core.context.engine import verify_build
+
+    verify_build(
+        result,
+        inputs=ctx if ctx is not None else inputs(),
+        profile=prof if prof is not None else profile(),
+        params=params if params is not None else PARAMS,
     )

@@ -2427,6 +2427,10 @@ def read_policy(cur: sqlite3.Cursor, tenant_id: str) -> Policy | None:
     return _policy(cur, tenant_id)
 
 
+def read_grant(cur: sqlite3.Cursor, run_id: str) -> RunGrant | None:
+    return _grant(cur, run_id)
+
+
 def read_approval_uses(cur: sqlite3.Cursor, approval_id: str) -> int | None:
     found = _approval_row(cur, approval_id)
     return None if found is None else found[1]

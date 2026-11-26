@@ -18,7 +18,7 @@ from pydantic import ValidationError
 
 from agent_core.adapters.replay_model import ReplayModelProvider
 from agent_core.context import engine
-from agent_core.context.engine import SYSTEM_RULES, verify_build
+from agent_core.context.engine import SYSTEM_RULES
 from agent_core.context.estimator import estimate_text
 from agent_core.context.facts import apply_fact_change, facts_from_journal
 from agent_core.runtime.execution_gate import SyntheticResult
@@ -117,7 +117,7 @@ def test_a_context_is_built_in_the_fixed_order() -> None:
     # Tool definitions in name order, whatever the input order.
     assert [t.name for t in result.request.tools] == ["read_file", "write_file"]
     assert result.manifest.context_hash == result.request.context_hash
-    verify_build(result)
+    cw.verify(result)
 
 
 def test_the_same_inputs_give_the_same_context() -> None:
@@ -408,21 +408,16 @@ def _open_error() -> Any:
     )
 
 
-def test_resolving_an_error_needs_runtime_evidence_and_keeps_the_old_version() -> None:
+def test_resolving_an_error_is_refused_and_the_fact_stays_open() -> None:
+    """WP14-R02: an evidence reference alone does not resolve an error; until the
+    resolution can be checked against the Journal, every resolution is refused."""
     fact = _open_error()
-    with pytest.raises(ProtectedFactError) as excinfo:
-        apply_fact_change(fact, FactChange(kind="RESOLVE", actor="RUNTIME", evidence_ref=None))
-    assert excinfo.value.reasons == ("FACT_EVIDENCE_REQUIRED",)
-    resolved = apply_fact_change(
-        fact, FactChange(kind="RESOLVE", actor="RUNTIME", evidence_ref="journal:42")
-    )
-    assert (resolved.status, resolved.version, resolved.previous_version) == (
-        FactStatus.RESOLVED,
-        2,
-        1,
-    )
-    assert resolved.resolution_evidence == "journal:42"
-    assert fact.status is FactStatus.OPEN  # the old version is unchanged
+    for evidence in (None, "journal:42"):
+        change = FactChange(kind="RESOLVE", actor="RUNTIME", evidence_ref=evidence)
+        with pytest.raises(ProtectedFactError) as excinfo:
+            apply_fact_change(fact, change)
+        assert excinfo.value.reasons == ("FACT_CHANGE_UNSUPPORTED",)
+    assert fact.status is FactStatus.OPEN
 
 
 @pytest.mark.parametrize(
@@ -554,7 +549,7 @@ def test_optional_items_are_excluded_in_a_fixed_order() -> None:
     assert all(e.reason == "BUDGET" for e in first.manifest.excluded)
     kept = {e.item_id for e in first.ir.entries}
     assert {"latest", "task.note", "rule.style"} <= kept  # instructions and the latest input
-    verify_build(first)
+    cw.verify(first, prof=tight)
 
 
 def test_tool_call_pairs_stay_together() -> None:
@@ -566,6 +561,7 @@ def test_tool_call_pairs_stay_together() -> None:
         kind=InputKind.HISTORY,
         seq=8,
         pair_id="pair1",
+        pair_role="CALL",
         priority=Priority.MAY,
     )
     answer = cw.item(
@@ -576,9 +572,21 @@ def test_tool_call_pairs_stay_together() -> None:
         kind=InputKind.HISTORY,
         seq=9,
         pair_id="pair1",
+        pair_role="RESULT",
         priority=Priority.SHOULD,
     )
-    ctx = cw.inputs(call, answer, cw.latest())
+    # A later (current) pair: the current pair is protected (WP14-R05), pair1 is not.
+    current = cw.item(
+        "call.2",
+        "tool_use B",
+        C.MODEL_OUTPUT,
+        P.MODEL_PLAN,
+        kind=InputKind.HISTORY,
+        seq=10,
+        pair_id="pair2",
+        pair_role="CALL",
+    )
+    ctx = cw.inputs(call, answer, current, cw.latest())
     full = cw.build(ctx).manifest.token_check
     tight = cw.profile(
         context_window=full.input_tokens + full.margin + full.reserved_output - 1, max_output=200
@@ -708,7 +716,7 @@ def _tampered(result: Any, what: str) -> Any:
 )
 def test_a_changed_or_copied_part_is_detected(what: str, reason: str) -> None:
     with pytest.raises(ContextVerificationError) as excinfo:
-        verify_build(_tampered(cw.build(), what))
+        cw.verify(_tampered(cw.build(), what))
     assert reason in excinfo.value.reasons
 
 

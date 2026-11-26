@@ -163,6 +163,14 @@ class ContextInput(FrozenModel):
     priority: Priority
     seq: Annotated[int, Field(strict=True, ge=0, le=2**62)]
     pair_id: PairId | None
+    # WP14-R05: the item's part of a tool-call pair (the model's call, the tool's result).
+    pair_role: Literal["CALL", "RESULT"] | None
+
+    @model_validator(mode="after")
+    def _pair(self) -> Self:
+        if (self.pair_id is None) != (self.pair_role is None):
+            raise ValueError("a pair id and a pair role go together")
+        return self
 
 
 class ApprovedRule(FrozenModel):

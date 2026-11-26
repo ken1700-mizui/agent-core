@@ -94,6 +94,7 @@ from agent_core.types.safety import (
     Policy,
     Receipt,
     ReceiptState,
+    RunGrant,
     StopEntry,
 )
 from agent_core.types.serialization import dump_json, load_json
@@ -432,6 +433,11 @@ class SqliteJournal:
         """The tenant's installed policy (owner-trusted), or None."""
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.read_policy(cur, str(tenant_id))
+
+    def run_grant(self, run_id: str) -> RunGrant | None:
+        """The Run's installed grant (owner-trusted), or None."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_grant(cur, str(run_id))
 
     def recorded_descriptor(self, attempt_id: str) -> ActionDescriptor | None:
         """The descriptor the ledger recorded for an attempt (its trusted content)."""
