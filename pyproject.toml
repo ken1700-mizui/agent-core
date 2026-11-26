@@ -103,6 +103,17 @@ forbidden_modules = [
     # Provider SDKs are not approved in Phase 1
     "anthropic",
     "openai",
-    # No arbitrary command execution in Phase 1 (ROADMAP 0.1)
+    "socketserver",
+    # Low-level and asynchronous network and process APIs. asyncio is not needed in
+    # Phase 1; allowing it later requires an ADR.
+    "_socket",
+    "asyncio",
+    # No arbitrary command execution in Phase 1 (ROADMAP 0.1). Calls through os
+    # (os.system, os.exec*, os.spawn*, os.fork ...) are checked by
+    # tests/unit/test_no_process_execution.py, which import-linter cannot see.
     "subprocess",
+    "_posixsubprocess",
+    "multiprocessing",
+    "pty",
+    "ctypes",
 ]

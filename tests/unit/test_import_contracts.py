@@ -14,6 +14,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 LINT_IMPORTS = str(Path(sys.executable).parent / "lint-imports")
 
@@ -22,7 +24,7 @@ def _lint_imports(config: Path, python_path: Path, cwd: Path) -> subprocess.Comp
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
     env["PYTHONPATH"] = str(python_path)
     return subprocess.run(
-        [LINT_IMPORTS, "--config", str(config), "--no-cache"],
+        [LINT_IMPORTS, str(config), "--no-cache"],
         cwd=cwd,
         env=env,
         capture_output=True,
@@ -48,12 +50,27 @@ def test_real_code_satisfies_real_contracts(tmp_path: Path) -> None:
     assert "0 broken" in result.stdout
 
 
-def test_direct_network_import_breaks_real_contract(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("statement", "target"),
+    [
+        ("import socket", "socket"),
+        ("import _socket", "_socket"),
+        ("import http.client", "http"),
+        ("from urllib import request", "urllib"),
+        ("import asyncio", "asyncio"),
+        ("import multiprocessing", "multiprocessing"),
+        ("import ctypes", "ctypes"),
+        ("import anthropic", "anthropic"),
+    ],
+)
+def test_direct_forbidden_import_breaks_real_contract(
+    tmp_path: Path, statement: str, target: str
+) -> None:
     src = _copy_real_package(tmp_path)
-    (src / "agent_core" / "leak.py").write_text('"""Planted."""\n\nimport socket\n')
+    (src / "agent_core" / "leak.py").write_text(f'"""Planted."""\n\n{statement}\n')
     result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
     assert result.returncode == 1
-    assert "agent_core.leak -> socket" in result.stdout
+    assert f"agent_core.leak -> {target}" in result.stdout
 
 
 def test_indirect_process_spawning_import_breaks_real_contract(tmp_path: Path) -> None:
