@@ -341,6 +341,11 @@ class AgentLoop:
 
     # ------------------------------------------------------------ entry
 
+    def continues(self, run_id: RunId) -> bool:
+        """Whether this loop holds the Run's transcript and can go on with it (a
+        caller asks this before recording an approval the loop could not use)."""
+        return run_id in self._sessions and run_id not in self._broken
+
     def run(self, run_id: RunId, *, approval_id: ApprovalId | None = None) -> LoopOutcome:
         if run_id in self._busy:
             return self._outcome(None, run_id, "RUN_BUSY")  # reentrant: nothing is touched

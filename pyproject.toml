@@ -84,7 +84,8 @@ warn_required_dynamic_aliases = true
 # WP-01 sets only contracts that apply to modules that exist now. Layer contracts
 # for each Engine are added by the work package that creates the modules.
 [tool.importlinter]
-root_package = "agent_core"
+# WP-10: the CLI (agent_core_cli) is the composition root, outside agent_core.
+root_packages = ["agent_core", "agent_core_cli"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -133,10 +134,17 @@ source_modules = ["agent_core.**"]
 forbidden_modules = ["agent_core.adapters.file_broker"]
 
 [[tool.importlinter.contracts]]
-id = "phase1-no-network-or-process"
-name = "Phase 1: agent_core has no network, provider SDK or process-spawning code path"
+id = "core-independent-of-cli"
+name = "WP-10: no agent_core module imports the CLI (the CLI composes the core, never the reverse)"
 type = "forbidden"
-source_modules = ["agent_core"]
+source_modules = ["agent_core.**"]
+forbidden_modules = ["agent_core_cli"]
+
+[[tool.importlinter.contracts]]
+id = "phase1-no-network-or-process"
+name = "Phase 1: agent_core and its CLI have no network, provider SDK or process-spawning code path"
+type = "forbidden"
+source_modules = ["agent_core", "agent_core_cli"]
 forbidden_modules = [
     # Network (PHASE_1_IMPLEMENTATION_PLAN.md section 2, item 5)
     "socket",

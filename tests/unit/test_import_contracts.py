@@ -35,12 +35,14 @@ def _lint_imports(config: Path, python_path: Path, cwd: Path) -> subprocess.Comp
 
 
 def _copy_real_package(tmp_path: Path) -> Path:
+    """A copy of every root package the real contracts name (WP-10 adds the CLI)."""
     src = tmp_path / "src"
-    shutil.copytree(
-        REPO_ROOT / "src" / "agent_core",
-        src / "agent_core",
-        ignore=shutil.ignore_patterns("__pycache__"),
-    )
+    for package in ("agent_core", "agent_core_cli"):
+        shutil.copytree(
+            REPO_ROOT / "src" / package,
+            src / package,
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
     return src
 
 
@@ -342,3 +344,27 @@ def test_the_context_engine_depends_on_types_and_ports_only(
     result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
     assert result.returncode == 1
     assert f"agent_core.context.planted -> {target}" in result.stdout
+
+
+# ---------------------------------------------------------------- WP-10 the CLI
+
+
+def test_the_core_never_imports_the_cli(tmp_path: Path) -> None:
+    src = _copy_real_package(tmp_path)
+    _plant(src, "agent_core.runtime.planted", "import agent_core_cli")
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert "agent_core.runtime.planted -> agent_core_cli" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("statement", "target"), [("import socket", "socket"), ("import subprocess", "subprocess")]
+)
+def test_the_cli_has_no_network_or_process_path(
+    tmp_path: Path, statement: str, target: str
+) -> None:
+    src = _copy_real_package(tmp_path)
+    _plant(src, "agent_core_cli.planted", statement)
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert f"agent_core_cli.planted -> {target}" in result.stdout

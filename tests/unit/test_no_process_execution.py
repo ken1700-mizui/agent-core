@@ -20,6 +20,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = REPO_ROOT / "src" / "agent_core"
+CLI_DIR = REPO_ROOT / "src" / "agent_core_cli"
 
 OS_MODULES = frozenset({"os", "posix", "nt"})
 FORBIDDEN_OS_ATTRIBUTES = frozenset(
@@ -90,7 +91,8 @@ def find_violations(source: str, filename: str = "<synthetic>") -> list[str]:
 
 
 def test_agent_core_has_no_process_execution_or_dynamic_code() -> None:
-    files = sorted(PACKAGE_DIR.rglob("*.py"))
+    # WP-10: the CLI (the composition root, outside agent_core) is checked too.
+    files = sorted(PACKAGE_DIR.rglob("*.py")) + sorted(CLI_DIR.rglob("*.py"))
     assert files, "the check must inspect at least one file"
     report = {
         str(path.relative_to(REPO_ROOT)): found
