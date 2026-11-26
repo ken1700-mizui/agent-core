@@ -71,6 +71,7 @@ def test_a_simple_task_runs_to_completion_through_the_safe_paths(tmp_path: Path)
         StepKind.TOOL_CALL,
         StepKind.MODEL_CALL,
         StepKind.VERIFICATION,
+        StepKind.VERIFICATION,  # the confirmation read (WP15-R03)
     ]
     attempts = _attempts(wd)[1:]
     assert all(a.state is A.COMPLETED for a in attempts)

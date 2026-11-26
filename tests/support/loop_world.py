@@ -142,6 +142,7 @@ class World:
     model: ScriptedModel
     loop: AgentLoop
     config: LoopConfig
+    mono: lw.ManualClock  # the loop's monotonic clock (WP15-R04)
 
 
 def criteria(*specs: FileCriterion) -> CriteriaCatalog:
@@ -200,6 +201,7 @@ def world(
         user_input=REQUEST,
     )
     broker = fw.broker(st.keys.owner, tree)
+    mono = lw.ManualClock(0)
     deps = LoopDeps(
         sm=st.sm,
         ledger=st.journal if wrap_ledger is None else wrap_ledger(st.journal),
@@ -209,9 +211,10 @@ def world(
         tools=(s.READ_TOOL, s.WRITE_TOOL),
         files=broker if wrap_files is None else wrap_files(broker),
         clock=st.clock,
+        monotonic=mono.now_ms,
         new_id=b.new_id,
     )
-    return World(st, tree, run, task, model, AgentLoop(deps, config), config)
+    return World(st, tree, run, task, model, AgentLoop(deps, config), config, mono)
 
 
 def approve_pending(wd: World, outcome: Any) -> Any:

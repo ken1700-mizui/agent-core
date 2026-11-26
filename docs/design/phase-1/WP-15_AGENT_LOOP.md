@@ -1,6 +1,6 @@
 # WP-15 エージェントのループ（単一の Runtime、単一のエージェント、単純な Task）
 
-> 文書の状態：**DRAFT**（ChatGPT のレビュー待ち）　最終更新：2026-11-26
+> 文書の状態：**DRAFT**（91/100 の条件付き合格の後、限定修正 WP15-R01〜R05 を15章に記録した）　最終更新：2026-11-26
 >
 > - 起点：`47c4643`（WP-14）。作業の前に、リモートとの一致、作業ツリーが空であること、`main`、設計のブランチ、1789 件の試験と8種類の検査の成功を確かめた。
 > - 段階1：`9f1c41f`（WP-14 の限定修正 R01〜R05。試験 1824 件）。記録は `WP-14_CONTEXT.md` の15章。
@@ -227,3 +227,69 @@ spent: 180 + 140 + 180 + 140 = 640 (model only; the file tools cost 0)
 - AUDIT-02〜04、A-P6、CI（GitHub Actions は未実行）、OS の隔離、実データのための鍵付きのハッシュ（変わらず残っている）。
 - 13章の「保証しない・未検証」の各項目。
 - 修復の上限 3 は暫定の試験の値。運用の値はオーナーの決定を待つ。
+
+## 15. 限定修正 WP15-R01〜R05（91/100 の条件付き合格の後）
+
+起点：`7ec1e7b`。回帰の試験 `tests/unit/test_wp15_fixes.py`（30件）を先に書き、赤を確かめた（最初は全件。`LoopDeps.monotonic` だけを足した後も、29件が振る舞いの理由で失敗した。その中には、再入の呼び出しで Run が `RECONCILIATION_REQUIRED` に変わる不具合と、開始済みの Attempt で状態機械が例外を出す不具合があった）。
+
+### 15.1 R01 再起動と実行の上限
+
+- `AgentLoop` は、自分が始めた Run だけを続ける。Attempt がすでにある Run（ループの Step には必ず Attempt がある）に、このプロセスの会話の記録がなければ、何も変えずに `SESSION_UNAVAILABLE` を返す。回数、修復の回数、経過時間は初期化されない（新しい Run として扱わない）。
+- 同じ Run への再入と同時の呼び出しは `RUN_BUSY` で拒否し、何も変えない。
+- 結果不明の Attempt があれば `RECONCILIATION_REQUIRED`（RUNNING、CANCELLING から）。開始済みで結果不明として記録されていない Attempt（プロセスの終了など）は、状態機械が再照合の遷移を認めないので、何も変えずに `UNRESOLVED_ATTEMPT` を返す（WP-12 へ）。
+- このループが記録を終えられなかった失敗の後は、その Run を二度と触らない（`LOOP_BROKEN`）。
+- `LoopOutcome` は、このプロセスの数（`model_calls`、`tool_calls`、`verification_reads`、`repairs`）と、台帳に永続化された数（`ledger_model_calls`、`ledger_tool_calls`）を分けて返す。
+- 会話の記録の永続化と、別のプロセスからの再開は WP-12 に残す。
+
+### 15.2 R02 承認待ちの間の停止
+
+- 停止（RUN、TENANT、GLOBAL）の確認を、承認 ID の有無より先に行う。停止は承認より優先する。
+- 対象は `RUNNING`、`WAITING_APPROVAL`（承認待ち、Context の予算の不足の両方）、`PAUSED_BUDGET`、`CANCELLING`。
+- 停止のとき、まだ始まっていない Attempt を、Permit の消費の前なら `AttemptPipeline.abort`、消費の後なら Gate の未実行の報告で中止し、開いている Step を `CANCELLED` にする。セッションのない新しいループのインスタンスでも停止できる。
+- 結果不明があれば `RECONCILIATION_REQUIRED`（正常な `CANCELLED` にしない）。費用が確定していなければ `CANCELLING` のまま（理由 `UNSETTLED_COSTS`）。どちらも WP-12 に引き継げる状態を保つ。
+
+### 15.3 R03 検証と完了の判定
+
+- まず、すべての基準のファイルを、正式な認可の経路とブローカーで読む（安全な読み取りの経路。直接は読まない）。
+- すべてが成り立ったときだけ、すべてのファイルをもう一度読み（確認の読み取り）、1回目と一致しなければ完了を拒否する（`FAILED`、`ARTIFACT_CHANGED`）。複数のファイルを読む間に、ほかのファイルが変わった場合も、これで見つかる。
+- ApplyPlan との対応：基準のファイルに確定した書き込みがあるなら、その内容の digest が読んだ digest と同じでなければならない（違えば `APPLY_PLAN_MISMATCH`）。
+- 判定の直前に、停止、未確定の費用、経過時間、Run の許可とポリシー（なければ `ABORTED_SAFETY`、`GRANT_MISSING`）、アクセスの epoch（変わっていれば `ACCESS_CHANGED`）を確かめ直す。
+- `VerificationEvidence` の `artifact_hash` は、各基準の「パス=読んだ digest」の列のハッシュで、`expected_artifact_hash`（「パス=期待の digest」）と一致したときだけ合格になる（型の検査）。
+- 協調する書き込み元との排他：ループは同期で動き、Runtime の OS のロックで単一の書き込み元である。ブローカーは各操作の間、作業領域の `flock` を持つ。
+- **限界（ADR-0008 を維持）：** 最後の読み取りと `COMPLETED` の記録の間に、協調しない書き込み元がファイルを変えることは防げない。ブローカーのロックは1回の操作の間だけで、検証の全体にまたがらない。
+
+### 15.4 R04 各上限の強制
+
+- モデルの呼び出し、ツールの呼び出し、検証の読み取りの前に、毎回、停止、未確定の費用、経過時間、その操作の回数を確かめる（`_guard`）。承認待ちから再開するときも、承認された行為を実行する前に確かめ、超えていれば待っている Attempt を中止してから `FAILED`（`LIMIT_EXCEEDED`）にする。
+- 経過時間は単調時計（`LoopDeps.monotonic`）で測り、見た最大の値を保つ。壁時計の逆行や、単調時計の値の後退では、時間は延びない。
+- 検証の読み取りも、台帳ではツールの呼び出しとして数える（台帳の `TOOL_CALLS` の上限が、検証の読み取りも止める。そのときは `PAUSED_BUDGET`）。ループの `max_tool_calls` は、モデルが求めたツールの呼び出しだけに使う。
+- 費用が確定していない Attempt があれば、次の操作をせずに `PAUSED_BUDGET`（`UNSETTLED_COSTS`）で止まる。
+- ループの上限と台帳の上限の両方を保つ。
+
+### 15.5 R05 例外が起きたときの状態
+
+| 障害 | 扱い |
+|---|---|
+| Context の組み立てや検証の誤り | 送らない。Attempt を中止し、Step を終わらせ、`ABORTED_SAFETY`（`CONTEXT_INVALID`） |
+| モデルの応答の不正 | 結果不明（Gate が保留を残す）、`RECONCILIATION_REQUIRED` |
+| 承認の拒否 | その行為を実行せず、拒否を TOOL_RESULT として返す |
+| Permit の拒否 | 消費の前なら中止と解放、`ABORTED_SAFETY`（`PERMIT_REFUSED`）。停止によるものなら `CANCELLED` |
+| Receipt の拒否（消費の後、開始の前） | Gate の未実行の報告で中止と解放、`ABORTED_SAFETY`（`NOT_DISPATCHED`）。停止によるものなら `CANCELLED` |
+| ブローカーの想定外の障害（開始の前） | 同上。`LoopOutcome.error` に例外のクラス名だけを入れる |
+| ブローカーの障害（開始の後） | 結果不明、`RECONCILIATION_REQUIRED` |
+| 台帳や Journal の書き込みの失敗 | 元の例外をそのまま出し、その Run を二度と触らない（`LOOP_BROKEN`） |
+| 後処理の失敗 | 元の例外に、後処理の例外のクラス名を note として付けて、元の例外を出す |
+| 割り込み（Ctrl+C など） | 安全な記録をした後、割り込みをそのまま渡す |
+
+未実行が確実な操作（Permit の消費の前、または Gate の未実行の報告ができる消費の後・開始の前）と、結果不明の操作（開始の後）を区別する。完全な Recovery Engine は実装していない。
+
+### 15.6 既存の試験の変更
+
+- 合格する検証には確認の読み取りが加わるので、`test_wp15_loop.py` の1件と `test_wp15_scenarios.py` の2件で、期待する Step の列に VERIFICATION を1つ足した（設計の変更による）。
+- 経過時間の上限の試験（`test_s4_the_elapsed_time_limit_ends_the_run`）は、壁時計ではなく単調時計を進めるように変えた（設計の変更による）。
+- 試験の削除、スキップ、条件の緩和はしていない。
+
+### 15.7 試験の数
+
+1866 件から 1896 件（+30）。8種類の検査が、すべて成功した。`uv.lock` は変えていない。
+

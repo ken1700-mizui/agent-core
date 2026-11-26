@@ -155,6 +155,7 @@ def test_s1_normal_work(tmp_path: Path) -> None:
         "TOOL_CALL:COMPLETED",
         "MODEL_CALL:COMPLETED",
         "VERIFICATION:COMPLETED",
+        "VERIFICATION:COMPLETED",  # the confirmation read (WP15-R03)
     ]
     assert _statuses(wd) == [
         R.WAITING_APPROVAL,
@@ -194,6 +195,7 @@ def test_s2_a_failed_verification_is_repaired(tmp_path: Path) -> None:
         StepKind.TOOL_CALL,
         StepKind.MODEL_CALL,
         StepKind.VERIFICATION,
+        StepKind.VERIFICATION,  # the confirmation read (WP15-R03)
     ]
     # The failure reaches the model as an observation (data), with the facts.
     repair_request = _text(wd.model.requests[2])
@@ -261,7 +263,7 @@ def test_s4_the_iteration_limit_ends_a_loop_of_refused_turns(tmp_path: Path) -> 
 def test_s4_the_elapsed_time_limit_ends_the_run(tmp_path: Path) -> None:
     wd = lp.world(tmp_path, [lp.write(), lp.done()], limits=_limits(max_elapsed_ms=1_000))
     first = wd.loop.run(wd.run.run_id)
-    wd.st.clock.now += 2_000
+    wd.mono.now += 2_000  # the monotonic clock (WP15-R04)
     outcome = lp.approve_pending(wd, first)
     assert (outcome.status, outcome.reason) == (R.FAILED, "LIMIT_EXCEEDED")
     assert len(wd.model.requests) == 1

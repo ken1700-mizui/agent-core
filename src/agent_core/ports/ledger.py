@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from agent_core.types.cost import ReservationView
+from agent_core.types.cost import BudgetScopeType, CounterKind, CounterView, ReservationView
 from agent_core.types.ledger import LedgerBatch, LedgerOp
 from agent_core.types.safety import (
     ActionDescriptor,
@@ -38,6 +38,12 @@ class LedgerPort(Protocol):
     def permit(self, permit_id: str) -> Permit | None: ...
 
     def reservation(self, reservation_id: str) -> ReservationView | None: ...
+
+    def counter(
+        self, scope_type: BudgetScopeType, scope_id: str, counter: CounterKind
+    ) -> CounterView | None:
+        """The persisted count of a counter of a scope (WP15-R04)."""
+        ...
 
     def stop_entries(self) -> tuple[StopEntry, ...]: ...
 
