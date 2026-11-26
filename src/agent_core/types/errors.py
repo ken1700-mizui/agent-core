@@ -7,6 +7,7 @@ caller must stop rather than retry). Messages never include record contents.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import ClassVar
 
 
@@ -567,6 +568,27 @@ class FileOperationRefusedError(SafetyError):
     example C1.S19: no safe path resolution in this environment)."""
 
     code = "FILE_OPERATION_REFUSED"
+
+
+class FileEffect(StrEnum):
+    """What a failed file operation may have done to the tree (WP08-R04)."""
+
+    NONE = "NONE"  # certainly nothing to any target
+    UNKNOWN = "UNKNOWN"  # a target may have changed
+
+
+class FileOperationFailedError(SafetyError):
+    """WP08-R04: a file operation inside the gate callback failed. ``effect`` says,
+    from the broker's own record of how far it got, whether any target may have
+    changed. Nothing is inferred from the exception type alone."""
+
+    code = "FILE_OPERATION_FAILED"
+
+    def __init__(self, *reasons: str, effect: FileEffect) -> None:
+        if type(effect) is not FileEffect:
+            raise TypeError("a file failure states its effect")
+        super().__init__(*reasons)
+        self.effect = effect
 
 
 class PermitRejectedError(SafetyError):

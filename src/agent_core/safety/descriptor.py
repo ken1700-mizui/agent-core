@@ -40,6 +40,7 @@ from pydantic import ValidationError
 
 from agent_core.safety.paths import matches
 from agent_core.types.errors import ActionDescriptorError
+from agent_core.types.files import MANIFEST_FILE_NAME, TEMP_FILE_PREFIX
 from agent_core.types.ids import AttemptId, ReservationId, RunId, StepId, TaskId, TenantId
 from agent_core.types.model import rendering_hash, request_hash
 from agent_core.types.replay import ReplayRequestRecord
@@ -140,6 +141,12 @@ def tool_targets(
             target = TargetResource(path=value, access=field.resource)
         except ValidationError:
             raise ActionDescriptorError("RESOURCE_PATH_INVALID") from None
+        if any(
+            part == MANIFEST_FILE_NAME or part.startswith(TEMP_FILE_PREFIX)
+            for part in target.path.split("/")
+        ):
+            # WP08-R01: the manifest and the broker's temporary files are never targets.
+            raise ActionDescriptorError("RESOURCE_PATH_RESERVED")
         declared = [
             spec
             for spec in manifest.resources

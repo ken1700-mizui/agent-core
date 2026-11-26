@@ -1,38 +1,21 @@
-"""WP-08 (in progress): file operations in the managed synthetic work tree.
+"""WP-08: the signed manifest (pure part), the minimal ApplyPlan (``WriteChange``)
+and the execution ticket, through the existing execution gate.
 
-Safe path resolution is not available in this environment (no openat2, and the
-dir_fd walk is not adopted), so C1.S19 applies: every read and write is refused
-before any target file is opened. What is tested here, through the existing
-execution gate:
-
-- the signed workspace manifest (HMAC-SHA-256 with a key derived for this
-  purpose), bound to the tree's root and to the policy's trusted digest;
-- the minimal ApplyPlan (``WriteChange``) bound into the approved operation;
-- the execution ticket: issued after the start is committed, used once inside
-  the callback for the matched operation only;
-- the S19 refusal: no side effect on the tree, and the Attempt, reservation and
-  receipt end in the designed states.
-
-Not verified here: a normal read or write of a real file, and stopping the
-process during a real file operation (they need safe path resolution).
+The broker (managed area, root and manifest through fds, component walk, lock,
+S19) is tested in ``test_wp08_workspace.py``; reads and writes of real files in
+``test_wp08_read.py`` and ``test_wp08_write.py``.
 """
 
 from __future__ import annotations
 
-import builtins
 import json
-import os
-import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from agent_core.adapters import file_broker
-from agent_core.adapters.file_broker import SyntheticFileBroker, safe_resolution_available
 from agent_core.runtime.execution_gate import SyntheticResult
-from agent_core.runtime.file_execution import run_file_operation
 from agent_core.safety.descriptor import write_change
 from agent_core.safety.workspace import (
     file_digest,
@@ -43,13 +26,11 @@ from agent_core.safety.workspace import (
 from agent_core.types.cost import ReservationState
 from agent_core.types.errors import (
     ActionDescriptorError,
-    FileOperationRefusedError,
     PermitRejectedError,
     SafetyError,
     WorkspaceRejectedError,
 )
 from agent_core.types.files import (
-    MANIFEST_FILE_NAME,
     ExecutionTicket,
     FileOperation,
 )
@@ -70,7 +51,6 @@ from agent_core.types.tools import (
     ObjectSchema,
     ResourceAccess,
 )
-from agent_core.types.transitions import AbortReason
 from support import builders as b
 from support import files_world as fw
 from support import ledger_world as lw
@@ -88,12 +68,6 @@ def world(tmp_path: Path) -> Any:
     yield st, tree
     if not st.journal.closed:
         st.journal.close()
-
-
-def _broker(st: Any, tree: fw.Tree, root: Path | None = None) -> SyntheticFileBroker:
-    return SyntheticFileBroker(
-        root=tree.root if root is None else root, key=manifest_key(st.keys.owner)
-    )
 
 
 def _descriptor(st: Any, attempt: Any) -> ActionDescriptor:
@@ -168,106 +142,6 @@ def test_the_digest_of_a_manifest_is_the_workspace_ref(tmp_path: Path) -> None:
     assert first.digest.startswith("sha256:")
     assert first.digest == manifest_digest(first.signed.manifest)
     assert first.digest != second.digest
-
-
-def test_a_valid_tree_passes_until_the_s19_refusal(world: Any) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    broker = _broker(st, tree)
-    with pytest.raises(FileOperationRefusedError) as excinfo:
-        broker.preflight(_descriptor(st, attempt), _policy(tree))
-    assert excinfo.value.reasons == ("SAFE_FILE_ACCESS_UNAVAILABLE",)
-
-
-def test_a_manifest_copied_to_another_tree_is_refused(world: Any, tmp_path: Path) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    other = tmp_path / "other"
-    fw.write_files(other, fw.FILES)
-    shutil.copyfile(tree.root / MANIFEST_FILE_NAME, other / MANIFEST_FILE_NAME)
-    broker = _broker(st, tree, root=other)
-    _rejected(lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "ROOT_MISMATCH")
-
-
-def test_a_copy_moved_into_the_original_path_is_refused(world: Any, tmp_path: Path) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    moved = tmp_path / "moved"
-    tree.root.rename(moved)
-    shutil.copytree(moved, tree.root)  # same path, same bytes, same manifest
-    tree.root.chmod(0o700)
-    broker = _broker(st, tree)
-    _rejected(
-        lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)),
-        "ROOT_IDENTITY_MISMATCH",
-    )
-
-
-def test_a_tree_without_a_manifest_is_refused(world: Any) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    (tree.root / MANIFEST_FILE_NAME).unlink()
-    broker = _broker(st, tree)
-    _rejected(
-        lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "MANIFEST_UNREADABLE"
-    )
-
-
-def test_a_manifest_behind_a_link_is_refused(world: Any, tmp_path: Path) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    kept = tmp_path / "kept.json"
-    (tree.root / MANIFEST_FILE_NAME).rename(kept)
-    (tree.root / MANIFEST_FILE_NAME).symlink_to(kept)
-    broker = _broker(st, tree)
-    _rejected(
-        lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "MANIFEST_UNREADABLE"
-    )
-    (tree.root / MANIFEST_FILE_NAME).unlink()
-    os.link(kept, tree.root / MANIFEST_FILE_NAME)  # a second hard link
-    _rejected(
-        lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "MANIFEST_UNREADABLE"
-    )
-
-
-def test_a_root_behind_a_link_is_refused(world: Any, tmp_path: Path) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    link = tmp_path / "link"
-    link.symlink_to(tree.root)
-    broker = _broker(st, tree, root=link)
-    _rejected(lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "ROOT_UNUSABLE")
-
-
-def test_the_root_must_be_private(world: Any) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    tree.root.chmod(0o750)
-    broker = _broker(st, tree)
-    _rejected(lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "ROOT_PERMISSIONS")
-
-
-def test_the_descriptor_must_name_this_manifest(world: Any, tmp_path: Path) -> None:
-    st, tree = world
-    other = fw.make_tree(tmp_path, st.keys.owner, "other")
-    attempt = fw.consumed(st, tree)
-    broker = _broker(st, other)
-    _rejected(
-        lambda: broker.preflight(_descriptor(st, attempt), _policy(tree)), "WORKSPACE_MISMATCH"
-    )
-
-
-@pytest.mark.parametrize("case", ["untrusted", "no-policy", "other-version"])
-def test_the_policy_must_trust_the_manifest_now(world: Any, case: str) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    broker = _broker(st, tree)
-    policy = {
-        "untrusted": s.policy(trusted_synthetic_workspaces=()),
-        "no-policy": None,
-        "other-version": _policy(tree, policy_version="policy-2"),
-    }[case]
-    _rejected(lambda: broker.preflight(_descriptor(st, attempt), policy), "WORKSPACE_NOT_TRUSTED")
 
 
 def test_the_pdp_denies_an_untrusted_manifest_digest(tmp_path: Path) -> None:
@@ -703,175 +577,3 @@ def test_a_ticket_from_another_gate_is_refused(world: Any) -> None:
 
     _execute(st, attempt, body)
     assert seen == [("TICKET_UNKNOWN",), attempt.attempt_id]
-
-
-# ================================================================ S19 through the gate
-
-
-class _Spy:
-    """Records every path the process opens or changes while installed."""
-
-    NAMES = (
-        "open",
-        "rename",
-        "replace",
-        "link",
-        "symlink",
-        "unlink",
-        "remove",
-        "rmdir",
-        "mkdir",
-        "makedirs",
-        "truncate",
-        "chmod",
-        "chown",
-        "utime",
-        "mkfifo",
-        "mknod",
-    )
-
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.calls: list[tuple[str, str]] = []
-        for name in self.NAMES:
-            original = getattr(os, name)
-            monkeypatch.setattr(os, name, self._wrap(name, original))
-        original_open = builtins.open
-        monkeypatch.setattr(builtins, "open", self._wrap("builtins.open", original_open))
-
-    def _wrap(self, name: str, original: Any) -> Any:
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            if args:
-                self.calls.append(
-                    (name, os.fsdecode(args[0]) if not isinstance(args[0], int) else str(args[0]))
-                )
-            return original(*args, **kwargs)
-
-        return wrapper
-
-    def touched(self, root: Path) -> set[tuple[str, str]]:
-        prefix = str(root)
-        return {(n, p) for n, p in self.calls if p.startswith(prefix)}
-
-
-def _run(st: Any, tree: fw.Tree, attempt: Any, files: Any, write: bytes | None) -> Any:
-    return run_file_operation(
-        gate=lw.gate(st),
-        ledger=st.journal,
-        files=files,
-        attempt=attempt,
-        write_content=write,
-        **lw.actual(st, attempt),
-    ).attempt
-
-
-def _not_dispatched(st: Any, attempt: Any, done: Any, reason: AbortReason) -> None:
-    assert done.state is A.ABORTED_BEFORE_DISPATCH
-    view = st.journal.reservation(attempt.reservation_id)
-    assert (view.state, view.hold_micro, view.spent_micro) == (R.RELEASED, 0, 0)
-    assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.NOT_DISPATCHED
-    states = [t.after.state for t in fw.history(st, attempt)]
-    assert A.DISPATCH_AUTHORIZED not in states
-    assert A.DISPATCH_STARTED not in states
-    last = fw.history(st, attempt)[-1]
-    assert last.evidence.reason is reason
-
-
-@pytest.mark.parametrize(
-    ("write", "canonical_input"),
-    [
-        pytest.param(False, fw.READ_INPUT, id="read"),
-        pytest.param(True, fw.WRITE_INPUT, id="create"),
-        pytest.param(
-            True,
-            tw.write_input(
-                "workspace/out/r.txt",
-                content="synthetic replaced\n",
-                expected=file_digest(fw.FILES["workspace/out/r.txt"]),
-            ),
-            id="replace",
-        ),
-    ],
-)
-def test_s19_refuses_before_any_target_is_opened(
-    world: Any, monkeypatch: pytest.MonkeyPatch, write: bool, canonical_input: str
-) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree, write=write, canonical_input=canonical_input)
-    before = fw.snapshot(tree.root)
-    content = parse_strict_json(canonical_input.encode())
-    assert isinstance(content, dict)
-    payload = str(content["content"]).encode() if write else None
-    spy = _Spy(monkeypatch)
-    done = _run(st, tree, attempt, _broker(st, tree), payload)
-    monkeypatch.undo()
-    _not_dispatched(st, attempt, done, AbortReason.SAFE_FILE_ACCESS_UNAVAILABLE)
-    # Only the root and the manifest were opened; nothing was created or changed.
-    assert spy.touched(tree.root) == {
-        ("open", str(tree.root)),
-        ("open", str(tree.root / MANIFEST_FILE_NAME)),
-    }
-    assert fw.snapshot(tree.root) == before
-    assert not (tree.root / NEW_PATH).exists()
-
-
-def test_a_rejected_manifest_aborts_before_dispatch(world: Any) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree)
-    (tree.root / MANIFEST_FILE_NAME).write_bytes(b"{}")
-    before = fw.snapshot(tree.root)
-    done = _run(st, tree, attempt, _broker(st, tree), None)
-    _not_dispatched(st, attempt, done, AbortReason.WORKSPACE_REJECTED)
-    assert fw.snapshot(tree.root) == before
-
-
-class _PreflightPassed:
-    """Lets an operation reach the callback; the real broker then decides there."""
-
-    def __init__(self, broker: SyntheticFileBroker) -> None:
-        self._broker = broker
-
-    def preflight(self, descriptor: Any, policy: Any) -> None:
-        return None
-
-    def read(self, authorization: Any, ticket: Any, redeem: Any) -> bytes:
-        return self._broker.read(authorization, ticket, redeem)
-
-    def write(self, authorization: Any, ticket: Any, redeem: Any, content: bytes) -> None:
-        self._broker.write(authorization, ticket, redeem, content)
-
-
-@pytest.mark.parametrize("write", [False, True])
-def test_s19_inside_the_callback_fails_definitely_without_side_effects(
-    world: Any, monkeypatch: pytest.MonkeyPatch, write: bool
-) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree, write=write)
-    before = fw.snapshot(tree.root)
-    spy = _Spy(monkeypatch)
-    done = _run(
-        st,
-        tree,
-        attempt,
-        _PreflightPassed(_broker(st, tree)),
-        fw.NEW_CONTENT.encode() if write else None,
-    )
-    monkeypatch.undo()
-    assert done.state is A.FAILED_DEFINITE
-    assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.USED
-    view = st.journal.reservation(attempt.reservation_id)
-    assert (view.hold_micro, view.spent_micro) == (0, 0)
-    assert spy.touched(tree.root) == set()
-    assert fw.snapshot(tree.root) == before
-
-
-def test_a_file_operation_without_safe_resolution_is_never_started(world: Any) -> None:
-    st, tree = world
-    attempt = fw.consumed(st, tree, write=True)
-    done = _run(st, tree, attempt, _broker(st, tree), b"different bytes")
-    # Refused before the start whatever the content: no ticket is ever issued.
-    assert done.state is A.ABORTED_BEFORE_DISPATCH
-
-
-def test_safe_resolution_is_not_available_here() -> None:
-    assert file_broker.SAFE_RESOLUTION_ADOPTED is False
-    assert safe_resolution_available() is False

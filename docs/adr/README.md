@@ -11,6 +11,7 @@
 | [0005](0005-eval-driven-holdout-separation.md) | 評価駆動の開発と、holdout の分離 | 一部 ACCEPTED（D3） |
 | [0006](0006-toolchain.md) | ツールチェーン | 一部 ACCEPTED（Phase 1 の部分） |
 | [0007](0007-documentation-language.md) | 文書の言語の方針 | ACCEPTED（D4） |
+| [0008](0008-dir-fd-path-resolution.md) | 管理された合成の作業領域での、`dir_fd` によるパスの解決 | ACCEPTED（限定。Phase 1 の管理された合成の環境だけ） |
 
 **状態の意味**
 

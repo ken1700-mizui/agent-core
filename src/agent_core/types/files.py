@@ -19,6 +19,7 @@ from typing import Annotated, Final, Literal, Self
 from pydantic import Field, StringConstraints, field_validator, model_validator
 
 from agent_core.types.base import FrozenModel
+from agent_core.types.errors import FileEffect as FileEffect  # re-exported
 from agent_core.types.ids import AttemptId, ReceiptId
 from agent_core.types.safety import MacHex, RelPath, WriteChange
 from agent_core.types.tools import ResourceAccess
@@ -26,6 +27,9 @@ from agent_core.types.values import Digest, Identifier, TimestampMs, require_sor
 
 # The signed manifest's file name, directly under the tree's root.
 MANIFEST_FILE_NAME: Final = ".agent-core-workspace.json"
+# Temporary files of a write (WP-08 R05): this prefix and 32 random hex digits.
+TEMP_FILE_PREFIX: Final = ".agent-core-tmp-"
+RESERVED_PREFIXES: Final = (MANIFEST_FILE_NAME, TEMP_FILE_PREFIX)
 MAX_MANIFEST_BYTES: Final = 1_048_576
 MAX_ENTRIES: Final = 4_096
 

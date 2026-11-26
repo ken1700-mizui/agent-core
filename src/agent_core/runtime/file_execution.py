@@ -1,25 +1,30 @@
-"""One file operation through the execution gate (WP-08; C1 8.3, E.Z33).
+"""One file operation through the execution gate (WP-08; ADR-0008; C1 8.3, E.Z33).
 
 Order:
 
-1. ``preflight`` before the claim: a rejected work tree or the C1.S19 refusal
+1. ``prepare`` before the claim. A rejected tree, the S19 refusal or a busy tree
    ends the attempt ABORTED_BEFORE_DISPATCH through the live gate's
    not-dispatched report, which releases the hold in the same transaction.
    Nothing was started and no target was opened.
-2. Otherwise the gate claims and starts; inside the callback the broker performs
-   the one operation, redeeming the execution ticket. A refusal there (raised
-   before any target is opened, by the broker's contract) is a definite failure;
-   anything else raised leaves the outcome unknown (the gate keeps the hold).
+2. Otherwise the gate claims and starts; inside the callback the prepared
+   operation performs the one operation, redeeming the execution ticket.
+   - ``FileOperationFailedError`` with effect NONE: a definite failure (the
+     broker's own record says no target changed).
+   - effect UNKNOWN, or any other exception: the outcome is unknown; the gate
+     keeps the hold. Nothing is retried and nothing is restored.
+3. The prepared operation is closed (fds and the writer lock) in every case.
 """
 
 from __future__ import annotations
 
 from typing import NamedTuple
 
-from agent_core.ports.files import FileOperationPort
+from agent_core.ports.files import FileOperationPort, PreparedFileOperation
 from agent_core.ports.ledger import LedgerPort
 from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
 from agent_core.types.errors import (
+    FileEffect,
+    FileOperationFailedError,
     FileOperationRefusedError,
     PermitRejectedError,
     WorkspaceRejectedError,
@@ -31,7 +36,11 @@ from agent_core.types.safety import ActionContent, DispatchAuthorization, Permit
 from agent_core.types.tools import ToolRegistration
 from agent_core.types.transitions import AbortReason
 
-_S19 = "SAFE_FILE_ACCESS_UNAVAILABLE"
+# Refusals of ``prepare`` that end the attempt before dispatch, and their reasons.
+_BEFORE_DISPATCH: dict[tuple[str, ...], AbortReason] = {
+    ("SAFE_FILE_ACCESS_UNAVAILABLE",): AbortReason.SAFE_FILE_ACCESS_UNAVAILABLE,
+    ("WORKSPACE_BUSY",): AbortReason.WORKSPACE_BUSY,
+}
 
 
 class FileOperationResult(NamedTuple):
@@ -51,6 +60,10 @@ def _no_usage() -> Usage:
     )
 
 
+def _failed() -> SyntheticResult:
+    return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+
+
 def run_file_operation(
     *,
     gate: SyntheticExecutionGate,
@@ -67,16 +80,29 @@ def run_file_operation(
     if (descriptor.apply_change is not None) != (write_content is not None):
         raise FileOperationRefusedError("WRITE_CONTENT_DOES_NOT_FIT")
     try:
-        files.preflight(descriptor, ledger.policy(descriptor.tenant_id))
+        prepared = files.prepare(descriptor, ledger.policy(descriptor.tenant_id))
     except WorkspaceRejectedError:
         aborted = gate.abort_not_dispatched(attempt, AbortReason.WORKSPACE_REJECTED)
         return FileOperationResult(aborted, None)
     except FileOperationRefusedError as exc:
-        if exc.reasons != (_S19,):
+        reason = _BEFORE_DISPATCH.get(exc.reasons)
+        if reason is None:
             raise
-        aborted = gate.abort_not_dispatched(attempt, AbortReason.SAFE_FILE_ACCESS_UNAVAILABLE)
-        return FileOperationResult(aborted, None)
+        return FileOperationResult(gate.abort_not_dispatched(attempt, reason), None)
+    try:
+        return _execute(gate, prepared, attempt, content, registration, write_content)
+    finally:
+        prepared.close()
 
+
+def _execute(
+    gate: SyntheticExecutionGate,
+    prepared: PreparedFileOperation,
+    attempt: Attempt,
+    content: ActionContent,
+    registration: ToolRegistration | None,
+    write_content: bytes | None,
+) -> FileOperationResult:
     read: list[bytes] = []
 
     def run(
@@ -84,14 +110,16 @@ def run_file_operation(
     ) -> SyntheticResult:
         if ticket is None:
             # Not one file target: nothing is attempted.
-            return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+            return _failed()
         try:
             if write_content is None:
-                read.append(files.read(authorization, ticket, gate.redeem))
+                read.append(prepared.read(authorization, ticket, gate.redeem))
             else:
-                files.write(authorization, ticket, gate.redeem, write_content)
-        except FileOperationRefusedError:
-            return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+                prepared.write(authorization, ticket, gate.redeem, write_content)
+        except FileOperationFailedError as exc:
+            if exc.effect is FileEffect.NONE:
+                return _failed()
+            raise  # a target may have changed: unknown, never retried
         return SyntheticResult(outcome="COMPLETED", usage=_no_usage(), final=True)
 
     done = gate.execute(attempt, content=content, registration=registration, run=run)

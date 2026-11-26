@@ -1,49 +1,72 @@
-"""Synthetic work-tree file broker (WP-08; C1 8.3, C1.S16, C1.S19).
+"""Synthetic work-tree file broker (WP-08; ADR-0008; C1 8.3, C1.S16, C1.S19).
 
-What it does now:
+Path resolution (ADR-0008, accepted for Phase 1 managed synthetic trees only):
 
-1. ``preflight`` (before the start, before any receipt is claimed):
+- The trusted managed area is an absolute, normalized path the composition root
+  names. It is reached from ``/`` one name at a time with
+  ``O_DIRECTORY | O_NOFOLLOW``. Ancestors must be directories owned by root or
+  by this user; one writable by group or others needs the sticky bit. The area
+  itself is ours and 0700.
+- The tree's root is opened relative to the area fd: a directory, ours, 0700, on
+  the area's device. Everything after that is relative to fds already opened;
+  no absolute path string is used again.
+- The signed manifest is opened relative to the root fd: first with ``O_PATH``
+  (no open side effects; it must be a regular file with one link, ours, not
+  writable by group or others, at most 1 MiB, on the same device), then for
+  reading, and the two must be the same inode. Its HMAC (derived key) and the
+  policy's trusted digest are checked, and it must name this root path and the
+  root fd's device and inode.
+- Inside the tree each directory is opened one name at a time
+  (``O_DIRECTORY | O_NOFOLLOW``): ours, not writable by group or others, on the
+  root's device. ``""``, ``.``, ``..``, NUL, backslash, absolute paths and the
+  reserved names (the manifest, temporary files) are refused before any open.
 
-   - the operation names a workspace, and the current policy (same version as
-     the decision) trusts that digest;
-   - the root is opened as a directory without following a link at its last
-     component, and must belong to this user with mode 0700 (no group or other
-     access);
-   - the signed manifest directly under the root is read (not through a link,
-     one hard link, bounded size), its HMAC verified with the derived manifest
-     key, and it must name this root path, the opened root's device and inode,
-     and have exactly the operation's ``workspace_ref`` as its digest. A valid
-     manifest copied into another tree, or a copied tree moved into the original
-     path, is refused (other path, or other inode).
+Single writer: the broker holds ``flock(LOCK_EX | LOCK_NB)`` on the root fd from
+``prepare`` to ``close``. That excludes cooperating brokers (in this or another
+process). It does not stop a non-cooperating process of the same OS user, or
+root (ADR-0008, limits).
 
-2. C1.S19: safe path resolution is not available in this environment (Python
-   has no ``openat2``; the component-wise ``dir_fd`` walk is proposed in
-   docs/design/phase-1/WP-08_FILE_OPS.md and not adopted). Every read and write
-   is refused before any target is opened, both in ``preflight`` and again in
-   ``read`` and ``write`` inside the callback.
+C1.S19: when a condition of ADR-0008 cannot be met here (platform, flags,
+``dir_fd`` support, ``flock``), every operation is refused before anything is
+opened, and again inside the callback.
 
-Only the root directory and the manifest file are ever opened here. Nothing is
-created, changed or removed. This module is imported by no other agent_core
-module (import-linter); the composition root builds the broker.
+The manifest is the record of the tree at creation. Later managed changes are
+the COMPLETED attempts in the Journal whose descriptor carries a
+``WriteChange``; the manifest is not rewritten and does not prove the current
+content. This module is imported by no other agent_core module (import-linter);
+the composition root builds the broker.
 """
 
 from __future__ import annotations
 
+import fcntl
 import os
+import re
 import stat
+import sys
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Final
+from typing import Final, NoReturn
 
 from pydantic import ValidationError
 
 from agent_core.ports.files import Redeem
-from agent_core.safety.workspace import manifest_digest, verify_manifest
-from agent_core.types.errors import FileOperationRefusedError, WorkspaceRejectedError
+from agent_core.safety.workspace import file_digest, manifest_digest, sign_manifest, verify_manifest
+from agent_core.types.errors import (
+    FileEffect,
+    FileOperationFailedError,
+    FileOperationRefusedError,
+    WorkspaceRejectedError,
+)
 from agent_core.types.files import (
     MANIFEST_FILE_NAME,
     MAX_MANIFEST_BYTES,
+    TEMP_FILE_PREFIX,
+    EntryKind,
     ExecutionTicket,
     SignedWorkspaceManifest,
+    WorkspaceEntry,
     WorkspaceManifest,
 )
 from agent_core.types.safety import (
@@ -53,46 +76,298 @@ from agent_core.types.safety import (
     Policy,
     SecretKey,
 )
-from agent_core.types.serialization import StrictJsonError, parse_strict_json
+from agent_core.types.serialization import StrictJsonError, dump_json, parse_strict_json
 
-# C1 8.3 requires resolution beneath the root that refuses links (openat2 with
-# RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS, or an equivalent
-# the owner accepted). None is adopted, so S19 refuses every file operation.
-SAFE_RESOLUTION_ADOPTED: Final = False
+# ADR-0008: adopted for Phase 1 managed synthetic trees, where its conditions hold.
+SAFE_RESOLUTION_ADOPTED: Final = True
+MAX_FILE_BYTES: Final = 1_048_576
+_MAX_PATH = 4_096
+_MAX_NAME = 255
+_WORKSPACE_ID = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_FLAGS: Final = ("O_PATH", "O_NOFOLLOW", "O_DIRECTORY", "O_CLOEXEC", "O_NONBLOCK", "O_NOCTTY")
+_DIR_FD_CALLS: Final = ("open", "stat", "mkdir", "link", "rename", "unlink")
 
-_DIR_FLAGS: Final = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_FILE_FLAGS: Final = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+def missing_capabilities() -> tuple[str, ...]:
+    """The ADR-0008 conditions this process cannot meet (empty when all hold)."""
+    missing: list[str] = []
+    if sys.platform != "linux":
+        missing.append("platform")
+    missing += [flag for flag in _FLAGS if not hasattr(os, flag)]
+    with_dir_fd = {getattr(f, "__name__", "") for f in os.supports_dir_fd}
+    missing += [f"{name}-dir-fd" for name in _DIR_FD_CALLS if name not in with_dir_fd]
+    if "stat" not in {getattr(f, "__name__", "") for f in os.supports_follow_symlinks}:
+        missing.append("stat-nofollow")
+    if not hasattr(fcntl, "flock") or not hasattr(os, "fsync"):
+        missing.append("flock" if not hasattr(fcntl, "flock") else "fsync")
+    return tuple(missing)
 
 
 def safe_resolution_available() -> bool:
-    return SAFE_RESOLUTION_ADOPTED
+    return SAFE_RESOLUTION_ADOPTED and not missing_capabilities()
 
 
-def _refuse_without_safe_resolution() -> None:
+def _require_safe_resolution() -> None:
     if not safe_resolution_available():
         raise FileOperationRefusedError("SAFE_FILE_ACCESS_UNAVAILABLE")
 
 
+def _dir_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _none(reason: str) -> NoReturn:
+    raise FileOperationFailedError(reason, effect=FileEffect.NONE)
+
+
+def split_target(path: str) -> tuple[str, ...]:
+    """The names of a relative path inside the tree; refused (no effect) when it is
+    empty, absolute, has an empty, ``.`` or ``..`` part, NUL or backslash, is too
+    long, or names a reserved file."""
+    if (
+        type(path) is not str
+        or not path
+        or len(path) > _MAX_PATH
+        or path.startswith("/")
+        or "\x00" in path
+        or "\\" in path
+    ):
+        _none("PATH_INVALID")
+    parts = tuple(path.split("/"))
+    for part in parts:
+        if part in ("", ".", "..") or len(part) > _MAX_NAME:
+            _none("PATH_INVALID")
+        if part == MANIFEST_FILE_NAME or part.startswith(TEMP_FILE_PREFIX):
+            _none("PATH_INVALID")
+    return parts
+
+
+def _normal_area(area: Path | str) -> str:
+    path = os.fspath(area)
+    if type(path) is not str or not path.startswith("/") or path == "/" or "\x00" in path:
+        raise ValueError("the managed area is an absolute path below /")
+    if any(part in ("", ".", "..") for part in path.split("/")[1:]):
+        raise ValueError("the managed area is a normalized absolute path")
+    return path
+
+
+def _private_dir(info: os.stat_result, device: int | None = None) -> bool:
+    return (
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and stat.S_IMODE(info.st_mode) & 0o077 == 0
+        and (device is None or info.st_dev == device)
+    )
+
+
+def _safe_ancestor(info: os.stat_result) -> bool:
+    mode = info.st_mode
+    if not stat.S_ISDIR(mode) or info.st_uid not in (0, os.geteuid()):
+        return False
+    return not (stat.S_IMODE(mode) & 0o022) or bool(mode & stat.S_ISVTX)
+
+
+def _open_area(area: str) -> int:
+    """The managed area's fd, reached from ``/`` one name at a time."""
+    names = area.split("/")[1:]
+    try:
+        fd = os.open("/", _dir_flags())
+    except OSError:
+        raise WorkspaceRejectedError("AREA_UNSAFE") from None
+    try:
+        if not _safe_ancestor(os.fstat(fd)):
+            raise WorkspaceRejectedError("AREA_UNSAFE")
+        for index, name in enumerate(names):
+            try:
+                child = os.open(name, _dir_flags(), dir_fd=fd)
+            except OSError:
+                raise WorkspaceRejectedError("AREA_UNSAFE") from None
+            os.close(fd)
+            fd = child
+            info = os.fstat(fd)
+            last = index == len(names) - 1
+            if not (_private_dir(info) if last else _safe_ancestor(info)):
+                raise WorkspaceRejectedError("AREA_UNSAFE")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_regular(dir_fd: int, name: str, *, device: int, limit: int) -> tuple[int, os.stat_result]:
+    """A regular file directly in ``dir_fd``, opened for reading only after an
+    ``O_PATH`` look (no open side effects for FIFOs or devices): one link, ours,
+    not writable by group or others, on ``device``, at most ``limit`` bytes; the
+    read fd must be the inode that was looked at. Raises ``LookupError`` with the
+    reason otherwise."""
+    try:
+        probe = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise LookupError("MISSING") from None
+    except OSError:
+        raise LookupError("UNSAFE") from None
+    try:
+        seen = os.fstat(probe)
+    finally:
+        os.close(probe)
+    if (
+        not stat.S_ISREG(seen.st_mode)
+        or seen.st_nlink != 1
+        or seen.st_uid != os.geteuid()
+        or stat.S_IMODE(seen.st_mode) & 0o022
+        or seen.st_dev != device
+    ):
+        raise LookupError("UNSAFE")
+    if seen.st_size > limit:
+        raise LookupError("TOO_LARGE")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+    try:
+        fd = os.open(name, flags, dir_fd=dir_fd)
+    except OSError:
+        raise LookupError("UNSAFE") from None
+    info = os.fstat(fd)
+    if (info.st_dev, info.st_ino) != (seen.st_dev, seen.st_ino) or not stat.S_ISREG(info.st_mode):
+        os.close(fd)
+        raise LookupError("CHANGED")
+    return fd, info
+
+
+def _read_bounded(fd: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = os.read(fd, 65_536)
+        if not chunk:
+            return b"".join(chunks)
+        size += len(chunk)
+        if size > limit:
+            raise LookupError("TOO_LARGE")
+        chunks.append(chunk)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+class PreparedWorkspace:
+    """A verified tree, held through fds and the writer lock until ``close``."""
+
+    __slots__ = ("_area_fd", "_closed", "_descriptor", "_device", "_digest", "_root_fd")
+
+    def __init__(
+        self, *, area_fd: int, root_fd: int, device: int, digest: str, descriptor: ActionDescriptor
+    ) -> None:
+        self._area_fd = area_fd
+        self._root_fd = root_fd
+        self._device = device
+        self._digest = digest
+        self._descriptor = descriptor
+        self._closed = False
+
+    def __repr__(self) -> str:
+        return "<PreparedWorkspace>"
+
+    def __enter__(self) -> PreparedWorkspace:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if not self._closed:
+            self._closed = True
+            os.close(self._root_fd)  # releases the writer lock
+            os.close(self._area_fd)
+
+    @property
+    def workspace_ref(self) -> str:
+        return self._digest
+
+    @property
+    def root_inode(self) -> int:
+        return os.fstat(self._root_fd).st_ino
+
+    @contextmanager
+    def resolve_parent(self, path: str) -> Iterator[tuple[int, str]]:
+        """The parent directory fd of ``path`` and its last name, walked from the
+        root fd one name at a time. Refused with no effect when unsafe."""
+        if self._closed:
+            _none("PREPARED_CLOSED")
+        parts = split_target(path)
+        current = self._root_fd
+        try:
+            for name in parts[:-1]:
+                try:
+                    child = os.open(name, _dir_flags(), dir_fd=current)
+                except OSError:
+                    _none("PATH_UNSAFE")
+                if current != self._root_fd:
+                    os.close(current)
+                current = child
+                info = os.fstat(current)
+                if not (
+                    stat.S_ISDIR(info.st_mode)
+                    and info.st_uid == os.geteuid()
+                    and stat.S_IMODE(info.st_mode) & 0o022 == 0
+                    and info.st_dev == self._device
+                ):
+                    _none("PATH_UNSAFE")
+            yield current, parts[-1]
+        finally:
+            if current != self._root_fd:
+                os.close(current)
+
+    def _check_still_safe(self, authorization: DispatchAuthorization) -> None:
+        if not safe_resolution_available():
+            _none("SAFE_FILE_ACCESS_UNAVAILABLE")
+        if self._closed:
+            _none("PREPARED_CLOSED")
+        if authorization.descriptor != self._descriptor:
+            _none("PREPARED_FOR_ANOTHER_OPERATION")
+
+    def read(
+        self, authorization: DispatchAuthorization, ticket: ExecutionTicket, redeem: Redeem
+    ) -> bytes:
+        self._check_still_safe(authorization)
+        _none("READ_NOT_ENABLED")
+
+    def write(
+        self,
+        authorization: DispatchAuthorization,
+        ticket: ExecutionTicket,
+        redeem: Redeem,
+        content: bytes,
+    ) -> None:
+        self._check_still_safe(authorization)
+        _none("WRITE_NOT_ENABLED")
+
+
 class SyntheticFileBroker:
-    def __init__(self, *, root: Path, key: SecretKey) -> None:
+    def __init__(self, *, area: Path | str, workspace_id: str, key: SecretKey) -> None:
         if type(key) is not SecretKey:
             raise TypeError("the broker needs the manifest key")
-        path = os.fspath(root)
-        if not os.path.isabs(path) or os.path.normpath(path) != path:
-            raise ValueError("the work tree root is a normalized absolute path")
-        self._root = path
+        if type(workspace_id) is not str or _WORKSPACE_ID.fullmatch(workspace_id) is None:
+            raise ValueError("a workspace id is a lowercase identifier")
+        self._area = _normal_area(area)
+        self._workspace_id = workspace_id
         self._key = key
 
     def __repr__(self) -> str:
         return "<SyntheticFileBroker>"
 
-    # ------------------------------------------------------------ before the start
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("the file broker is not extended (its code is the pinned artifact)")
 
-    def preflight(self, descriptor: ActionDescriptor, policy: Policy | None) -> None:
-        self._check_workspace(descriptor, policy)
-        _refuse_without_safe_resolution()
-
-    def _check_workspace(self, descriptor: ActionDescriptor, policy: Policy | None) -> None:
+    def prepare(self, descriptor: ActionDescriptor, policy: Policy | None) -> PreparedWorkspace:
+        """Before the start: S19, the policy's trust, the area, the root, the lock and
+        the manifest. Nothing but the area's ancestors, the area, the root and the
+        manifest is opened; nothing is changed."""
+        _require_safe_resolution()
         ref = descriptor.workspace_ref
         if descriptor.kind is not ActionKind.TOOL_CALL or not descriptor.target_resources:
             raise WorkspaceRejectedError("NOT_A_FILE_OPERATION")
@@ -105,28 +380,50 @@ class SyntheticFileBroker:
             or ref not in policy.trusted_synthetic_workspaces
         ):
             raise WorkspaceRejectedError("WORKSPACE_NOT_TRUSTED")
-        manifest, device, inode = self._load_manifest()
-        if manifest.root_path != self._root:
-            raise WorkspaceRejectedError("ROOT_MISMATCH")
-        if (manifest.root_device, manifest.root_inode) != (device, inode):
-            raise WorkspaceRejectedError("ROOT_IDENTITY_MISMATCH")
-        if manifest_digest(manifest) != ref:
-            raise WorkspaceRejectedError("WORKSPACE_MISMATCH")
-
-    def _load_manifest(self) -> tuple[WorkspaceManifest, int, int]:
+        area_fd = _open_area(self._area)
+        root_fd = -1
         try:
-            fd = os.open(self._root, _DIR_FLAGS)
-        except OSError:
-            raise WorkspaceRejectedError("ROOT_UNUSABLE") from None
-        try:
-            info = os.fstat(fd)
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) & 0o077
-            ):
+            try:
+                root_fd = os.open(self._workspace_id, _dir_flags(), dir_fd=area_fd)
+            except OSError:
+                raise WorkspaceRejectedError("ROOT_UNUSABLE") from None
+            area = os.fstat(area_fd)
+            root = os.fstat(root_fd)
+            if not _private_dir(root):
                 raise WorkspaceRejectedError("ROOT_PERMISSIONS")
-            raw = _read_manifest(os.path.join(self._root, MANIFEST_FILE_NAME))
+            if root.st_dev != area.st_dev:
+                raise WorkspaceRejectedError("MOUNT_BOUNDARY")
+            try:
+                fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise FileOperationRefusedError("WORKSPACE_BUSY") from None
+            manifest = self._manifest(root_fd, root.st_dev)
+            if manifest.root_path != f"{self._area}/{self._workspace_id}":
+                raise WorkspaceRejectedError("ROOT_MISMATCH")
+            if (manifest.root_device, manifest.root_inode) != (root.st_dev, root.st_ino):
+                raise WorkspaceRejectedError("ROOT_IDENTITY_MISMATCH")
+            if manifest_digest(manifest) != ref:
+                raise WorkspaceRejectedError("WORKSPACE_MISMATCH")
+        except BaseException:
+            if root_fd >= 0:
+                os.close(root_fd)
+            os.close(area_fd)
+            raise
+        return PreparedWorkspace(
+            area_fd=area_fd, root_fd=root_fd, device=root.st_dev, digest=ref, descriptor=descriptor
+        )
+
+    def _manifest(self, root_fd: int, device: int) -> WorkspaceManifest:
+        try:
+            fd, _info = _open_regular(
+                root_fd, MANIFEST_FILE_NAME, device=device, limit=MAX_MANIFEST_BYTES
+            )
+        except LookupError:
+            raise WorkspaceRejectedError("MANIFEST_UNREADABLE") from None
+        try:
+            raw = _read_bounded(fd, MAX_MANIFEST_BYTES)
+        except LookupError:
+            raise WorkspaceRejectedError("MANIFEST_UNREADABLE") from None
         finally:
             os.close(fd)
         try:
@@ -134,52 +431,131 @@ class SyntheticFileBroker:
             signed = SignedWorkspaceManifest.model_validate_json(raw)
         except (StrictJsonError, ValidationError):
             raise WorkspaceRejectedError("MANIFEST_INVALID") from None
-        return verify_manifest(self._key, signed), info.st_dev, info.st_ino
-
-    # ------------------------------------------------------------ inside the callback
-
-    def read(
-        self, authorization: DispatchAuthorization, ticket: ExecutionTicket, redeem: Redeem
-    ) -> bytes:
-        _refuse_without_safe_resolution()
-        raise FileOperationRefusedError("SAFE_FILE_ACCESS_NOT_IMPLEMENTED")
-
-    def write(
-        self,
-        authorization: DispatchAuthorization,
-        ticket: ExecutionTicket,
-        redeem: Redeem,
-        content: bytes,
-    ) -> None:
-        _refuse_without_safe_resolution()
-        raise FileOperationRefusedError("SAFE_FILE_ACCESS_NOT_IMPLEMENTED")
+        return verify_manifest(self._key, signed)
 
 
-def _read_manifest(path: str) -> bytes:
-    """The manifest's bytes: a regular file with one link, not reached through a
-    link at its last component, at most MAX_MANIFEST_BYTES."""
+# ---------------------------------------------------------------- creating a managed tree
+
+
+def _creation_plan(files: Mapping[str, bytes]) -> tuple[list[str], list[str]]:
+    """Directories and files to create, checked before anything is created."""
+    dirs: set[str] = set()
+    for path, data in files.items():
+        try:
+            parts = split_target(path)
+        except FileOperationFailedError:
+            raise WorkspaceRejectedError("PATH_INVALID") from None
+        if type(data) is not bytes or len(data) > MAX_FILE_BYTES:
+            raise WorkspaceRejectedError("CONTENT_INVALID")
+        dirs.update("/".join(parts[: i + 1]) for i in range(len(parts) - 1))
+    if dirs & set(files):
+        raise WorkspaceRejectedError("PATH_INVALID")  # a file is also a directory
+    return sorted(dirs, key=lambda d: (d.count("/"), d)), sorted(files)
+
+
+def _open_dir_beneath(root_fd: int, path: str) -> int:
+    current = os.dup(root_fd)
     try:
-        fd = os.open(path, _FILE_FLAGS)
-    except OSError:
-        raise WorkspaceRejectedError("MANIFEST_UNREADABLE") from None
+        for name in path.split("/"):
+            child = os.open(name, _dir_flags(), dir_fd=current)
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _parent_and_name(root_fd: int, path: str) -> tuple[int, str]:
+    head, _, name = path.rpartition("/")
+    return (_open_dir_beneath(root_fd, head) if head else os.dup(root_fd)), name
+
+
+def _create_file(dir_fd: int, name: str, data: bytes) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+    fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
     try:
-        info = os.fstat(fd)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_nlink != 1
-            or info.st_size > MAX_MANIFEST_BYTES
-        ):
-            raise WorkspaceRejectedError("MANIFEST_UNREADABLE")
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(fd, 65_536)
-            if not chunk:
-                break
-            size += len(chunk)
-            if size > MAX_MANIFEST_BYTES:
-                raise WorkspaceRejectedError("MANIFEST_UNREADABLE")
-            chunks.append(chunk)
-        return b"".join(chunks)
+        os.fchmod(fd, 0o600)
+        _write_all(fd, data)
+        os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def create_synthetic_workspace(
+    *,
+    area: Path | str,
+    workspace_id: str,
+    files: Mapping[str, bytes],
+    key: SecretKey,
+    now_ms: int,
+) -> SignedWorkspaceManifest:
+    """Create a managed synthetic tree ``<area>/<workspace_id>`` (0700) with the given
+    synthetic files (0600) and its signed manifest (written last, 0600). Every
+    path is checked before anything is created. A failure part way leaves a tree
+    without a manifest, which ``prepare`` refuses; it is not removed by guessing."""
+    _require_safe_resolution()
+    if type(key) is not SecretKey:
+        raise TypeError("the manifest is signed with the manifest key")
+    if type(workspace_id) is not str or _WORKSPACE_ID.fullmatch(workspace_id) is None:
+        raise WorkspaceRejectedError("WORKSPACE_ID_INVALID")
+    area_path = _normal_area(area)
+    dirs, names = _creation_plan(files)
+    area_fd = _open_area(area_path)
+    try:
+        try:
+            os.mkdir(workspace_id, 0o700, dir_fd=area_fd)
+        except FileExistsError:
+            raise WorkspaceRejectedError("WORKSPACE_EXISTS") from None
+        root_fd = os.open(workspace_id, _dir_flags(), dir_fd=area_fd)
+        try:
+            os.fchmod(root_fd, 0o700)
+            fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for path in dirs:
+                parent, name = _parent_and_name(root_fd, path)
+                try:
+                    os.mkdir(name, 0o700, dir_fd=parent)
+                    child = os.open(name, _dir_flags(), dir_fd=parent)
+                    os.fchmod(child, 0o700)
+                    os.close(child)
+                finally:
+                    os.close(parent)
+            for path in names:
+                parent, name = _parent_and_name(root_fd, path)
+                try:
+                    _create_file(parent, name, files[path])
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+            root = os.fstat(root_fd)
+            entries = [
+                WorkspaceEntry(path=d, kind=EntryKind.DIRECTORY, size=None, content_digest=None)
+                for d in dirs
+            ] + [
+                WorkspaceEntry(
+                    path=p,
+                    kind=EntryKind.FILE,
+                    size=len(files[p]),
+                    content_digest=file_digest(files[p]),
+                )
+                for p in names
+            ]
+            manifest = WorkspaceManifest(
+                manifest_version=1,
+                workspace_id=workspace_id,
+                synthetic=True,
+                root_path=f"{area_path}/{workspace_id}",
+                root_device=root.st_dev,
+                root_inode=root.st_ino,
+                entries=tuple(sorted(entries, key=lambda e: e.path)),
+                created_at_ms=now_ms,
+            )
+            signed = sign_manifest(key, manifest)
+            _create_file(root_fd, MANIFEST_FILE_NAME, dump_json(signed))
+            os.fsync(root_fd)
+            os.fsync(area_fd)
+            return signed
+        finally:
+            os.close(root_fd)
+    finally:
+        os.close(area_fd)

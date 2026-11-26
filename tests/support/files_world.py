@@ -1,7 +1,8 @@
 """Synthetic work trees and file-operation attempts for WP-08 tests.
 
-The tree is created here, by the test, as Agent Core's own synthetic tree: a
-private (0700) directory with synthetic files and the signed manifest at its root.
+Trees are created by the production ``create_synthetic_workspace`` inside a
+managed area (``<tmp_path>/area``, 0700). ``write_files`` and ``install`` build a
+tree by hand, only for tests that copy or forge one.
 """
 
 from __future__ import annotations
@@ -12,14 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from agent_core.safety.workspace import file_digest, manifest_digest, manifest_key, sign_manifest
-from agent_core.types.files import (
-    MANIFEST_FILE_NAME,
-    EntryKind,
-    SignedWorkspaceManifest,
-    WorkspaceEntry,
-    WorkspaceManifest,
-)
+from agent_core.adapters.file_broker import SyntheticFileBroker, create_synthetic_workspace
+from agent_core.safety.workspace import manifest_digest, manifest_key
+from agent_core.types.files import MANIFEST_FILE_NAME, SignedWorkspaceManifest
 from agent_core.types.records import Attempt
 from agent_core.types.safety import SecretKey
 from agent_core.types.serialization import dump_json
@@ -34,61 +30,28 @@ FILES: dict[str, bytes] = {
 READ_INPUT = '{"path":"workspace/a.txt"}'
 NEW_CONTENT = "synthetic new\n"
 WRITE_INPUT = tw.write_input("workspace/out/new.txt", content=NEW_CONTENT)
+CREATED_AT = s.NOW - 10_000
 
 
 @dataclass(frozen=True)
 class Tree:
-    root: Path
+    area: Path
+    workspace_id: str
     signed: SignedWorkspaceManifest
     digest: str
 
-
-def entries_of(files: dict[str, bytes]) -> tuple[WorkspaceEntry, ...]:
-    dirs: set[str] = set()
-    for path in files:
-        parts = path.split("/")[:-1]
-        dirs.update("/".join(parts[: i + 1]) for i in range(len(parts)))
-    entries = [
-        WorkspaceEntry(path=d, kind=EntryKind.DIRECTORY, size=None, content_digest=None)
-        for d in dirs
-    ] + [
-        WorkspaceEntry(
-            path=p, kind=EntryKind.FILE, size=len(data), content_digest=file_digest(data)
-        )
-        for p, data in files.items()
-    ]
-    return tuple(sorted(entries, key=lambda e: e.path))
+    @property
+    def root(self) -> Path:
+        return self.area / self.workspace_id
 
 
-def manifest_for(root: Path, files: dict[str, bytes], **overrides: Any) -> WorkspaceManifest:
-    info = os.lstat(root)
-    values: dict[str, Any] = {
-        "manifest_version": 1,
-        "workspace_id": "synthetic_tree",
-        "synthetic": True,
-        "root_path": str(root),
-        "root_device": info.st_dev,
-        "root_inode": info.st_ino,
-        "entries": entries_of(files),
-        "created_at_ms": s.NOW - 10_000,
-    }
-    values.update(overrides)
-    return WorkspaceManifest(**values)
-
-
-def write_files(root: Path, files: dict[str, bytes]) -> None:
-    root.mkdir(mode=0o700)
-    root.chmod(0o700)
-    for path, data in files.items():
-        target = root / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-
-
-def install(root: Path, signed: SignedWorkspaceManifest) -> None:
-    target = root / MANIFEST_FILE_NAME
-    target.write_bytes(dump_json(signed))
-    target.chmod(0o600)
+def area_of(tmp_path: Path) -> Path:
+    """The managed area: a private directory the composition root names."""
+    area = tmp_path / "area"
+    if not area.exists():
+        area.mkdir(mode=0o700)
+    area.chmod(0o700)
+    return area
 
 
 def make_tree(
@@ -98,16 +61,46 @@ def make_tree(
     files: dict[str, bytes] | None = None,
     *,
     key: SecretKey | None = None,
+    area: Path | None = None,
 ) -> Tree:
-    """A new synthetic tree with its manifest signed by the derived manifest key
-    (or by ``key``, for forgery tests)."""
-    files = dict(FILES if files is None else files)
-    root = tmp_path / name
-    write_files(root, files)
-    manifest = manifest_for(root, files)
-    signed = sign_manifest(key if key is not None else manifest_key(owner), manifest)
-    install(root, signed)
-    return Tree(root=root, signed=signed, digest=manifest_digest(signed.manifest))
+    """A new synthetic tree, its manifest signed by the derived manifest key (or by
+    ``key``, for forgery tests)."""
+    where = area if area is not None else area_of(tmp_path)
+    signed = create_synthetic_workspace(
+        area=where,
+        workspace_id=name,
+        files=dict(FILES if files is None else files),
+        key=key if key is not None else manifest_key(owner),
+        now_ms=CREATED_AT,
+    )
+    return Tree(
+        area=where, workspace_id=name, signed=signed, digest=manifest_digest(signed.manifest)
+    )
+
+
+def broker(owner: SecretKey, tree: Tree, workspace_id: str | None = None) -> SyntheticFileBroker:
+    return SyntheticFileBroker(
+        area=tree.area,
+        workspace_id=tree.workspace_id if workspace_id is None else workspace_id,
+        key=manifest_key(owner),
+    )
+
+
+def write_files(root: Path, files: dict[str, bytes]) -> None:
+    """A hand-made tree (copy and forgery tests only)."""
+    root.mkdir(mode=0o700)
+    root.chmod(0o700)
+    for path, data in files.items():
+        target = root / path
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(0o600)
+
+
+def install(root: Path, signed: SignedWorkspaceManifest) -> None:
+    target = root / MANIFEST_FILE_NAME
+    target.write_bytes(dump_json(signed))
+    target.chmod(0o600)
 
 
 def snapshot(root: Path) -> dict[str, Any]:
@@ -117,7 +110,12 @@ def snapshot(root: Path) -> dict[str, Any]:
         for name in sorted(dirs + names):
             path = Path(current) / name
             info = os.lstat(path)
-            data = path.read_bytes() if stat.S_ISREG(info.st_mode) else sorted(os.listdir(path))
+            if stat.S_ISREG(info.st_mode):
+                data: Any = path.read_bytes()
+            elif stat.S_ISDIR(info.st_mode):
+                data = sorted(os.listdir(path))
+            else:
+                data = None
             result[str(path.relative_to(root))] = (
                 stat.S_IFMT(info.st_mode),
                 data,
@@ -173,3 +171,54 @@ def history(st: lw.Setup, attempt: Attempt) -> list[Any]:
             if isinstance(t, AttemptTransition) and t.after.attempt_id == attempt.attempt_id:
                 found.append(t)
     return found
+
+
+class Spy:
+    """Records the path-taking os calls (name, path, dir_fd) while installed."""
+
+    NAMES = (
+        "open",
+        "stat",
+        "lstat",
+        "rename",
+        "replace",
+        "link",
+        "symlink",
+        "unlink",
+        "remove",
+        "rmdir",
+        "mkdir",
+        "makedirs",
+        "truncate",
+        "chmod",
+        "chown",
+        "utime",
+        "mkfifo",
+        "mknod",
+    )
+
+    def __init__(self, monkeypatch: Any) -> None:
+        import builtins
+
+        self.calls: list[tuple[str, str, Any]] = []
+        for name in self.NAMES:
+            monkeypatch.setattr(os, name, self._wrap(name, getattr(os, name)))
+        monkeypatch.setattr(builtins, "open", self._wrap("builtins.open", builtins.open))
+
+    def _wrap(self, name: str, original: Any) -> Any:
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if args:
+                first = args[0]
+                path = str(first) if isinstance(first, int) else os.fsdecode(first)
+                self.calls.append((name, path, kwargs.get("dir_fd", kwargs.get("src_dir_fd"))))
+            return original(*args, **kwargs)
+
+        return wrapper
+
+    def paths(self) -> list[str]:
+        return [p for _n, p, _d in self.calls]
+
+    def changes(self) -> list[tuple[str, str, Any]]:
+        """Calls that create, change or remove something."""
+        reading = {"open", "stat", "lstat", "builtins.open"}
+        return [c for c in self.calls if c[0] not in reading]

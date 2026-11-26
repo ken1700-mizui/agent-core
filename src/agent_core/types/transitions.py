@@ -38,6 +38,7 @@ class AbortReason(StrEnum):
     # WP-08: refused before the start by the file broker's preflight.
     WORKSPACE_REJECTED = "WORKSPACE_REJECTED"
     SAFE_FILE_ACCESS_UNAVAILABLE = "SAFE_FILE_ACCESS_UNAVAILABLE"
+    WORKSPACE_BUSY = "WORKSPACE_BUSY"
 
 
 class ReconciledOutcome(StrEnum):
