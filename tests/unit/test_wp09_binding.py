@@ -197,13 +197,19 @@ def test_required_amount_is_checked_again_at_issue(st: Any) -> None:
     attempt = lw.intent(st, lw.reserve(st, lw.fixed_attempt(st, step, scopes, costly=True), 300))
     st.journal.close()
     conn = sqlite3.connect(st.path)
+    # Row and ledger entries together, so the open-time check (WP09-R07) accepts
+    # the database and the permit issue's own re-check of the amount is reached.
     conn.execute(
         "UPDATE reservations SET reserved_micro = 100, hold_micro = 100 WHERE reservation_id = ?",
         (str(attempt.reservation_id),),
     )
+    conn.execute(
+        "UPDATE ledger_entries SET hold_micro = 100 WHERE reservation_id = ? AND hold_micro = 300",
+        (str(attempt.reservation_id),),
+    )
     conn.commit()
     conn.close()
-    st2 = st.reopen(verify=False)
+    st2 = st.reopen()
     try:
         with pytest.raises(PermitRejectedError, match="RESERVATION_INVALID"):
             lw.issue(st2, st2.sm.state.attempts[attempt.attempt_id])

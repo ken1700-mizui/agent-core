@@ -65,6 +65,7 @@ from agent_core.types.errors import (
     CostBasisMissingError,
     CounterCapExceededError,
     DuplicateUsageReportError,
+    LedgerInconsistencyError,
     LedgerKeyMissingError,
     LedgerPairingError,
     OwnerAuthorizationError,
@@ -75,7 +76,7 @@ from agent_core.types.errors import (
     ReservationReuseError,
     ReservationStateError,
 )
-from agent_core.types.events import EventDraft
+from agent_core.types.events import Event, EventDraft
 from agent_core.types.ledger import (
     OWNER_OPS,
     STANDALONE_OPS,
@@ -1456,10 +1457,20 @@ def _revocation_gen(cur: sqlite3.Cursor) -> int:
 
 
 def _bump(cur: sqlite3.Cursor, *, tenants: tuple[str, ...]) -> None:
-    """Revocation (E 3.3): one new generation; the listed tenants' access epochs too."""
-    cur.execute(
-        "UPDATE revocation SET revocation_gen = ? WHERE singleton = 1",
-        (checked_add(_revocation_gen(cur), 1),),
+    """Revocation (E 3.3): one new generation; the listed tenants' access epochs too.
+    Each generation is audited, so a restart can check it never went back (R07)."""
+    generation = checked_add(_revocation_gen(cur), 1)
+    cur.execute("UPDATE revocation SET revocation_gen = ? WHERE singleton = 1", (generation,))
+    clock = cur.execute("SELECT high_water_ms FROM ledger_clock WHERE singleton = 1").fetchone()
+    _audit(
+        cur,
+        0 if clock is None else int(clock[0]),
+        "REVOCATION_GEN",
+        {"gen": str(generation)},
+        "REVOKE",
+        None,
+        None,
+        None,
     )
     for tenant in tenants:
         cur.execute(
@@ -2561,4 +2572,246 @@ def _stop_run(cur: sqlite3.Cursor, run_id: str, now_ms: int) -> None:
         return
     _stop_scope(
         cur, StopScope(op="stop_scope", scope_type=StopScopeType.RUN, scope_id=run_id), now_ms
+    )
+
+
+# ================================================================ open-time consistency (WP09-R07)
+
+# Reservation states an attempt state allows (E 4.1, E 38). After a restart the
+# recovery may already have moved in-flight reservations to UNKNOWN.
+_SETTLED: Final = frozenset({"UNKNOWN", "RECONCILED", "USAGE_REPORTED"})
+_ATTEMPT_RESERVATION: Final = {
+    "CONTENT_FIXED": frozenset({"ID_ALLOCATED", "VOID"}),
+    "POLICY_ALLOWED": frozenset({"ID_ALLOCATED", "VOID"}),
+    "APPROVAL_PENDING": frozenset({"ID_ALLOCATED", "VOID"}),
+    "APPROVED": frozenset({"ID_ALLOCATED", "VOID"}),
+    "BUDGET_RESERVED": frozenset({"RESERVED"}),
+    "INTENT_RECORDED": frozenset({"RESERVED"}),
+    "PERMIT_ISSUED": frozenset({"RESERVED"}),
+    "PERMIT_CONSUMED": frozenset({"CONSUMED", "UNKNOWN", "RECONCILED"}),
+    "DISPATCH_AUTHORIZED": frozenset({"CONSUMED", "UNKNOWN", "RECONCILED"}),
+    "DISPATCH_STARTED": frozenset({"ACTIVE"}) | _SETTLED,
+    "COMPLETED": frozenset({"ACTIVE"}) | _SETTLED,
+    "FAILED_DEFINITE": frozenset({"ACTIVE"}) | _SETTLED,
+    "OUTCOME_UNKNOWN": frozenset({"CONSUMED", "ACTIVE"}) | _SETTLED,
+    "ABORTED_BEFORE_DISPATCH": frozenset(
+        {"ID_ALLOCATED", "VOID", "RESERVED", "RELEASED", "CONSUMED"}
+    )
+    | _SETTLED,
+}
+
+
+_CONSUMED_OR_LATER: Final = frozenset(
+    {"PERMIT_CONSUMED", "DISPATCH_AUTHORIZED", "DISPATCH_STARTED", "COMPLETED", "FAILED_DEFINITE"}
+)
+
+
+def _inconsistent(reason: str) -> LedgerInconsistencyError:
+    return LedgerInconsistencyError(reason)
+
+
+def _journal_view(cur: sqlite3.Cursor) -> dict[str, dict[str, Any]]:
+    """The runtime chain as the journal's own events record it (last snapshot wins)."""
+    view: dict[str, dict[str, Any]] = {"tasks": {}, "runs": {}, "steps": {}, "attempts": {}}
+    for (body,) in cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq"):
+        event = Event.model_validate_json(body)
+        if not isinstance(event.payload, RuntimePayload):
+            continue
+        for t in event.payload.transitions:
+            if isinstance(t, TaskTransition):
+                view["tasks"][str(t.after.task_id)] = t.after
+            elif isinstance(t, RunTransition):
+                view["runs"][str(t.after.run_id)] = t.after
+            elif isinstance(t, StepTransition):
+                view["steps"][str(t.after.step_id)] = t.after
+            elif isinstance(t, AttemptTransition):
+                view["attempts"][str(t.after.attempt_id)] = t.after
+    return view
+
+
+def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
+    attempts = {
+        r[0]: (r[1], r[2])
+        for r in cur.execute("SELECT attempt_id, step_id, state FROM rt_attempts")
+    }
+    expected = {k: (str(a.step_id), a.state.value) for k, a in view["attempts"].items()}
+    runs = {
+        r[0]: (r[1], r[2], bool(r[3]))
+        for r in cur.execute("SELECT run_id, task_id, status, cancel_requested FROM rt_runs")
+    }
+    expected_runs = {
+        k: (str(r.task_id), r.status.value, r.cancel_requested) for k, r in view["runs"].items()
+    }
+    steps = {r[0]: r[1] for r in cur.execute("SELECT step_id, run_id FROM rt_steps")}
+    expected_steps = {k: str(s.run_id) for k, s in view["steps"].items()}
+    tasks = {r[0] for r in cur.execute("SELECT task_id FROM rt_tasks")}
+    if (attempts, runs, steps, tasks) != (
+        expected,
+        expected_runs,
+        expected_steps,
+        set(view["tasks"]),
+    ):
+        raise _inconsistent("MIRROR_MISMATCH")
+
+
+def _check_reservations(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
+    rows = {
+        r[0]: r[1:]
+        for r in cur.execute(
+            "SELECT reservation_id, attempt_id, state, permit_id, receipt_id FROM reservations"
+        )
+    }
+    seen: set[str] = set()
+    for attempt in view["attempts"].values():
+        if attempt.reservation_id is None:
+            continue
+        found = rows.get(str(attempt.reservation_id))
+        allowed = _ATTEMPT_RESERVATION.get(attempt.state.value)
+        if found is None or allowed is None or found[0] != str(attempt.attempt_id):
+            raise _inconsistent("RESERVATION_MISMATCH")
+        if found[1] not in allowed:
+            raise _inconsistent("RESERVATION_STATE_MISMATCH")
+        # The ledger binds permit and receipt at consumption; from then on both agree.
+        consumed = attempt.state.value in _CONSUMED_OR_LATER
+        for held, journaled in ((found[2], attempt.permit_id), (found[3], attempt.receipt_id)):
+            if (held is not None or consumed) and held != (
+                None if journaled is None else str(journaled)
+            ):
+                raise _inconsistent("RESERVATION_PERMIT_MISMATCH")
+        seen.add(str(attempt.reservation_id))
+    if seen != set(rows):
+        raise _inconsistent("RESERVATION_WITHOUT_ATTEMPT")
+
+
+def _check_permits(cur: sqlite3.Cursor) -> None:
+    permits = {
+        r[0]: (r[1], r[2]) for r in cur.execute("SELECT permit_id, attempt_id, state FROM permits")
+    }
+    receipts = {r[0]: r[1] for r in cur.execute("SELECT permit_id, attempt_id FROM receipts")}
+    for permit_id, (attempt_id, state) in permits.items():
+        if (state == PermitState.CONSUMED.value) != (permit_id in receipts):
+            raise _inconsistent("PERMIT_RECEIPT_MISMATCH")
+        if permit_id in receipts and receipts[permit_id] != attempt_id:
+            raise _inconsistent("PERMIT_RECEIPT_MISMATCH")
+    if set(receipts) - set(permits):
+        raise _inconsistent("PERMIT_RECEIPT_MISMATCH")
+    uses = cur.execute(
+        "SELECT a.approval_id, a.uses, (SELECT COUNT(*) FROM decisions d JOIN permits p "
+        "ON p.attempt_id = d.attempt_id WHERE d.approval_id = a.approval_id "
+        "AND p.state = 'CONSUMED') FROM approvals a"
+    ).fetchall()
+    if any(int(r[1]) != int(r[2]) for r in uses):
+        raise _inconsistent("APPROVAL_USES_MISMATCH")
+
+
+def _check_entries(cur: sqlite3.Cursor) -> None:
+    for reservation_id, hold, spent, adjust in cur.execute(
+        "SELECT reservation_id, hold_micro, spent_micro, adjust_micro FROM reservations"
+    ).fetchall():
+        last = cur.execute(
+            "SELECT hold_micro, spent_micro FROM ledger_entries WHERE reservation_id = ? "
+            "ORDER BY entry_seq DESC LIMIT 1",
+            (reservation_id,),
+        ).fetchone()
+        deltas = cur.execute(
+            "SELECT delta_micro FROM ledger_entries WHERE reservation_id = ? "
+            "AND kind IN ('CORRECTION', 'UNEXPLAINED')",
+            (reservation_id,),
+        ).fetchall()
+        if last is None or (int(last[0]), int(last[1])) != (int(hold), int(spent)):
+            raise _inconsistent("RESERVATION_ENTRIES_MISMATCH")
+        if checked_sum(int(d[0]) for d in deltas) != int(adjust):
+            raise _inconsistent("RESERVATION_ENTRIES_MISMATCH")
+
+
+def _audit_rows(cur: sqlite3.Cursor) -> list[tuple[Any, ...]]:
+    return cur.execute(
+        "SELECT audit_seq, at_ms, action, targets, decision, reason, policy_version, "
+        "access_epoch, prev_hash, record_hash FROM audit_log ORDER BY audit_seq"
+    ).fetchall()
+
+
+def _check_audit(cur: sqlite3.Cursor, rows: list[tuple[Any, ...]]) -> None:
+    prev: str | None = None
+    for index, row in enumerate(rows, start=1):
+        seq, at_ms, action, targets, decision, reason, version, epoch, prev_hash, digest = row
+        payload = json.dumps(
+            [at_ms, action, targets, decision, reason, version, epoch], separators=(",", ":")
+        ).encode()
+        expected = (
+            "sha256:"
+            + hashlib.sha256(
+                AUDIT_HASH_DOMAIN + (prev or "").encode() + b"\x00" + payload
+            ).hexdigest()
+        )
+        if seq != index or prev_hash != prev or digest != expected:
+            raise _inconsistent("AUDIT_CHAIN_BROKEN")
+        prev = digest
+
+
+def _check_stop_and_revocation(cur: sqlite3.Cursor, rows: list[tuple[Any, ...]]) -> None:
+    stops = cur.execute("SELECT scope_type, scope_id, stop_seq, status FROM stop_state").fetchall()
+    if not any(r[0] == "GLOBAL" and r[1] == "global" for r in stops):
+        raise _inconsistent("STOP_STATE_MISMATCH")
+    by_scope: dict[str, list[str]] = {}
+    generations: list[str] = []
+    for row in rows:
+        action, targets = row[2], json.loads(row[3])
+        if action in ("STOP", "RESUME"):
+            by_scope.setdefault(targets.get("scope", ""), []).append(action)
+        if action == "REVOCATION_GEN":
+            generations.append(targets.get("gen", ""))
+    for scope_type, scope_id, stop_seq, status in stops:
+        actions = by_scope.get(f"{scope_type}:{scope_id}", [])
+        if int(stop_seq) != actions.count("STOP"):
+            raise _inconsistent("STOP_STATE_MISMATCH")
+        last = actions[-1] if actions else None
+        if status == StopStatus.STOPPED.value and last != "STOP":
+            raise _inconsistent("STOP_STATE_MISMATCH")
+        if status == StopStatus.RUNNING.value and last not in (None, "RESUME"):
+            raise _inconsistent("STOP_STATE_MISMATCH")
+    gen = _revocation_gen(cur)
+    if gen != len(generations) or (generations and generations[-1] != str(gen)):
+        raise _inconsistent("REVOCATION_MISMATCH")
+
+
+def verify_consistency(cur: sqlite3.Cursor) -> None:
+    """Open-time checks of the journal against the ledger (WP09-R07). Any mismatch
+    raises ``LedgerInconsistencyError``: the journal is not opened, nothing runs.
+
+    Not a full Recovery Engine: it detects disagreement, it does not repair it, and
+    it cannot detect a consistent rewrite by someone holding the database."""
+    view = _journal_view(cur)
+    _check_mirror(cur, view)
+    _check_reservations(cur, view)
+    _check_permits(cur)
+    _check_entries(cur)
+    rows = _audit_rows(cur)
+    _check_audit(cur, rows)
+    _check_stop_and_revocation(cur, rows)
+
+
+def revoke_stale(cur: sqlite3.Cursor, new_owner_epoch: int, wall_ms: int) -> None:
+    """At open, under the new owner epoch: every unused permit and receipt of an
+    earlier owner can never be used (WP09-R07). Consumed and started operations
+    stay as they are (held, to be reconciled)."""
+    now = effective_now(cur, wall_ms)
+    stale_permits = cur.execute("SELECT COUNT(*) FROM permits WHERE state = 'ISSUED'").fetchone()[0]
+    stale_receipts = cur.execute(
+        "SELECT COUNT(*) FROM receipts WHERE state IN ('ISSUED', 'CLAIMED')"
+    ).fetchone()[0]
+    if not stale_permits and not stale_receipts:
+        return
+    cur.execute("UPDATE permits SET state = 'REVOKED' WHERE state = 'ISSUED'")
+    cur.execute("UPDATE receipts SET state = 'REVOKED' WHERE state IN ('ISSUED', 'CLAIMED')")
+    _bump(cur, tenants=())
+    _audit(
+        cur,
+        now,
+        "RESTART_REVOKED",
+        {"owner_epoch": str(new_owner_epoch)},
+        "REVOKE",
+        None,
+        None,
+        None,
     )

@@ -567,3 +567,10 @@ class CostBasisMissingError(CostError):
     price for the model, or no recorded descriptor): nothing is reserved (WP09-R01)."""
 
     code = "COST_BASIS_MISSING"
+
+
+class LedgerInconsistencyError(JournalCorruptionError):
+    """At open, the journal's runtime events and the ledger disagree (WP09-R07).
+    The journal is refused unchanged; nothing is executed."""
+
+    code = "LEDGER_INCONSISTENT"

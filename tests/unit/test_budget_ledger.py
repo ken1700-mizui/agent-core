@@ -409,10 +409,13 @@ def test_overflowing_totals_are_refused_and_nothing_is_stored(st: Any) -> None:
     second = _next_step_attempt(st, step, first, micro=MAX_INT64)
     st.journal.close()
     conn = sqlite3.connect(st.path)
-    conn.execute(
-        "UPDATE reservations SET hold_micro = ? WHERE reservation_id = ?",
-        (MAX_INT64 - 10, str(first.reservation_id)),
-    )
+    # Row and its last ledger entry together, so the open-time check (WP09-R07)
+    # accepts the database and the activation's own overflow check is reached.
+    for table, key in (("reservations", "reservation_id"), ("ledger_entries", "reservation_id")):
+        conn.execute(
+            f"UPDATE {table} SET hold_micro = ? WHERE {key} = ?",  # noqa: S608 (test constant)
+            (MAX_INT64 - 10, str(first.reservation_id)),
+        )
     conn.commit()
     conn.close()
     st2 = st.reopen()

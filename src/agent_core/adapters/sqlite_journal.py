@@ -844,6 +844,8 @@ def _initialize_verify_and_claim(
             except (InvalidIdError, TypeError) as exc:
                 raise JournalCorruptionError("stored tenant_id is invalid") from exc
             _verify_tenant(cur, tenant_id)
+        # The ledger must agree with the verified journal (WP09-R07).
+        sqlite_ledger.verify_consistency(cur)
         owner_rows = cur.execute("SELECT epoch FROM runtime_owner").fetchall()
         if len(owner_rows) != 1:
             raise JournalCorruptionError("runtime_owner must have exactly one row")
@@ -856,6 +858,8 @@ def _initialize_verify_and_claim(
             "WHERE singleton = 1",
             (new_epoch, instance_id, acquired_at),
         )
+        # Unused permits and receipts of earlier owners can never run (WP09-R07).
+        sqlite_ledger.revoke_stale(cur, new_epoch, acquired_at)
         conn.execute("COMMIT")
     except BaseException:
         if conn.in_transaction:

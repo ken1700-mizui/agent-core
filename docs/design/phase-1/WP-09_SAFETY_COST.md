@@ -1,6 +1,6 @@
 # WP-09：Safety、Cost、Permit と Receipt（実装の記録）
 
-> 文書の状態：**DRAFT**（ChatGPT のレビューを待っている）　作成日：2026-11-26
+> 文書の状態：**PROVISIONAL**（レビューは 88/100 の条件付き合格。WP09-R01〜R07 を修正した。14章）　作成日：2026-11-26
 >
 > - この文書は、WP-09（A：Safety、B：Cost、C：Permit・Receipt・停止）で実装した内容と、**設計資料に書かれていなかったために、WP-09 で決めたこと**を記録する。
 > - 正本の規則は `E_INTEGRATION.md` の28章に従う。この文書は、設計資料を上書きしない。
@@ -343,3 +343,156 @@ AUDIT-01 は、**Phase 1 の合成の範囲での実装と試験**を記録し�
 - 価格表とツールの見積もりを台帳に登録し、見積もりの入力そのものを台帳の側で決めること。今は、Runtime の側が渡す入力から必要額を計算し直すだけである。
 - 実際の BillingScheme での「追加の費用がない」ことの判断、外部の請求との照合、独立した台帳（Phase 3A 以降）。
 - 月をまたぐ Run（AUDIT-02）。Phase 1 は合成の期間の ID だけ。
+
+## 14. レビューの指摘への対応（WP09-R01〜R07）
+
+この章は、1〜13章の記述より優先する。特に、6.4 の `verify_dispatch`（読み取りだけの確認）はなくした。また、`ActivateReservation` の見積もり、`AllocateReservation` の範囲の指定、`ReleaseReservation` の `not_dispatched_ref`、`ReportUsage` の自由な Usage も、なくした。
+
+### 14.1 TDD の記録
+
+- **WP-09A では、TDD の順序を守れなかった。** 実装を試験より先に書き、Red は、後からパッケージを外して確かめただけである。この記録は残す。
+- 今回は、3つの段階のそれぞれで、次の順に進めた。
+  1. 再現の試験を先に書く。
+  2. Red を確かめる。第1段階と第2段階は、新しい型がないことによる収集の失敗。第3段階は、エラーの型だけを先に加え、改ざんした DB が開けてしまうことによる、振る舞いの失敗（13件中11件）。
+  3. 実装する。
+- 実装の前の欠陥は、今のコードを調べて記録した（下の表の「修正前」）。
+
+### 14.2 各指摘の修正
+
+| 指摘 | 修正前（実際のコードで確かめた） | 修正後 | 再現の試験 |
+|---|---|---|---|
+| R01 見積もり | `ActivateReservation.estimate` を呼び出し側が渡し、台帳はそれを計算し直すだけだった | 見積もりの根拠（`cost_basis`）を ActionDescriptor（版 2）に入れた。必要額は、台帳が根拠と、オーナーが導入した合成の価格表から計算する | `test_the_caller_cannot_supply_the_estimate`、`test_tool_required_amount_comes_from_the_trusted_manifest`、`test_model_required_amount_comes_from_the_owner_price_table`、`test_a_model_call_cannot_use_a_tool_estimate`、`test_the_cost_basis_must_match_the_manifest_and_the_policy`、`test_required_amount_is_checked_again_at_issue` |
+| R02 Task の予算 | Task の `budget_total` を見ていなかった。実行の時間の窓を設定し直すと、開始の時刻が今に戻った。照合で、訂正の額が消えた | 次の3つを行う。(1) Task の予算と上限を、Journal から台帳に写す。(2) 台帳の上限は、Task の値を超えない。(3) 費用を「元の費用」と「調整の額」に分けた | `test_the_task_budget_total_bounds_a_larger_ledger_cap`、`test_task_non_monetary_caps_bound_the_ledger`、`test_setting_the_run_window_again_does_not_reset_elapsed_time`、`test_reconciliation_keeps_earlier_corrections`、`test_a_correction_beyond_the_budget_is_an_overrun` |
+| R03 実行の開始 | `verify_dispatch` は読み取りだけだった。Receipt がないと `_use_receipt` が何もせずに戻った。Receipt に `owner_epoch` がなかった | 合成の実行ゲートを置いた。Receipt の取得と実行の開始を、トランザクションの中で確定する | `test_a_receipt_is_bound_to_the_current_owner`、`test_a_missing_receipt_record_refuses_the_start`、`test_one_receipt_starts_execution_once`、`test_the_actual_operation_must_match_at_execution`、`test_a_stop_right_after_the_claim_prevents_the_start` |
+| R04 未実行の証明と費用 | 任意の Digest で、消費済みの予約を解放できた。呼び出し側が自由な Usage を報告できた | ゲートの MAC 付きの報告だけを受け付ける。費用は台帳が計算する。未確定の費用があれば、正常に完了できない | `test_an_arbitrary_digest_does_not_release_a_consumed_reservation`、`test_a_forged_or_foreign_not_dispatched_report_is_refused`、`test_usage_needs_a_trusted_execution_report`、`test_the_cost_comes_from_the_synthetic_billing`、`test_run_and_task_cannot_complete_with_unsettled_costs` |
+| R05 停止、キャンセル、期限 | `CANCELLING` で Run を停止しなかった。実行の時間の窓は、予約のときだけ確かめた。時計の逆行で、期限が延びた。オーナーの MAC 付きの操作を、再送できた | 14.4 | `test_cancelling_a_run_stops_it`、`test_lowering_a_budget_cap_revokes_outstanding_permits`、`test_an_expired_run_window_refuses_consumption`、`test_a_clock_moving_back_does_not_extend_a_permit`、`test_an_old_owner_batch_cannot_be_replayed` |
+| R06 範囲と対象 | 予算の範囲（Task、ユーザー、期間）と `action_kind` を、呼び出し側が渡した。対象の資源も呼び出し側が渡し、空にできた | 14.5 | `test_budget_scopes_come_from_trusted_state`、`test_targets_are_derived_from_the_arguments`、`test_a_descriptor_with_emptied_targets_is_not_recorded`、`test_a_descriptor_outside_the_attempt_chain_is_not_recorded`、`test_the_action_kind_comes_from_the_descriptor` |
+| R07 復元の整合 | Journal と台帳が食い違う DB でも開けた | 開くときに確かめ、食い違えば開かない。古い所有者の未使用の Permit と Receipt を失効させる | `tests/unit/test_wp09_restart.py` の13件 |
+
+### 14.3 信頼する見積もり（WP09-R01）
+
+- **ツール：** 必要額は、登録簿の信頼する Manifest の `cost_estimate`。PDP は、Descriptor の根拠が Manifest と一致しなければ拒否する。
+- **モデル：** 必要額は、次の値から台帳が計算する。
+  - オーナーが導入した合成の価格表（`InstallPriceTable`。`status=test`。一度導入した版は変えられない）。Policy が、使う価格表を名指しする。
+  - 対象のモデル。
+  - 要求の記録と、描画した入力から確かめた上限。入力は描画した入力の UTF-8 のバイト数で、トークンの数の保守的な上限とする。出力は要求の `max_output_tokens`。
+  - トークンの計測（WP-14）は前倒ししていない。
+- 呼び出し側は、価格も必要額も渡せない。モデルの呼び出しに、ツールの根拠を使うことは、型で拒否する。
+- 根拠（価格表がない、モデルの価格がない、判定の記録がない）がなければ、予約しない（`CostBasisMissingError`）。
+- 必要額 ≦ 予約額 ≦ `cost_cap` を、予約、Permit の発行、消費で確かめる。
+
+### 14.4 実行のゲート、報告、停止（WP09-R03〜R05）
+
+- **ゲート**（`agent_core.runtime.execution_gate.SyntheticExecutionGate`）。プロセスの中の合成の PEP で、次の順に進む。
+  1. `claim`：実際の操作（引数）から Descriptor を作り直し、記録した Descriptor と一致すれば、Receipt を `CLAIMED` にする。
+  2. `start`：同じトランザクションで、Receipt を1回だけ `USED` にする。停止、失効の世代、所有者の epoch、ゲートのインスタンス、期限、経過時間、承認を、もう一度すべて確かめる。
+  3. コールバックを1回だけ呼ぶ。渡す `DispatchAuthorization` は情報で、どこにも戻せない。
+  4. `finish`：MAC 付きの結果の報告で記録する。コールバックが例外を出したら、結果不明にする（押さえた額は保つ）。
+  - 停止はゲートのロックを通るので、同じプロセスの中では、開始の確定とコールバックの間に、停止が入らない。コールバックからのゲートの再入は、`GATE_BUSY` で拒否する。
+  - Journal の SQLite の接続は1つのスレッドのものなので、ほかのスレッドからは使えない（安全側に失敗する）。
+- **Receipt** に、消費したときの `owner_epoch` を入れた。再起動の後は、古い PEP の ID で示しても拒否する。Receipt の記録がなければ、開始しない。
+- **未実行の報告：** ゲートが、P1 の鍵の MAC を付ける。次のすべてを満たさなければ、消費済みの予約を解放しない。
+  - Receipt、Permit、Attempt、予約、今の所有者の epoch、ゲートのインスタンスに結び付くこと。
+  - 開始されていない Receipt であること。
+  - 報告が、まだ使われていないこと。
+- **費用の報告：** ゲートの MAC 付きの結果の報告だけを受け付ける。
+  - 費用は、台帳が合成の課金の規則で計算する。ツールは Manifest の見積もり。モデルは、既知のトークンの数 × 価格表の単価で、切り上げる。
+  - 述べた費用が、計算した額と違えば拒否する。
+  - 価格表の `final_usage_is_complete`（合成の BillingScheme）が真で、報告が最終のときだけ、残りを解放する。そうでなければ、押さえた額を保つ（`UNKNOWN`）。
+- **照合、訂正、説明できない差額** は、オーナーの経路だけで受け付ける。
+- **正常な完了の禁止：** 未確定の費用（`RESERVED`、`CONSUMED`、`ACTIVE`、`UNKNOWN`、または押さえた額がある）が残る Run と Task は、`COMPLETED` にできない。
+- **停止とキャンセル：**
+  - Run の `CANCELLING`（と終わりの状態）は、同じトランザクションで Run を停止する（K1）。キャンセルした Run は、再開できない。
+  - 予算、回数、実行の時間の窓の上限を下げたら、その範囲の発行済みの Permit と Receipt を失効させる。
+- **期限：** 実行の時間の窓と、Grant の期限を、発行、消費、取得、開始のすべてで確かめる。承認と Receipt の期限は、両方を守る。
+- **時計：** 台帳は、使った最も遅い時刻を記録する（高水位）。壁時計が戻っても、期限は延びず、経過時間も戻らない。
+- **オーナーの操作の再送：** オーナーの操作のまとまりに、増えていく番号（`owner_seq`）を付け、永続化した。同じものも古いものも、二度と受け付けない。承認は、`approval_id` で一度だけ記録できる（変えていない）。
+
+### 14.5 範囲と対象の結び付け（WP09-R06）
+
+- **Journal の写し：** Task の予算と上限、Run、Step、Attempt の親子と状態を、イベントと同じトランザクションで、台帳の表（`rt_*`）に写す。台帳は、呼び出し側の主張ではなく、この写しだけを読む。
+- **予算の範囲：** 予約の ID の確保（`AllocateReservation`）は、範囲を持たない。
+  - Task、Run、Step、テナントは、写しから取る。
+  - ユーザー、合成の期間、実験は、Run の Grant から取る。
+  - 呼び出し側は、別の範囲を選べない。
+- **操作の種類**（`action_kind`）は、記録した Descriptor から取る。
+- **対象の資源：** Manifest の入力のスキーマで、資源を指す欄（`FieldSpec.resource`。必須の文字列）に印を付ける。信頼する Descriptor の作り手が、その引数から対象を導く。
+  - 資源を宣言したツールには、その欄が必須である。
+  - 呼び出し側は対象を渡せず、空にもできない。
+  - 実際のパスの安全な解決は、WP-08 で行う。
+- **判定の記録：** 台帳は、次の2つを確かめる。
+  - Descriptor が、その Attempt の Journal の親子（Step、Run、Task、テナント）に属すること。
+  - 実際の内容（引数、または要求の記録と描画した入力）から作り直した Descriptor と、完全に一致すること。
+- 承認、Intent、Permit、Receipt は、同じ操作（`action_hash`、Attempt、予約）に属することを、それぞれの時点で確かめる。
+
+### 14.6 復元の時の整合（WP09-R07）
+
+Journal を開くとき、Journal の検証の後、所有者の epoch を取る前に、同じトランザクションで次を確かめる。1つでも外れれば、開かない（`LedgerInconsistencyError`）。ファイルは変えない（試験で、バイト列が同じことを確かめた）。
+
+1. Journal のイベントから求めた、Task、Run、Step、Attempt の状態と、台帳の写し。
+2. Attempt の状態と、予約の状態の対応。消費の後は、Permit と Receipt の結び付きも見る。
+3. 消費した Permit と、Receipt の1対1の対応。
+4. 承認の使用の回数と、その承認で消費した Permit の数。
+5. 予約の、押さえている額、費用、調整の額と、台帳のエントリー。
+6. 必須の監査の記録の、ハッシュの連鎖。連番の抜け（削除）と、内容の変更を見つける。
+7. 停止の状態。全体の項目があること。`stop_seq` と停止の監査の数。状態と、最後の停止や再開の監査の一致。
+8. 失効の世代と、その監査の記録。巻き戻りを見つける。
+
+- 確かめた後、新しい所有者の epoch で、古い所有者の未使用の Permit と Receipt を、すべて失効させる（`RESTART_REVOKED`）。消費済み、開始済みの操作は、そのまま保つ（押さえた額は保ち、照合を待つ）。
+- **主張しないこと：** これは、食い違いを見つけるだけで、直さない。DB を持つ者が、すべてを矛盾なく書き換えたことは、見つけられない。完全な Recovery Engine、独立した証人、バックアップは、後の WP と Phase に残した。
+
+### 14.7 トランザクションと、実行のゲートの境界
+
+| 境界 | 一体として確定すること | 一体にできないこと |
+|---|---|---|
+| Journal のトランザクション（`BEGIN IMMEDIATE`） | 次のすべて。どれかが失敗すれば、すべて取り消す。head と所有者の照合、写し、台帳の操作、監査、イベント、時計の高水位、オーナーの操作の番号 | — |
+| 実行のゲート（プロセスの中のロック） | 開始の確定（`USED`）から、コールバックの呼び出しまで。停止も同じロックを通る | DB の記録と、実際の操作（OS のファイル操作など）。**完全に原子的にはできない** |
+| 異常終了 | 開始の確定の直前に止まった場合、何も開始されていない（消費済みのまま。生きているゲートの報告がなければ、解放しない）。開始の確定の後に止まった場合、結果不明として扱う（`DISPATCH_STARTED` → 復旧で `UNKNOWN`。押さえた額は保つ） | 開始したかどうかを、後から確かめる方法はない（実際の操作は WP-08） |
+
+- 実際のプロセスの停止の試験：子のプロセスで、開始を確定した直後に `os._exit` で止めた。親のプロセスで、次を確かめた。
+  - `DISPATCH_STARTED`、Receipt の `USED`、予約の `ACTIVE` が残ること。
+  - 未実行の報告を拒否すること（`ALREADY_STARTED`）。
+  - 復旧で `UNKNOWN` になり、押さえた額が保たれること。
+
+### 14.8 AUDIT-01 の再検証
+
+| 条件 | 結果 |
+|---|---|
+| ID の確保だけでは、予算も実行の権限も生じない | 成功（変えていない） |
+| 予約の額は、**信頼する必要額**以上、`cost_cap` 以下 | 成功。必要額の入力は、信頼する Manifest、またはオーナーの価格表と、確かめた上限から決める。呼び出し側は入力を渡せない（14.3） |
+| 予約に失敗したら、実行しない | 成功 |
+| 内容、費用の上限、Attempt、**見積もりの根拠**を変えると、`action_hash` が変わり、承認が無効になる | 成功（根拠が `action_hash` に入る） |
+| 発行と消費のときに、承認、Descriptor、予約、必要額が一致する | 成功 |
+| 古い ID の再使用、二重の予約、付け替えを拒否する | 成功 |
+
+AUDIT-01 は、Phase 1 の合成の範囲で、実装と試験を記録した。実 API での検証（Phase 3A 以降）は含まない。
+
+### 14.9 Journal の形式の版
+
+- 形式の版を **5** にした。版 5 で、写し、価格表、回数の使用、費用の分割、使用済みの未実行の報告、時計の高水位、オーナーの操作の番号を加えた。
+- 版 1〜4 のファイルは拒否する。移行も削除もしない（Phase 1 のファイルは、合成の試験のデータだけ）。
+- ActionDescriptor は版 2 にした。版 1 は受け付けない。
+
+### 14.10 試験の数
+
+| 段階 | 追加 | 合計 |
+|---|---|---|
+| 第1段階（R01・R02・R06） | 22 | 1447 |
+| 第2段階（R03・R04・R05） | 25（ゲートなど 24、プロセスの停止 1） | 1472 |
+| 第3段階（R07） | 13 | 1485 |
+
+- 既存の試験のうち、台帳の行を直接作っていた単体の試験を書き直した。費用と解放の報告がゲートの MAC 付きの報告だけになったため、Journal とゲートの経路を通すようにした。確かめる内容は変えていない。
+- 開くときの検査で、改ざんした DB が開けなくなったため、次の試験を直した。
+  - 2件は、改ざんする値を、台帳のエントリーと揃えた。オーバーフローの検査と、発行のときの必要額の再確認に届かせるためである。
+  - 3件は、期待する状態を直した。再起動の後の、古い Permit と Receipt を `REVOKED` とした。
+- 実際の SQLite の競合の試験と、実際のプロセスの停止の試験は、残して、加えた。
+
+### 14.11 残る制約（主張しないこと）
+
+- 実行のゲートは、プロセスの中の合成のものである。DB の記録と実際の操作の原子性はない。開始の直前と直後の異常終了は、結果不明として保守的に扱う。
+- ゲートの報告の MAC と、P1 の Permit の鍵は、同じプロセスの中にある。別のプロセスの PEP、Lease、OS の隔離、停止の状態のファイルの署名は、後の段階。
+- 合成の課金の規則と価格表だけ。実際の請求との照合と、独立した台帳は、Phase 3A 以降。
+- トークンの上限は、描画した入力のバイト数による保守的な値。実際の計測は WP-14。
+- 対象の資源のパスの安全な解決（リンク、ルートの外）は、WP-08。
+- 開くときの整合の検査は、食い違いを見つけるだけで、矛盾のない書き換えは見つけられない。
+- 承認とオーナーの操作の MAC は、対称鍵。別の装置での署名は、後の段階。

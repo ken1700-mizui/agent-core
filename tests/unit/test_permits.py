@@ -647,8 +647,10 @@ def test_commit_outcome_unknown_requires_a_reload(st: Any, monkeypatch: pytest.M
         lw.consume(st, attempt, op)
     st2 = st.reopen()
     try:
-        # The commit did not happen: ledger and journal agree (nothing consumed).
-        assert st2.journal.permit_state(attempt.permit_id) is PermitState.ISSUED
+        # The commit did not happen: ledger and journal agree (nothing consumed). The
+        # unused permit of the earlier owner is revoked when the journal opens (R07).
+        assert st2.journal.permit_state(attempt.permit_id) is PermitState.REVOKED
+        assert st2.journal.reservation(attempt.reservation_id).state is R.RESERVED
         assert st2.sm.state.attempts[attempt.attempt_id].state is A.PERMIT_ISSUED
     finally:
         st2.journal.close()

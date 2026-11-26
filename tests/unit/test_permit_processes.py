@@ -69,7 +69,8 @@ def test_process_stop_right_after_consumption(prepared: Any) -> None:
         assert consumed.state is A.PERMIT_CONSUMED
         assert st2.journal.head(b.TENANT).tenant_seq == head.tenant_seq + 2  # issue, consume
         assert st2.journal.permit_state(consumed.permit_id) is PermitState.CONSUMED
-        assert st2.journal.receipt_state(consumed.receipt_id) is ReceiptState.ISSUED
+        # The earlier owner's unused receipt is revoked when the journal opens (R07).
+        assert st2.journal.receipt_state(consumed.receipt_id) is ReceiptState.REVOKED
         assert st2.journal.reservation(attempt.reservation_id).state is R.CONSUMED
         # The PEP that held the receipt is gone: a new PEP instance cannot use it.
         with pytest.raises(PermitRejectedError, match="PEP_MISMATCH"):
@@ -94,12 +95,13 @@ def test_process_stop_inside_the_consumption_transaction(prepared: Any) -> None:
         issued = st2.sm.state.attempts[attempt.attempt_id]
         assert issued.state is A.PERMIT_ISSUED
         assert st2.journal.head(b.TENANT).tenant_seq == head.tenant_seq + 1
-        assert st2.journal.permit_state(issued.permit_id) is PermitState.ISSUED
+        # The earlier owner's unused permit is revoked when the journal opens (R07).
+        assert st2.journal.permit_state(issued.permit_id) is PermitState.REVOKED
         assert st2.journal.reservation(attempt.reservation_id).state is R.RESERVED
-        actions = [r.action for r in st2.journal.audit_records()]
-        assert len(actions) == audits + 1
-        assert actions[-1] == "PERMIT_ISSUED"
+        actions = [r.action for r in st2.journal.audit_records()][audits:]
+        assert actions[0] == "PERMIT_ISSUED"
         assert "PERMIT_CONSUMED" not in actions
+        assert actions[-1] == "RESTART_REVOKED"
         # The permit was issued under an earlier owner epoch: it stays unusable.
         with pytest.raises(PermitRejectedError, match="STALE_OWNER"):
             lw.consume(st2, st2.sm.state.attempts[attempt.attempt_id])
