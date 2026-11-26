@@ -13,7 +13,12 @@ kills it with SIGKILL:
 - ``before_save``: the model's answer arrived; its result is about to be
   saved to the journal (not yet saved);
 - ``during_recovery``: inside the owner's ``recover`` (the parent made a Run
-  that needs it), after its first change.
+  that needs it), after its first change;
+- ``after_reserve``: the first model call's budget is reserved; nothing else;
+- ``file_committed``: the broker's write has committed the file (rename),
+  before the result reaches the journal;
+- ``during_repair``: inside ``repair_projections``'s transaction, after the
+  mirror was rewritten, before the commit (the parent damaged the mirror).
 """
 
 from __future__ import annotations
@@ -61,7 +66,7 @@ class Files:
         if POINT == "file_prepare":
             block()
         prepared = self._real.prepare(descriptor, policy)
-        if POINT != "file_write":
+        if POINT not in ("file_write", "file_committed"):
             return prepared
 
         class Prepared:
@@ -69,13 +74,37 @@ class Files:
                 return getattr(prepared, name)
 
             def write(self, *args: Any) -> Any:
-                block()
-                return prepared.write(*args)
+                if POINT == "file_write":
+                    block()
+                result = prepared.write(*args)
+                block()  # file_committed: the rename is done, the journal not yet
+                return result
 
         return Prepared()
 
 
 def main() -> int:
+    if POINT == "during_repair":
+        from agent_core.adapters import sqlite_ledger
+        from agent_core.adapters.system import SystemClock
+
+        real_repair = sqlite_ledger.repair_mirror
+
+        def repair(cur: Any) -> Any:
+            result = real_repair(cur)
+            block()  # inside the transaction, before COMMIT
+            return result
+
+        sqlite_ledger.repair_mirror = repair
+        SqliteJournal.repair_projections(HOME / "journal.db", clock=SystemClock())
+        return 0
+    if POINT == "after_reserve":
+        from agent_core.runtime.pipeline import AttemptPipeline
+
+        def authorize(self: Any, attempt: Any, consumer: Any) -> Any:
+            block()
+
+        AttemptPipeline.authorize = authorize  # type: ignore[method-assign]
     if POINT == "before_save":
         real = SqliteJournal.append_with_ledger
 
