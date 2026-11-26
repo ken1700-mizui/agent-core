@@ -58,6 +58,7 @@ class IdKind(StrEnum):
     RESERVATION = "rsv"
     TENANT = "tnt"
     RUN_GRANT = "grt"
+    MODEL_REQUEST = "mrq"
 
 
 def _check_int(value: object, maximum: int, what: str) -> int:
@@ -231,6 +232,11 @@ class RunGrantId(EntityId):
     KIND = IdKind.RUN_GRANT
 
 
+class ModelRequestId(EntityId):
+    __slots__ = ()
+    KIND = IdKind.MODEL_REQUEST
+
+
 _ID_TYPES: dict[str, type[EntityId]] = {
     t.KIND.value: t
     for t in (
@@ -245,6 +251,7 @@ _ID_TYPES: dict[str, type[EntityId]] = {
         ReservationId,
         TenantId,
         RunGrantId,
+        ModelRequestId,
     )
 }
 _KINDS = frozenset(_ID_TYPES)
