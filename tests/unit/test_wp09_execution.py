@@ -116,8 +116,9 @@ def test_one_receipt_starts_execution_once(st: Any) -> None:
     attempt = _consumed(st)
     calls: list[Any] = []
 
-    def run(authorization: Any, _ticket: Any) -> SyntheticResult:
+    def run(authorization: Any, ticket: Any) -> SyntheticResult:
         calls.append(authorization)
+        lw.use_ticket(gate, authorization, ticket)  # WP08-R04: COMPLETED uses the ticket
         return _ok(authorization)
 
     done = gate.execute(attempt, run=run, **lw.actual(st, attempt))
@@ -175,7 +176,7 @@ def test_the_gate_cannot_be_reentered_from_the_callback(st: Any) -> None:
     seen: list[str] = []
     run_id = st.sm.state.steps[attempt.step_id].run_id
 
-    def run(authorization: Any, _ticket: Any) -> SyntheticResult:
+    def run(authorization: Any, ticket: Any) -> SyntheticResult:
         for call in (
             lambda: gate.stop(st.signed(lw.stop_op(StopScopeType.RUN, str(run_id)))),
             lambda: gate.start(st.sm.state.attempts[attempt.attempt_id]),
@@ -184,6 +185,7 @@ def test_the_gate_cannot_be_reentered_from_the_callback(st: Any) -> None:
                 call()
             except PermitRejectedError as exc:
                 seen.extend(exc.reasons)
+        lw.use_ticket(gate, authorization, ticket)  # WP08-R04: COMPLETED uses the ticket
         return _ok(authorization)
 
     gate.execute(attempt, run=run, **lw.actual(st, attempt))

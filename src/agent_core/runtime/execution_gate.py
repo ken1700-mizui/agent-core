@@ -13,8 +13,12 @@ The single place where a consumed permit turns into one execution:
    execution ticket (WP-08). The ticket is issued after the start is committed,
    is redeemed by ``redeem`` at most once, only while the callback runs and only
    for the exact operation it was bound to (access, path and, for a write, the
-   ``WriteChange``: content digest and size, expected state). A mismatch uses it
-   up. When the callback returns or raises, the ticket is closed.
+   ``WriteChange``: content digest and size, expected state) in the verified
+   tree (``workspace_ref``). A mismatch uses it up. When the callback returns or
+   raises, the ticket is closed. A callback that reports COMPLETED without having
+   redeemed its ticket is not trusted: the outcome becomes unknown
+   (``TICKET_NOT_USED``). The separate ``start``/``finish`` steps never hand out a
+   ticket, so no broker file operation can run through them.
 4. ``finish`` records the outcome with a MAC-signed execution report; the ledger
    derives the cost itself. A callback that raises leaves the outcome unknown
    (hold kept).
@@ -89,12 +93,13 @@ class SyntheticResult(FrozenModel):
 
 
 class _OpenTicket:
-    __slots__ = ("binding", "ticket", "used")
+    __slots__ = ("binding", "redeemed", "ticket", "used")
 
     def __init__(self, ticket: ExecutionTicket, binding: TicketBinding) -> None:
         self.ticket = ticket
         self.binding = binding
-        self.used = False
+        self.used = False  # presented once (matched or not)
+        self.redeemed = False  # presented for exactly its operation
 
 
 class SyntheticExecutionGate:
@@ -221,7 +226,11 @@ class SyntheticExecutionGate:
                 try:
                     result = run(authorization, ticket)
                 finally:
-                    self._close_ticket()
+                    redeemed = self._close_ticket()
+                if ticket is not None and result.outcome == "COMPLETED" and not redeemed:
+                    # WP08-R04: an operation on a file target that reports success
+                    # must have used its ticket; otherwise the report is not trusted.
+                    raise PermitRejectedError(PermitReason.TICKET_NOT_USED)
             except BaseException:
                 self._unknown(started)
                 raise
@@ -232,7 +241,7 @@ class SyntheticExecutionGate:
     def _open_ticket(self, authorization: DispatchAuthorization) -> ExecutionTicket | None:
         """Issued after the start was committed (the receipt is USED)."""
         descriptor = authorization.descriptor
-        if len(descriptor.target_resources) != 1:
+        if len(descriptor.target_resources) != 1 or descriptor.workspace_ref is None:
             return None
         target = descriptor.target_resources[0]
         change = descriptor.apply_change if target.access is ResourceAccess.WRITE else None
@@ -240,7 +249,12 @@ class SyntheticExecutionGate:
             receipt_id=authorization.receipt.receipt_id,
             attempt_id=descriptor.attempt_id,
             action_hash=authorization.action_hash,
-            operation=FileOperation(access=target.access, path=target.path, change=change),
+            operation=FileOperation(
+                access=target.access,
+                path=target.path,
+                change=change,
+                workspace_ref=descriptor.workspace_ref,
+            ),
         )
         ticket = ExecutionTicket()
         with self._ticket_lock:
@@ -248,9 +262,11 @@ class SyntheticExecutionGate:
             self._issued.add(ticket)
         return ticket
 
-    def _close_ticket(self) -> None:
+    def _close_ticket(self) -> bool:
+        """Close the open ticket; whether it was redeemed for its operation."""
         with self._ticket_lock:
-            self._open = None
+            current, self._open = self._open, None
+            return current is not None and current.redeemed
 
     def redeem(self, ticket: ExecutionTicket, operation: FileOperation) -> TicketBinding:
         """Use the open ticket once for the operation it was bound to. Any refusal
@@ -266,6 +282,7 @@ class SyntheticExecutionGate:
             current.used = True
             if type(operation) is not FileOperation or operation != current.binding.operation:
                 raise PermitRejectedError(PermitReason.TICKET_MISMATCH)
+            current.redeemed = True
             return current.binding
 
     def _unknown(self, attempt: Attempt) -> None:

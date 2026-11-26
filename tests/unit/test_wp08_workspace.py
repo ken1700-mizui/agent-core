@@ -555,6 +555,7 @@ def test_a_busy_tree_aborts_before_dispatch(world: Any) -> None:
         done = run_file_operation(
             gate=lw.gate(st),
             ledger=st.journal,
+            registry=s.REGISTRY,
             files=fw.broker(st.keys.owner, tree),
             attempt=attempt,
             write_content=None,
@@ -607,6 +608,7 @@ def test_without_the_conditions_s19_refuses_before_anything_is_opened(
     done = run_file_operation(
         gate=gate,
         ledger=st.journal,
+        registry=s.REGISTRY,
         files=files,
         attempt=attempt,
         write_content=fw.NEW_CONTENT.encode() if write else None,
@@ -642,6 +644,7 @@ def test_losing_the_conditions_after_preparing_fails_definitely_without_effect(
     done = run_file_operation(
         gate=lw.gate(st),
         ledger=st.journal,
+        registry=s.REGISTRY,
         files=_Then(),
         attempt=attempt,
         write_content=fw.NEW_CONTENT.encode() if write else None,

@@ -93,11 +93,14 @@ class SignedWorkspaceManifest(FrozenModel):
 
 
 class FileOperation(FrozenModel):
-    """The one operation a broker is about to perform, as the broker sees it."""
+    """The one operation a broker is about to perform, as the broker sees it: in
+    which verified tree (its manifest digest), on which path, reading or writing,
+    and for a write the change computed from the actual bytes."""
 
     access: ResourceAccess
     path: RelPath
     change: WriteChange | None
+    workspace_ref: Digest
 
     @model_validator(mode="after")
     def _shape(self) -> Self:

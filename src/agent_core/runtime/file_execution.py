@@ -22,30 +22,54 @@ from typing import NamedTuple
 from agent_core.ports.files import FileOperationPort, PreparedFileOperation
 from agent_core.ports.ledger import LedgerPort
 from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
+from agent_core.tool.registry import ToolRegistry
 from agent_core.types.errors import (
     FileEffect,
     FileOperationFailedError,
     FileOperationRefusedError,
     PermitRejectedError,
+    ToolOutputError,
     WorkspaceRejectedError,
 )
 from agent_core.types.files import ExecutionTicket
 from agent_core.types.model import CostStatus, Usage, UsageStatus
-from agent_core.types.records import Attempt
+from agent_core.types.records import Attempt, AttemptState
 from agent_core.types.safety import ActionContent, DispatchAuthorization, PermitReason
-from agent_core.types.tools import ToolRegistration
+from agent_core.types.tools import ToolRegistration, ValidatedToolOutput, canonical_json
 from agent_core.types.transitions import AbortReason
 
 # Refusals of ``prepare`` that end the attempt before dispatch, and their reasons.
 _BEFORE_DISPATCH: dict[tuple[str, ...], AbortReason] = {
     ("SAFE_FILE_ACCESS_UNAVAILABLE",): AbortReason.SAFE_FILE_ACCESS_UNAVAILABLE,
     ("WORKSPACE_BUSY",): AbortReason.WORKSPACE_BUSY,
+    ("ARTIFACT_MISMATCH",): AbortReason.ARTIFACT_MISMATCH,
 }
 
 
 class FileOperationResult(NamedTuple):
     attempt: Attempt
+    # A completed read: the bytes, and the builtin read_file output validated
+    # against the tool's output schema and max_output_bytes.
     data: bytes | None
+    output: ValidatedToolOutput | None
+
+
+def _read_output(
+    registry: ToolRegistry, registration: ToolRegistration | None, data: bytes
+) -> ValidatedToolOutput | None:
+    """The builtin read_file output ({"content", "truncated"}), or None when the bytes
+    are not UTF-8 text or do not fit the tool's output schema."""
+    if registration is None:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    output = canonical_json({"content": text, "truncated": False}).decode()
+    try:
+        return registry.validate_output(registration, output)
+    except ToolOutputError:
+        return None
 
 
 def _no_usage() -> Usage:
@@ -73,6 +97,7 @@ def run_file_operation(
     content: ActionContent,
     registration: ToolRegistration | None,
     write_content: bytes | None,
+    registry: ToolRegistry,
 ) -> FileOperationResult:
     descriptor = ledger.recorded_descriptor(attempt.attempt_id)
     if descriptor is None:
@@ -83,14 +108,14 @@ def run_file_operation(
         prepared = files.prepare(descriptor, ledger.policy(descriptor.tenant_id))
     except WorkspaceRejectedError:
         aborted = gate.abort_not_dispatched(attempt, AbortReason.WORKSPACE_REJECTED)
-        return FileOperationResult(aborted, None)
+        return FileOperationResult(aborted, None, None)
     except FileOperationRefusedError as exc:
         reason = _BEFORE_DISPATCH.get(exc.reasons)
         if reason is None:
             raise
-        return FileOperationResult(gate.abort_not_dispatched(attempt, reason), None)
+        return FileOperationResult(gate.abort_not_dispatched(attempt, reason), None, None)
     try:
-        return _execute(gate, prepared, attempt, content, registration, write_content)
+        return _execute(gate, prepared, attempt, content, registration, write_content, registry)
     finally:
         prepared.close()
 
@@ -102,8 +127,9 @@ def _execute(
     content: ActionContent,
     registration: ToolRegistration | None,
     write_content: bytes | None,
+    registry: ToolRegistry,
 ) -> FileOperationResult:
-    read: list[bytes] = []
+    read: list[tuple[bytes, ValidatedToolOutput]] = []
 
     def run(
         authorization: DispatchAuthorization, ticket: ExecutionTicket | None
@@ -113,7 +139,11 @@ def _execute(
             return _failed()
         try:
             if write_content is None:
-                read.append(prepared.read(authorization, ticket, gate.redeem))
+                data = prepared.read(authorization, ticket, gate.redeem)
+                output = _read_output(registry, registration, data)
+                if output is None:
+                    return _failed()  # read, nothing changed, the result is not usable
+                read.append((data, output))
             else:
                 prepared.write(authorization, ticket, gate.redeem, write_content)
         except FileOperationFailedError as exc:
@@ -123,4 +153,6 @@ def _execute(
         return SyntheticResult(outcome="COMPLETED", usage=_no_usage(), final=True)
 
     done = gate.execute(attempt, content=content, registration=registration, run=run)
-    return FileOperationResult(done, read[0] if read else None)
+    if read and done.state is AttemptState.COMPLETED:
+        return FileOperationResult(done, read[0][0], read[0][1])
+    return FileOperationResult(done, None, None)

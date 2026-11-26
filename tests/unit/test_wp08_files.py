@@ -65,6 +65,7 @@ NEW_PATH = "workspace/out/new.txt"
 @pytest.fixture
 def world(tmp_path: Path) -> Any:
     st, tree = fw.world(tmp_path)
+    _WS["ref"] = tree.digest
     yield st, tree
     if not st.journal.closed:
         st.journal.close()
@@ -353,16 +354,29 @@ def _ok() -> SyntheticResult:
     return SyntheticResult(outcome="COMPLETED", usage=lw.zero_usage(), final=True)
 
 
-def _read_op(path: str = "workspace/a.txt") -> FileOperation:
-    return FileOperation(access=ResourceAccess.READ, path=path, change=None)
+# The tree of the running test (set by the ``world`` fixture).
+_WS: dict[str, str] = {}
+
+
+def _read_op(path: str = "workspace/a.txt", workspace: str | None = None) -> FileOperation:
+    return FileOperation(
+        access=ResourceAccess.READ,
+        path=path,
+        change=None,
+        workspace_ref=_WS["ref"] if workspace is None else workspace,
+    )
 
 
 def _write_op(descriptor: ActionDescriptor, **change: Any) -> FileOperation:
     assert descriptor.apply_change is not None
     bound = descriptor.apply_change.model_dump()
     bound.update(change)
+    assert descriptor.workspace_ref is not None
     return FileOperation(
-        access=ResourceAccess.WRITE, path=bound["path"], change=WriteChange(**bound)
+        access=ResourceAccess.WRITE,
+        path=bound["path"],
+        change=WriteChange(**bound),
+        workspace_ref=descriptor.workspace_ref,
     )
 
 
@@ -374,25 +388,35 @@ def test_an_operation_is_consistent_in_itself() -> None:
         content_digest=file_digest(b""),
         content_size=0,
     )
+    ws = b.digest("tree")
     for bad in (
         {"access": ResourceAccess.WRITE, "path": NEW_PATH, "change": None},
         {"access": ResourceAccess.READ, "path": NEW_PATH, "change": change},
         {"access": ResourceAccess.WRITE, "path": "workspace/out/x.txt", "change": change},
     ):
         with pytest.raises(ValidationError):
-            FileOperation(**bad)
+            FileOperation(**bad, workspace_ref=ws)
+    with pytest.raises(ValidationError):
+        FileOperation.model_validate(
+            {"access": ResourceAccess.READ, "path": NEW_PATH, "change": None}  # no tree
+        )
     with pytest.raises(ValidationError):
         WriteChange(**{**change.model_dump(), "expected_pre": file_digest(b"x")})
     with pytest.raises(ValidationError):
         WriteChange(**{**change.model_dump(), "op": WriteOp.REPLACE})
 
 
-def _execute(st: Any, attempt: Any, body: Any, gate: Any = None) -> Any:
+def _execute(st: Any, attempt: Any, body: Any, gate: Any = None, *, used: bool = True) -> Any:
+    """Run ``body`` in the callback. ``used=False``: the body does not redeem the
+    ticket for its operation, so it reports a definite failure (a COMPLETED report
+    needs a used ticket, WP08-R04)."""
     gate = gate if gate is not None else lw.gate(st)
 
     def run(authorization: Any, ticket: Any) -> SyntheticResult:
         body(gate, authorization, ticket)
-        return _ok()
+        if used:
+            return _ok()
+        return SyntheticResult(outcome="FAILED_DEFINITE", usage=lw.zero_usage(), final=True)
 
     return gate.execute(attempt, run=run, **lw.actual(st, attempt))
 
@@ -455,6 +479,7 @@ def test_a_ticket_is_used_once(world: Any) -> None:
         pytest.param(lambda d: _read_op("workspace/out/r.txt"), id="other-path"),
         pytest.param(
             lambda d: FileOperation(
+                workspace_ref=_WS["ref"],
                 access=ResourceAccess.WRITE,
                 path="workspace/a.txt",
                 change=WriteChange(
@@ -479,7 +504,7 @@ def test_a_read_ticket_cannot_serve_another_operation(world: Any, operation: Any
         # A mismatch burns the ticket: the matching operation is refused afterwards.
         seen.append(_ticket_reasons(lambda: gate.redeem(ticket, _read_op())))
 
-    _execute(st, attempt, body)
+    _execute(st, attempt, body, used=False)
     assert seen == [("TICKET_MISMATCH",), ("TICKET_USED",)]
 
 
@@ -504,7 +529,7 @@ def test_a_write_ticket_binds_the_content_and_the_expected_state(
         seen.append(_ticket_reasons(lambda: gate.redeem(ticket, _write_op(descriptor, **change))))
         seen.append(_ticket_reasons(lambda: gate.redeem(ticket, _write_op(descriptor))))
 
-    _execute(st, attempt, body)
+    _execute(st, attempt, body, used=False)
     assert seen == [("TICKET_MISMATCH",), ("TICKET_USED",)]
 
 
@@ -528,7 +553,7 @@ def test_a_ticket_cannot_be_used_after_the_callback(world: Any) -> None:
     attempt = fw.consumed(st, tree)
     kept: list[Any] = []
     gate = lw.gate(st)
-    _execute(st, attempt, lambda g, a, ticket: kept.append(ticket), gate)
+    _execute(st, attempt, lambda g, a, ticket: kept.append(ticket), gate, used=False)
     assert _ticket_reasons(lambda: gate.redeem(kept[0], _read_op())) == ("TICKET_CLOSED",)
 
 
@@ -553,7 +578,7 @@ def test_an_earlier_ticket_does_not_work_in_a_later_execution(world: Any) -> Non
     gate = lw.gate(st)
     first = fw.consumed(st, tree)
     kept: list[Any] = []
-    _execute(st, first, lambda g, a, ticket: kept.append(ticket), gate)
+    _execute(st, first, lambda g, a, ticket: kept.append(ticket), gate, used=False)
     later = fw.consumed(st, tree)
     seen: list[Any] = []
 
@@ -577,3 +602,38 @@ def test_a_ticket_from_another_gate_is_refused(world: Any) -> None:
 
     _execute(st, attempt, body)
     assert seen == [("TICKET_UNKNOWN",), attempt.attempt_id]
+
+
+def test_a_ticket_is_bound_to_the_tree_of_the_operation(world: Any, tmp_path: Path) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    other = fw.make_tree(tmp_path, st.keys.owner, "other")
+    seen: list[Any] = []
+
+    def body(gate: Any, authorization: Any, ticket: Any) -> None:
+        wrong = _read_op(workspace=other.digest)
+        seen.append(_ticket_reasons(lambda: gate.redeem(ticket, wrong)))
+
+    with pytest.raises(PermitRejectedError):
+        _execute(st, attempt, body)  # COMPLETED reported for an unused ticket (below)
+    assert seen == [("TICKET_MISMATCH",)]
+
+
+def test_completed_without_using_the_ticket_is_an_unknown_outcome(world: Any) -> None:
+    """WP08-R04: a file operation reported as done must have used its ticket."""
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    gate = lw.gate(st)
+    with pytest.raises(PermitRejectedError) as excinfo:
+        gate.execute(attempt, run=lambda a, t: _ok(), **lw.actual(st, attempt))
+    assert excinfo.value.reasons == ("TICKET_NOT_USED",)
+    assert st.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
+    assert st.journal.reservation(attempt.reservation_id).hold_micro == 1_000
+
+
+def test_a_definite_failure_needs_no_ticket_use(world: Any) -> None:
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    failed = SyntheticResult(outcome="FAILED_DEFINITE", usage=lw.zero_usage(), final=True)
+    done = lw.gate(st).execute(attempt, run=lambda a, t: failed, **lw.actual(st, attempt))
+    assert done.state is A.FAILED_DEFINITE

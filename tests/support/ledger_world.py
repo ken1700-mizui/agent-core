@@ -677,3 +677,22 @@ def raw_apply(st: Setup, op: Any) -> None:
             conn.execute("ROLLBACK")
     finally:
         conn.close()
+
+
+def use_ticket(gate_: Any, authorization: Any, ticket: Any) -> Any:
+    """Redeem the execution ticket for exactly the operation it was issued for
+    (a callback that reports COMPLETED for a file target must have used it)."""
+    from agent_core.types.files import FileOperation
+    from agent_core.types.tools import ResourceAccess
+
+    descriptor = authorization.descriptor
+    (target,) = descriptor.target_resources
+    return gate_.redeem(
+        ticket,
+        FileOperation(
+            access=target.access,
+            path=target.path,
+            change=descriptor.apply_change if target.access is ResourceAccess.WRITE else None,
+            workspace_ref=descriptor.workspace_ref,
+        ),
+    )

@@ -592,6 +592,7 @@ class PermitReason(StrEnum):
     TICKET_CLOSED = "TICKET_CLOSED"
     TICKET_USED = "TICKET_USED"
     TICKET_MISMATCH = "TICKET_MISMATCH"
+    TICKET_NOT_USED = "TICKET_NOT_USED"
 
 
 class PermitBody(FrozenModel):

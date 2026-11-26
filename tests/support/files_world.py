@@ -143,6 +143,7 @@ def consumed(
     *,
     write: bool = False,
     canonical_input: str | None = None,
+    **descriptor: Any,
 ) -> Attempt:
     """A file operation on ``tree`` up to PERMIT_CONSUMED through the real path."""
     step = lw.step_in(st)
@@ -151,7 +152,13 @@ def consumed(
     workspace_ref = tree if isinstance(tree, str) else tree.digest
     inp = canonical_input if canonical_input is not None else (WRITE_INPUT if write else READ_INPUT)
     attempt = lw.fixed_attempt(
-        st, step, scopes, write=write, workspace_ref=workspace_ref, canonical_input=inp
+        st,
+        step,
+        scopes,
+        write=write,
+        workspace_ref=workspace_ref,
+        canonical_input=inp,
+        **descriptor,
     )
     attempt = lw.reserve(st, attempt, 1_000)
     attempt = lw.issue(st, lw.intent(st, attempt))
@@ -219,6 +226,20 @@ class Spy:
         return [p for _n, p, _d in self.calls]
 
     def changes(self) -> list[tuple[str, str, Any]]:
-        """Calls that create, change or remove something."""
+        """os calls that create, change or remove something."""
         reading = {"open", "stat", "lstat", "builtins.open"}
-        return [c for c in self.calls if c[0] not in reading]
+        return [c for c in self.calls if c[0] in self.NAMES and c[0] not in reading]
+
+
+class AfterPrepare:
+    """A file port that runs ``action`` once the real broker has prepared the tree
+    (to change something between the check and the operation)."""
+
+    def __init__(self, real: Any, action: Any) -> None:
+        self._real = real
+        self._action = action
+
+    def prepare(self, descriptor: Any, policy: Any) -> Any:
+        prepared = self._real.prepare(descriptor, policy)
+        self._action()
+        return prepared

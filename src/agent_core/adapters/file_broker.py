@@ -40,12 +40,15 @@ the composition root builds the broker.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import re
 import stat
 import sys
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from importlib.abc import SourceLoader
+from importlib.machinery import ModuleSpec
 from pathlib import Path
 from typing import Final, NoReturn
 
@@ -57,6 +60,7 @@ from agent_core.types.errors import (
     FileEffect,
     FileOperationFailedError,
     FileOperationRefusedError,
+    PermitRejectedError,
     WorkspaceRejectedError,
 )
 from agent_core.types.files import (
@@ -65,6 +69,7 @@ from agent_core.types.files import (
     TEMP_FILE_PREFIX,
     EntryKind,
     ExecutionTicket,
+    FileOperation,
     SignedWorkspaceManifest,
     WorkspaceEntry,
     WorkspaceManifest,
@@ -77,10 +82,45 @@ from agent_core.types.safety import (
     SecretKey,
 )
 from agent_core.types.serialization import StrictJsonError, dump_json, parse_strict_json
+from agent_core.types.tools import ResourceAccess
 
 # ADR-0008: adopted for Phase 1 managed synthetic trees, where its conditions hold.
 SAFE_RESOLUTION_ADOPTED: Final = True
 MAX_FILE_BYTES: Final = 1_048_576
+# The read_file output holds at most this many bytes of content (its schema).
+MAX_READ_BYTES: Final = 65_536
+
+# WP08-R04: the builtin file tools this broker runs, with the access each one has.
+# Their trusted registry entries must pin ``builtin_artifact_hash()``.
+BUILTIN_FILE_TOOLS: dict[tuple[str, str], ResourceAccess] = {
+    ("read_file", "1.0.0"): ResourceAccess.READ,
+    ("write_file", "1.0.0"): ResourceAccess.WRITE,
+}
+_ARTIFACT_DOMAIN = b"agent-core/builtin-file-broker/v1\x00"
+
+
+def artifact_hash_of(source: bytes) -> str:
+    """The artifact hash of a broker build: domain-tagged SHA-256 of its source."""
+    return "sha256:" + hashlib.sha256(_ARTIFACT_DOMAIN + source).hexdigest()
+
+
+def current_source() -> bytes:
+    """This module's source as the import system would load it now."""
+    spec: ModuleSpec | None = globals().get("__spec__")
+    if spec is None or spec.origin is None or not isinstance(spec.loader, SourceLoader):
+        raise FileOperationRefusedError("ARTIFACT_MISMATCH")
+    return spec.loader.get_data(spec.origin)
+
+
+# The source of the code that is running (read once, when the module was loaded).
+_LOADED_ARTIFACT: Final = artifact_hash_of(current_source())
+
+
+def builtin_artifact_hash() -> str:
+    """The artifact hash of the broker code running in this process."""
+    return _LOADED_ARTIFACT
+
+
 _MAX_PATH = 4_096
 _MAX_NAME = 255
 _WORKSPACE_ID = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -254,6 +294,18 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+_LOOKUP_REASONS: Final = {
+    "MISSING": "TARGET_MISSING",
+    "UNSAFE": "TARGET_UNSAFE",
+    "TOO_LARGE": "READ_TOO_LARGE",
+    "CHANGED": "TARGET_CHANGED",
+}
+
+
+def _state(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
 class PreparedWorkspace:
     """A verified tree, held through fds and the writer lock until ``close``."""
 
@@ -330,11 +382,49 @@ class PreparedWorkspace:
         if authorization.descriptor != self._descriptor:
             _none("PREPARED_FOR_ANOTHER_OPERATION")
 
+    def _redeem(self, ticket: ExecutionTicket, redeem: Redeem, operation: FileOperation) -> None:
+        """Use the ticket before any part of the target is opened."""
+        try:
+            redeem(ticket, operation)
+        except PermitRejectedError as exc:
+            raise FileOperationFailedError(*exc.reasons, effect=FileEffect.NONE) from None
+
     def read(
         self, authorization: DispatchAuthorization, ticket: ExecutionTicket, redeem: Redeem
     ) -> bytes:
+        """The target's bytes, read only from a verified fd of a regular file with one
+        link (WP08-R03). Reading changes nothing, so every failure is definite."""
         self._check_still_safe(authorization)
-        _none("READ_NOT_ENABLED")
+        targets = self._descriptor.target_resources
+        if len(targets) != 1 or targets[0].access is not ResourceAccess.READ:
+            _none("NOT_A_READ")
+        path = targets[0].path
+        self._redeem(
+            ticket,
+            redeem,
+            FileOperation(
+                access=ResourceAccess.READ, path=path, change=None, workspace_ref=self._digest
+            ),
+        )
+        with self.resolve_parent(path) as (parent, name):
+            try:
+                fd, before = _open_regular(parent, name, device=self._device, limit=MAX_READ_BYTES)
+            except LookupError as exc:
+                _none(_LOOKUP_REASONS.get(str(exc.args[0]), "TARGET_UNSAFE"))
+            except OSError:
+                _none("READ_FAILED")
+            try:
+                data = _read_bounded(fd, MAX_READ_BYTES)
+                after = os.fstat(fd)
+            except LookupError:
+                _none("READ_TOO_LARGE")
+            except OSError:
+                _none("READ_FAILED")
+            finally:
+                os.close(fd)
+        if _state(before) != _state(after) or len(data) != after.st_size:
+            _none("TARGET_CHANGED_DURING_READ")
+        return data
 
     def write(
         self,
@@ -345,6 +435,22 @@ class PreparedWorkspace:
     ) -> None:
         self._check_still_safe(authorization)
         _none("WRITE_NOT_ENABLED")
+
+
+def _check_artifact(descriptor: ActionDescriptor) -> None:
+    """WP08-R04: the operation's tool is one of this broker's builtin file tools,
+    with the access it declares, and its trusted entry pins exactly the code that
+    runs here, which is also the code the import system would load now."""
+    tool = descriptor.tool
+    if tool is None or len(descriptor.target_resources) != 1:
+        raise FileOperationRefusedError("ARTIFACT_MISMATCH")
+    access = BUILTIN_FILE_TOOLS.get((tool.tool_id, tool.version))
+    if access is not descriptor.target_resources[0].access:
+        raise FileOperationRefusedError("ARTIFACT_MISMATCH")
+    if tool.artifact_hash != builtin_artifact_hash():
+        raise FileOperationRefusedError("ARTIFACT_MISMATCH")
+    if artifact_hash_of(current_source()) != builtin_artifact_hash():
+        raise FileOperationRefusedError("ARTIFACT_MISMATCH")
 
 
 class SyntheticFileBroker:
@@ -371,6 +477,7 @@ class SyntheticFileBroker:
         ref = descriptor.workspace_ref
         if descriptor.kind is not ActionKind.TOOL_CALL or not descriptor.target_resources:
             raise WorkspaceRejectedError("NOT_A_FILE_OPERATION")
+        _check_artifact(descriptor)
         if ref is None:
             raise WorkspaceRejectedError("WORKSPACE_REF_MISSING")
         if (
@@ -418,11 +525,11 @@ class SyntheticFileBroker:
             fd, _info = _open_regular(
                 root_fd, MANIFEST_FILE_NAME, device=device, limit=MAX_MANIFEST_BYTES
             )
-        except LookupError:
+        except (LookupError, OSError):
             raise WorkspaceRejectedError("MANIFEST_UNREADABLE") from None
         try:
             raw = _read_bounded(fd, MAX_MANIFEST_BYTES)
-        except LookupError:
+        except (LookupError, OSError):
             raise WorkspaceRejectedError("MANIFEST_UNREADABLE") from None
         finally:
             os.close(fd)

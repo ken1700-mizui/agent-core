@@ -5,9 +5,10 @@ from __future__ import annotations
 import secrets
 from typing import Any
 
+from agent_core.adapters.file_broker import BUILTIN_FILE_TOOLS, builtin_artifact_hash
 from agent_core.safety.approval import OwnerApprovalChannel
 from agent_core.safety.descriptor import AttemptRef, model_action, pin_of, tool_action
-from agent_core.tool.registry import ToolRegistry
+from agent_core.tool.registry import ToolRegistry, TrustedToolCatalog
 from agent_core.types.cost import PriceItem, PriceTable
 from agent_core.types.ids import (
     ApprovalId,
@@ -75,11 +76,21 @@ def xtu(micro: int) -> Budget:
     return Budget(currency=Currency.XTU, micro_units=micro)
 
 
+def artifact_of(sealed: ToolManifest) -> str:
+    """The builtin file tools run the file broker's code, so their trusted entry pins
+    the broker's artifact hash (WP08-R04); other synthetic tools keep a fixed one."""
+    if (sealed.tool_id, sealed.version) in BUILTIN_FILE_TOOLS:
+        return builtin_artifact_hash()
+    return tw.ARTIFACT
+
+
 def registry(*manifests: ToolManifest) -> ToolRegistry:
     chosen = manifests or (READ_MANIFEST, WRITE_MANIFEST, COSTLY_MANIFEST)
-    reg = ToolRegistry(tw.catalog(*chosen))
+    reg = ToolRegistry(
+        TrustedToolCatalog(entries=tuple(tw.entry(m, artifact_of(m)) for m in chosen))
+    )
     for sealed in chosen:
-        reg.register(sealed, artifact_hash=tw.ARTIFACT)
+        reg.register(sealed, artifact_hash=artifact_of(sealed))
     return reg
 
 
