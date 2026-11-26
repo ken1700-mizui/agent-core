@@ -1,6 +1,9 @@
 """Replay record types (WP-06; B1 6.2-6.3, B1.C10, B1.C24, A 1.1, E.Z14).
 
-Record format version 1 (``format_version``):
+Record format version 2 (``format_version``; WP06-R01). Version 1 is retired:
+its rendered blob was opaque bytes that could not be bound to the current
+request, so a version 1 record is refused (``FORMAT_SUPERSEDED``) and never
+reinterpreted.
 
 - ``ReplayRecord``: one source Run's model calls, in order (``ReplayStep``).
   Bodies are not inside the record: each step references content-addressed
@@ -8,6 +11,12 @@ Record format version 1 (``format_version``):
   the request record and, for a recorded response, the response.
 - ``ReplayStep`` keeps the three hashes of B1 6.2. They are recomputed from
   the referenced blobs before replay; equal strings alone prove nothing.
+- The rendered blob is the model-facing input in an explicit synthetic normal
+  form: ``ReplayRenderedInput`` serialized with ``dump_json`` (keys sorted, no
+  whitespace, UTF-8). The current request's messages (order, role, content),
+  tools and generation parameters must equal it. The current context is not
+  rebuilt (that is the Context Engine, WP-14); it is compared with what was
+  stored.
 - ``ReplayManifest`` is the trusted anchor: it pins each record's
   ``record_hash`` (domain-tagged SHA-256 of the canonical record). A record
   whose hashes were all recomputed consistently is still refused if it is not
@@ -33,6 +42,7 @@ from agent_core.types.ids import AttemptId, ModelRequestId, ReplayRecordId, RunI
 from agent_core.types.model import (
     ContextHash,
     GenerationParams,
+    Message,
     ModelCallOutcome,
     ProfileRef,
     RenderingHash,
@@ -44,8 +54,9 @@ from agent_core.types.model_errors import ModelError, _no_tokens
 from agent_core.types.serialization import dump_json
 from agent_core.types.values import Count, Digest
 
-REPLAY_FORMAT_VERSION = 1
-REPLAY_RECORD_HASH_DOMAIN = b"agent-core/replay-record/v1\x00"
+REPLAY_FORMAT_VERSION = 2
+SUPERSEDED_REPLAY_FORMAT_VERSIONS = frozenset({1})
+REPLAY_RECORD_HASH_DOMAIN = b"agent-core/replay-record/v2\x00"
 
 
 class ReplayOrigin(StrEnum):
@@ -78,6 +89,14 @@ class ReplayReason(StrEnum):
     ACCESS_REVOKED = "ACCESS_REVOKED"
     DELETED = "DELETED"
     KEY_UNAVAILABLE = "KEY_UNAVAILABLE"
+    FORMAT_SUPERSEDED = "FORMAT_SUPERSEDED"
+    RENDERED_INPUT_INVALID = "RENDERED_INPUT_INVALID"
+    INPUT_MISMATCH = "INPUT_MISMATCH"
+    REQUEST_REUSED = "REQUEST_REUSED"
+    ATTEMPT_REUSED = "ATTEMPT_REUSED"
+    CONCURRENT_CALL = "CONCURRENT_CALL"
+    STORE_FAILED = "STORE_FAILED"
+    ACCESS_CHECK_FAILED = "ACCESS_CHECK_FAILED"
 
 
 class ReplayUnavailableError(ModelError):
@@ -117,6 +136,16 @@ class RecordedFailure(FrozenModel):
 RecordedOutcome = Annotated[RecordedResponse | RecordedFailure, Field(discriminator="kind")]
 
 
+class ReplayRenderedInput(FrozenModel):
+    """The model-facing input as rendered for the source call, in the synthetic
+    normal form (``dump_json`` of this model). Version 1."""
+
+    rendered_input_version: Literal[1]
+    messages: Annotated[tuple[Message, ...], Field(min_length=1)]
+    tools: tuple[ToolSpec, ...]
+    params: GenerationParams
+
+
 class ReplayRequestRecord(FrozenModel):
     """The request record (B1 6.2 ``request_record_ref``): what was sent, without
     credentials, request IDs or times."""
@@ -150,7 +179,7 @@ class ReplayStep(FrozenModel):
 
 
 class ReplayRecord(ImmutableRecord):
-    format_version: Literal[1]
+    format_version: Literal[2]
     record_id: ReplayRecordId
     origin: ReplayOrigin
     tenant_id: TenantId
@@ -164,6 +193,9 @@ class ReplayRecord(ImmutableRecord):
         ids = [s.source_model_request_id for s in self.steps]
         if len(set(ids)) != len(ids):
             raise ValueError("each step has its own source request")
+        attempts = [s.source_attempt_id for s in self.steps]
+        if len(set(attempts)) != len(attempts):
+            raise ValueError("each step has its own source attempt")
         return self
 
 

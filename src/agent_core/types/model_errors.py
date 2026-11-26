@@ -15,7 +15,7 @@ imply a known zero cost. Messages never include request or response text.
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import ClassVar, Self
 
 from agent_core.types.errors import AgentCoreError
 from agent_core.types.model import CostStatus, ModelCallOutcome, Usage, UsageStatus
@@ -36,12 +36,36 @@ def _no_tokens(*, cost_known_zero: bool, synthetic: bool) -> Usage:
 
 
 class ModelError(AgentCoreError):
+    """``outcome`` is what the error class means for a live call. A replayed
+    failure (WP06-R04) reproduces a recorded outcome: ``replayed`` is true,
+    ``actual_outcome`` is NOT_SENT (this call sent nothing), ``usage`` is this
+    call's usage (a known zero) and ``source_usage`` is the recorded usage,
+    kept as recorded (unknown stays unknown) and never billed again."""
+
     code: ClassVar[str] = "MODEL_CALL_FAILED"
     outcome: ClassVar[ModelCallOutcome] = ModelCallOutcome.UNKNOWN
 
     def __init__(self, message: str, *, usage: Usage) -> None:
         super().__init__(message)
         self.usage = usage
+        self.replayed = False
+        self.source_usage: Usage | None = None
+
+    @property
+    def actual_outcome(self) -> ModelCallOutcome:
+        """What this call actually did outside the process."""
+        return ModelCallOutcome.NOT_SENT if self.replayed else self.outcome
+
+    @classmethod
+    def replayed_from_record(
+        cls, message: str, *, replay_usage: Usage, source_usage: Usage
+    ) -> Self:
+        """A reproduction of a recorded failure (Replay only)."""
+        error = cls.__new__(cls)
+        ModelError.__init__(error, message, usage=replay_usage)
+        error.replayed = True
+        error.source_usage = source_usage
+        return error
 
 
 class _NotSentError(ModelError):

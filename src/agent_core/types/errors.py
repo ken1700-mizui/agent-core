@@ -376,6 +376,13 @@ class LogFileChangedError(LogWriteError):
     code = "LOG_FILE_CHANGED"
 
 
+class LogFileIncompleteError(LogWriteError):
+    """The log file ends with an incomplete line (for example after a partial
+    write). Appending is refused; the file is left as it is."""
+
+    code = "LOG_FILE_INCOMPLETE"
+
+
 class LogPartialWriteError(LogWriteError):
     """Only part of a line was written. The partial tail stays in the file (it is
     never truncated) and the sink stops; the file's last line is then incomplete."""

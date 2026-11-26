@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ from agent_core.types.replay import (
     ReplayOrigin,
     ReplayReason,
     ReplayRecord,
+    ReplayRenderedInput,
     ReplayRequestRecord,
     ReplayStep,
     replay_record_hash,
@@ -41,9 +43,11 @@ from support import model_world as m
 class MemoryBlobStore:
     """Tenant-scoped content-addressed blobs (synthetic)."""
 
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.blobs: dict[tuple[str, str], bytes] = {}
         self.reads: list[str] = []
+        self.events = events if events is not None else []
+        self.fail_with: BaseException | None = None
 
     def put(self, tenant_id: TenantId, data: bytes) -> str:
         ref = sha256_digest(data)
@@ -52,6 +56,9 @@ class MemoryBlobStore:
 
     def get(self, tenant_id: TenantId, ref: str) -> bytes:
         self.reads.append(ref)
+        self.events.append("read")
+        if self.fail_with is not None:
+            raise self.fail_with
         try:
             return self.blobs[(str(tenant_id), ref)]
         except KeyError:
@@ -68,12 +75,23 @@ class ScriptedAccess:
     revoke_after_checks: int | None = None
     checks: int = 0
     order: list[str] = field(default_factory=list)
+    calls: list[tuple[str, ...]] = field(default_factory=list)
+    events: list[str] | None = None
+    hook: Callable[[], None] | None = None
+    fail_with: BaseException | None = None
 
     def check(
         self, tenant_id: TenantId, refs: tuple[str, ...], key_version: int
     ) -> ReplayAccessDecision:
         self.checks += 1
         self.order.append("check")
+        self.calls.append(refs)
+        if self.events is not None:
+            self.events.append("check")
+        if self.hook is not None:
+            self.hook()
+        if self.fail_with is not None:
+            raise self.fail_with
         if self.deny_all:
             return ReplayAccessDecision(allowed=False, reason=ReplayReason.ACCESS_DENIED)
         if self.revoke_after_checks is not None and self.checks > self.revoke_after_checks:
@@ -112,10 +130,18 @@ def _step(
     position: int,
     text: str,
     outcome: Any,
+    source_usage: Usage,
 ) -> tuple[ReplayStep, ModelRequest]:
     ir = json.dumps({"ir": text, "position": position}, sort_keys=True).encode()
-    rendered = json.dumps({"rendered": text}, sort_keys=True).encode()
     template = m.request(m.user(text))
+    rendered = dump_json(
+        ReplayRenderedInput(
+            rendered_input_version=1,
+            messages=template.messages,
+            tools=template.tools,
+            params=template.params,
+        )
+    )
     request_record = ReplayRequestRecord(
         request_record_version=1,
         destination="synthetic",
@@ -131,7 +157,7 @@ def _step(
             "model_request_id": str(source_id),
             "content": [{"type": "text", "text": f"recorded answer {position}"}],
             "stop_reason": StopReason.END_TURN.value,
-            "usage": json.loads(dump_json(SOURCE_USAGE)),
+            "usage": json.loads(dump_json(source_usage)),
             "provider_request_id": f"fake-{position}",
             "final_usage": True,
         }
@@ -140,7 +166,7 @@ def _step(
             kind="response", response_blob_ref=store.put(tenant, response_bytes)
         )
     else:
-        recorded = RecordedFailure(kind="failure", failure=outcome, source_usage=SOURCE_USAGE)
+        recorded = RecordedFailure(kind="failure", failure=outcome, source_usage=source_usage)
     step = ReplayStep(
         position=position,
         source_model_request_id=source_id,
@@ -164,17 +190,22 @@ def _step(
 
 
 def world(
-    *outcomes: Any, origin: ReplayOrigin = ReplayOrigin.SYNTHETIC, tenant: TenantId | None = None
+    *outcomes: Any,
+    origin: ReplayOrigin = ReplayOrigin.SYNTHETIC,
+    tenant: TenantId | None = None,
+    source_usage: Usage = SOURCE_USAGE,
 ) -> World:
     tenant_id = tenant if tenant is not None else b.TENANT
     store = MemoryBlobStore()
     steps, requests = [], []
     for position, outcome in enumerate(outcomes or ("response",), start=1):
-        step, current = _step(store, tenant_id, position, f"synthetic input {position}", outcome)
+        step, current = _step(
+            store, tenant_id, position, f"synthetic input {position}", outcome, source_usage
+        )
         steps.append(step)
         requests.append(current)
     record = ReplayRecord(
-        format_version=1,
+        format_version=2,
         record_id=b.new_id(ReplayRecordId),
         origin=origin,
         tenant_id=tenant_id,
@@ -198,6 +229,44 @@ def world(
 def replace_blob(w: World, ref: str, data: bytes) -> None:
     """Overwrite a stored blob in place (simulated tampering)."""
     w.store.blobs[(str(w.tenant), ref)] = data
+
+
+def repin(w: World, record: ReplayRecord) -> World:
+    """Store ``record`` and pin it in a new trusted manifest (a legitimate record
+    built with different stored data, not an attacker's forgery)."""
+    record_ref = w.store.put(w.tenant, dump_json(record))
+    entry = ReplayManifestEntry(
+        record_id=record.record_id,
+        tenant_id=w.tenant,
+        record_blob_ref=record_ref,
+        record_hash=replay_record_hash(record),
+    )
+    return World(
+        w.tenant, w.store, record, ReplayManifest(entries=(entry,)), w.requests, record_ref
+    )
+
+
+def with_rendered(w: World, rendered: bytes) -> World:
+    """The first step recorded with ``rendered`` as its model-facing input."""
+    step = w.record.steps[0]
+    ref = w.store.put(w.tenant, rendered)
+    record_bytes = json.loads(w.store.blobs[(str(w.tenant), step.request_record_ref)])
+    record_bytes["rendering_hash"] = rendering_hash(rendered)
+    request_bytes = dump_json(ReplayRequestRecord.model_validate_json(json.dumps(record_bytes)))
+    new_step = step.model_copy(
+        update={
+            "rendered_blob_ref": ref,
+            "rendering_hash": rendering_hash(rendered),
+            "request_record_ref": w.store.put(w.tenant, request_bytes),
+            "request_hash": request_hash(request_bytes),
+        }
+    )
+    pinned = repin(w, w.record.model_copy(update={"steps": (new_step, *w.record.steps[1:])}))
+    first = w.requests[0].model_copy(
+        update={"rendering_hash": new_step.rendering_hash, "request_hash": new_step.request_hash}
+    )
+    pinned.requests = [first, *w.requests[1:]]
+    return pinned
 
 
 __all__ = ["ReplayFailureKind"]

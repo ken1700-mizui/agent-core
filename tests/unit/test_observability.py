@@ -28,6 +28,7 @@ from agent_core.types.errors import (
     JournalError,
     LogCapacityError,
     LogFileChangedError,
+    LogFileIncompleteError,
     LogPartialWriteError,
     LogRecordTooLargeError,
     LogSinkStoppedError,
@@ -455,7 +456,7 @@ def test_replaced_file_stops_the_sink(tmp_path: Path) -> None:
         _write_one(sink)
 
 
-# ---------------------------------------------------------------- WP11-R03: audit limits and errors
+# --------------------------------- WP11-R03: audit limits and errors
 
 
 def test_audit_record_size_limit() -> None:
@@ -498,3 +499,81 @@ def test_sink_exception_text_does_not_leak_from_the_logger() -> None:
     with pytest.raises(LogWriteError) as excinfo:
         logger.state_changed(entity=LogEntity.TASK, state="ACTIVE", task_id=b.new_id(TaskId))
     assert MARKER not in "".join(traceback.format_exception(excinfo.value))
+
+
+# --------------------------------- WP11-R04: restart after a partial write
+
+
+def test_new_sink_refuses_a_file_with_an_incomplete_last_line(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    path.write_bytes(b'{"complete":1}\n{"partial"')
+    path.chmod(0o600)
+    with pytest.raises(LogFileIncompleteError):
+        JsonLinesLogSink(path, max_total_bytes=10_000)
+    # Left exactly as it was: nothing truncated, removed or appended.
+    assert path.read_bytes() == b'{"complete":1}\n{"partial"'
+
+
+def test_restart_after_a_partial_write_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "o.jsonl"
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    real_write = os.write
+    monkeypatch.setattr(
+        "agent_core.adapters.jsonl_log.os.write", lambda fd, data: real_write(fd, data[:5])
+    )
+    with pytest.raises(LogPartialWriteError):
+        _write_one(sink)
+    monkeypatch.undo()
+    with pytest.raises(LogFileIncompleteError):
+        JsonLinesLogSink(path, max_total_bytes=10_000)
+    assert len(path.read_bytes()) == 5
+
+
+def test_complete_files_and_empty_files_can_be_reopened(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    sink.close()
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    _write_one(sink)
+    sink.close()
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    _write_one(sink)
+    assert path.read_bytes().count(b"\n") == 2
+
+
+def test_tail_is_checked_after_the_lock_is_held(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import fcntl
+
+    path = tmp_path / "o.jsonl"
+    path.write_bytes(b"x")
+    path.chmod(0o600)
+    order: list[str] = []
+    real_flock, real_pread = fcntl.flock, os.pread
+
+    def flock(fd: int, op: int) -> None:
+        order.append("lock")
+        real_flock(fd, op)
+
+    def pread(fd: int, n: int, offset: int) -> bytes:
+        order.append("tail")
+        return real_pread(fd, n, offset)
+
+    monkeypatch.setattr("agent_core.adapters.jsonl_log.fcntl.flock", flock)
+    monkeypatch.setattr("agent_core.adapters.jsonl_log.os.pread", pread)
+    with pytest.raises(LogFileIncompleteError):
+        JsonLinesLogSink(path, max_total_bytes=10_000)
+    assert order == ["lock", "tail"]
+
+
+def test_mode_change_after_opening_stops_the_sink(tmp_path: Path) -> None:
+    path = tmp_path / "o.jsonl"
+    sink = JsonLinesLogSink(path, max_total_bytes=10_000)
+    path.chmod(0o644)
+    with pytest.raises(LogFileChangedError):
+        _write_one(sink)
+    with pytest.raises(LogSinkStoppedError):
+        _write_one(sink)

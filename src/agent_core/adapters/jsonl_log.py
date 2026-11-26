@@ -8,16 +8,23 @@
   when creating it). A file already above the cap is refused and left as it is.
 - Single writer: the sink holds a non-blocking ``flock`` on the file for its
   life, so a second cooperating sink on the same file is refused.
-- Before every write the sink checks that the path still names the same file
-  with one link and that its real size equals the size it tracked. Any
-  difference stops the sink (``LogFileChangedError``).
+- After the lock is held, a non-empty file must end with a newline. A file with
+  an incomplete last line (for example left by a partial write before a
+  restart) is refused (``LogFileIncompleteError``) and left as it is: never
+  truncated, repaired or removed (WP11-R04).
+- Before every write the sink checks that the path still names the same regular
+  file with one link, owned by this user with mode 0600, and that its real size
+  equals the size it tracked. Any difference stops the sink
+  (``LogFileChangedError``).
 - Each line must end with exactly one newline. A line that would exceed the cap
   is refused whole. A short write or an I/O error stops the sink: the partial
   tail stays in the file (never truncated), so the last line may be incomplete,
   and no further line is written after it.
 
 Not claimed: protection against an uncooperative process that writes the file
-directly, or against races on an untrusted parent directory (Safety Gate).
+directly, or against races on an untrusted parent directory (Safety Gate). No
+``fsync``: a line that was written may still be lost on a crash. This sink is
+an observability log, not the durable mandatory audit record (WP-09).
 """
 
 from __future__ import annotations
@@ -31,12 +38,13 @@ from pathlib import Path
 from agent_core.types.errors import (
     LogCapacityError,
     LogFileChangedError,
+    LogFileIncompleteError,
     LogPartialWriteError,
     LogSinkStoppedError,
     LogWriteError,
 )
 
-_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_FLAGS = os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 _MAX_TOTAL_BYTES = 1 << 40
 
 
@@ -61,6 +69,14 @@ class JsonLinesLogSink:
                 raise LogWriteError("log file is in use by another sink") from None
             if info.st_size > max_total_bytes:
                 raise LogCapacityError("existing log file is above the cap; left unchanged")
+            try:
+                tail = os.pread(fd, 1, info.st_size - 1) if info.st_size else b"\n"
+            except OSError as exc:
+                raise LogWriteError(f"cannot read log file: {exc.strerror}") from None
+            if tail != b"\n":
+                raise LogFileIncompleteError(
+                    "log file ends with an incomplete line; left unchanged"
+                )
         except BaseException:
             os.close(fd)
             raise
@@ -102,7 +118,11 @@ class JsonLinesLogSink:
             raise LogFileChangedError("log file cannot be checked") from None
         if (
             (named.st_dev, named.st_ino) != self._identity
-            or named.st_nlink != 1
+            or (current.st_dev, current.st_ino) != self._identity
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+            or current.st_mode & 0o077
             or current.st_size != self._size
         ):
             self._stop()
