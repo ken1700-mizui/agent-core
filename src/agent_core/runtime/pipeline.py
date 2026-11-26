@@ -12,7 +12,8 @@ ledger operation the ledger checks:
 
 Nothing here executes anything, and nothing here grants: the ledger decides at
 every step and refuses what it does not allow. A refusal before consumption
-ends the Attempt ABORTED_BEFORE_DISPATCH and releases its hold.
+ends the Attempt ABORTED_BEFORE_DISPATCH and releases its hold (or voids an
+allocation that was never activated).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from agent_core.ports.clock import Clock
 from agent_core.ports.ledger import LedgerPort
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.safety.pdp import approval_required
+from agent_core.types.cost import ReservationState
 from agent_core.types.errors import PermitRejectedError
 from agent_core.types.ids import ApprovalId, PepInstanceId, PermitId, ReceiptId, ReservationId
 from agent_core.types.ledger import (
@@ -35,6 +37,7 @@ from agent_core.types.ledger import (
     RecordDecision,
     RecordIntent,
     ReleaseReservation,
+    VoidAllocation,
 )
 from agent_core.types.records import Attempt, AttemptState, Step
 from agent_core.types.safety import (
@@ -250,20 +253,27 @@ class AttemptPipeline:
         )
 
     def abort(self, attempt: Attempt, reason: AbortReason) -> Attempt:
-        """ABORTED_BEFORE_DISPATCH before the permit is consumed; releases the hold.
-        A consumed permit is reported by the live gate (``abort_not_dispatched``)."""
+        """ABORTED_BEFORE_DISPATCH before the permit is consumed: a reserved hold is
+        released, an allocation that was never activated is voided. A consumed permit
+        is reported by the live gate (``abort_not_dispatched``)."""
         current = self._sm.state.attempts[attempt.attempt_id]
         if current.state not in _BEFORE_CONSUMPTION:
             raise PermitRejectedError(PermitReason.ALREADY_STARTED)
-        ops: tuple[ReleaseReservation, ...] = ()
-        if current.reservation_id is not None and current.state is not A.VALIDATED:
-            ops = (
-                ReleaseReservation(
-                    op="release",
-                    reservation_id=current.reservation_id,
-                    attempt_id=current.attempt_id,
-                    report=None,
-                ),
-            )
+        ops: tuple[ReleaseReservation | VoidAllocation, ...] = ()
+        rid = current.reservation_id
+        view = None if rid is None else self._ledger.reservation(str(rid))
+        if rid is not None and view is not None:
+            if view.state is ReservationState.ID_ALLOCATED:
+                # Allocated, never activated: nothing is held; the id is voided.
+                ops = (VoidAllocation(op="void", reservation_id=rid),)
+            else:
+                ops = (
+                    ReleaseReservation(
+                        op="release",
+                        reservation_id=rid,
+                        attempt_id=current.attempt_id,
+                        report=None,
+                    ),
+                )
         evidence = AbortEvidence(kind="abort", reason=reason, not_dispatched_ref=None)
         return self._sm.advance_attempt(current, A.ABORTED_BEFORE_DISPATCH, evidence, ledger=ops)

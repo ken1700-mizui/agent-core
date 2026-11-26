@@ -8,7 +8,9 @@ Each iteration, in order:
 
 1. the Run's state: terminal or waiting states return at once; an unresolved
    (started or unknown) Attempt sends the Run to RECONCILIATION_REQUIRED and is
-   never run again; a stop sends it to CANCELLING; the loop limits are checked;
+   never run again; a stop (also one that arrives while an action waits for its
+   approval) sends it through CANCELLING to CANCELLED; the loop limits are
+   checked (the tool-call limit before each tool call);
 2. the context: built from the trusted runtime assembly (WP14-R01) and verified
    against it (R03, R04); if the required items do not fit, nothing is sent
    (B1 4.3: the Run waits for the owner);
@@ -23,9 +25,14 @@ Each iteration, in order:
 5. an answer without a tool request is a claim, not a proof: the loop verifies
    the done criteria itself (VERIFICATION Steps reading each file through the
    same authorization path), moves the Run to VERIFYING, and completes it only if
-   every criterion holds and no reservation is left unsettled. A failed
+   every criterion holds and no reservation is left unsettled (an unsettled cost
+   pauses the Run, PAUSED_BUDGET, and nothing more runs). A failed
    verification goes back to RUNNING and, within the repair limit, to a new model
    call with the failure in the context (I4).
+
+A refusal before the permit is consumed (policy, approval, budget, a permit that
+does not check) ends the Attempt ABORTED_BEFORE_DISPATCH and releases or voids
+its reservation; nothing was sent.
 
 Phase 1 limits: simple tasks only (no planning call; a complex task is refused);
 one tool request per turn; the transcript of a Run lives in this process (a new
@@ -75,11 +82,13 @@ from agent_core.types.errors import (
 )
 from agent_core.types.ids import ApprovalId, AttemptId, ModelRequestId, RunId, TenantId
 from agent_core.types.model import (
+    CostStatus,
     GenerationParams,
     ModelResponse,
     TextBlock,
     ToolUseBlock,
     Usage,
+    UsageStatus,
 )
 from agent_core.types.model_errors import ModelNotSentError
 from agent_core.types.records import (
@@ -111,7 +120,7 @@ from agent_core.types.transitions import (
     TerminationReason,
     VerificationEvidence,
 )
-from agent_core.types.values import Count, Digest, sha256_digest
+from agent_core.types.values import Budget, Count, Currency, Digest, sha256_digest
 
 A = AttemptState
 _UNRESOLVED: Final = frozenset({A.DISPATCH_STARTED, A.OUTCOME_UNKNOWN, A.DISPATCH_AUTHORIZED})
@@ -245,14 +254,15 @@ class _Turn(StrEnum):
     REFUSED = "REFUSED"
 
 
-def _no_usage() -> Usage:
+def _not_sent() -> Usage:
+    """Nothing left the process: zero tokens and a known zero cost."""
     return Usage(
-        status="FINAL",  # type: ignore[arg-type]
+        status=UsageStatus.FINAL,
         input_tokens=0,
         output_tokens=0,
         total_tokens=0,
-        cost=None,
-        cost_status="UNKNOWN",  # type: ignore[arg-type]
+        cost=Budget(currency=Currency.XTU, micro_units=0),
+        cost_status=CostStatus.FINAL,
         synthetic=True,
     )
 
@@ -326,6 +336,9 @@ class AgentLoop:
                 return self._outcome(
                     session, run_id, "WAITING_APPROVAL", self._pending_hash(session)
                 )
+            if self._stopped(run_id):
+                # A stop wins over the approval: the waiting action never runs.
+                raise self._cancel(session, run_id)
             self._set(run_id, RunStatus.RUNNING)
             self._resume_tool(run_id, session, approval_id)
         elif run.status is not RunStatus.RUNNING:
@@ -346,11 +359,11 @@ class AgentLoop:
             elif kind is _Turn.DONE:
                 if self._verify(run_id, session):
                     return self._outcome(session, run_id, "VERIFIED")
-                session.repairs += 1
-                if session.repairs > self._config.limits.max_repairs:
+                if session.repairs >= self._config.limits.max_repairs:
                     raise self._fail(
                         session, run_id, TerminationReason.VERIFICATION_FAILED, "REPAIR_LIMIT"
                     )
+                session.repairs += 1  # one more repair round, within the limit
 
     def _pending_hash(self, session: _Session) -> str | None:
         if session.pending is None:
@@ -378,17 +391,8 @@ class AgentLoop:
             raise self._stop(
                 session, run_id, RunStatus.RECONCILIATION_REQUIRED, "OUTCOME_UNKNOWN", trigger
             )
-        stopped = {
-            (e.scope_type.value, e.scope_id)
-            for e in self._deps.ledger.stop_entries()
-            if e.status is StopStatus.STOPPED
-        }
-        if stopped & {
-            ("GLOBAL", "global"),
-            ("TENANT", str(self._config.tenant_id)),
-            ("RUN", str(run_id)),
-        }:
-            raise self._stop(session, run_id, RunStatus.CANCELLING, "STOPPED")
+        if self._stopped(run_id):
+            raise self._cancel(session, run_id)
         elapsed = self._deps.clock.now_ms() - session.started_ms
         if (
             session.iterations > limits.max_iterations
@@ -397,6 +401,30 @@ class AgentLoop:
             or elapsed > limits.max_elapsed_ms
         ):
             raise self._fail(session, run_id, TerminationReason.LIMIT_EXCEEDED, "LIMIT_EXCEEDED")
+
+    def _stopped(self, run_id: RunId) -> bool:
+        stopped = {
+            (e.scope_type.value, e.scope_id)
+            for e in self._deps.ledger.stop_entries()
+            if e.status is StopStatus.STOPPED
+        }
+        return bool(
+            stopped
+            & {("GLOBAL", "global"), ("TENANT", str(self._config.tenant_id)), ("RUN", str(run_id))}
+        )
+
+    def _cancel(self, session: _Session, run_id: RunId) -> _Stop:
+        """CANCELLING, then CANCELLED: the loop is synchronous, so nothing of this Run
+        is in flight here (an unresolved Attempt was sent to reconciliation first).
+        The runtime refuses CANCELLED if anything is still unsettled."""
+        self._set(run_id, RunStatus.CANCELLING)
+        pending, session.pending = session.pending, None
+        if pending is not None:
+            attempt = self._deps.sm.state.attempts[pending.attempt_id]
+            self._pipeline.abort(attempt, AbortReason.STOPPED)
+            step = self._deps.sm.state.steps[attempt.step_id]
+            self._deps.sm.set_step_status(step, StepStatus.CANCELLED)
+        return self._stop(session, run_id, RunStatus.CANCELLED, "STOPPED")
 
     def _new_step(self, run_id: RunId, kind: StepKind) -> Step:
         step = self._deps.sm.create_step(self._deps.sm.state.runs[run_id], kind)
@@ -448,9 +476,27 @@ class AgentLoop:
                 attempt, amount=required, cost_cap=descriptor.cost_cap.micro_units
             )
         except CostError:
-            self._pipeline.abort(attempt, AbortReason.CANCELLED)
+            # The budget does not allow it: nothing runs; the Run waits for the owner.
+            current = self._deps.sm.state.attempts[attempt.attempt_id]
+            self._pipeline.abort(current, AbortReason.CANCELLED)
+            self._end_step(self._deps.sm.state.steps[attempt.step_id], current)
             raise self._stop(session, run_id, RunStatus.PAUSED_BUDGET, "BUDGET") from None
-        return self._pipeline.authorize(attempt, consumer)
+        try:
+            return self._pipeline.authorize(attempt, consumer)
+        except SafetyError:
+            # The permit or its consumption was refused (for example a permit that does
+            # not match): nothing ran. End the Attempt and stop the Run for safety.
+            current = self._deps.sm.state.attempts[attempt.attempt_id]
+            self._pipeline.abort(current, AbortReason.REVOKED)
+            self._end_step(self._deps.sm.state.steps[attempt.step_id], current)
+            evidence = Termination(
+                kind="termination",
+                reason=TerminationReason.SAFETY_ABORT,
+                evidence_ref=sha256_digest(f"{run_id}:permit".encode()),
+            )
+            raise self._stop(
+                session, run_id, RunStatus.ABORTED_SAFETY, "PERMIT_REFUSED", evidence
+            ) from None
 
     # ------------------------------------------------------------ the model call
 
@@ -529,11 +575,11 @@ class AgentLoop:
         def call(authorization: Any) -> SyntheticResult:
             # The request sent is exactly the one the permit was issued for.
             if authorization.descriptor.request_hash != result.request.request_hash:
-                return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+                return SyntheticResult(outcome="FAILED_DEFINITE", usage=_not_sent(), final=True)
             try:
                 response = deps.model.complete(result.request)
-            except ModelNotSentError:
-                return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+            except ModelNotSentError as exc:
+                return SyntheticResult(outcome="FAILED_DEFINITE", usage=exc.usage, final=True)
             # Any other failure leaves the outcome unknown (the gate keeps the hold).
             if (
                 type(response) is not ModelResponse
@@ -601,6 +647,8 @@ class AgentLoop:
 
     def _tool_turn(self, run_id: RunId, session: _Session, use: ToolUseBlock, pair_id: str) -> None:
         deps, config = self._deps, self._config
+        if session.tool_calls >= config.limits.max_tool_calls:
+            raise self._fail(session, run_id, TerminationReason.LIMIT_EXCEEDED, "LIMIT_EXCEEDED")
         registration = self._registration(run_id, use.name)
         if registration is None:
             self._refuse_tool(session, pair_id, "TOOL_NOT_AVAILABLE", "runtime:tool")
@@ -816,11 +864,16 @@ class AgentLoop:
             for a in attempts
             if a.reservation_id is not None
             and (view := deps.ledger.reservation(str(a.reservation_id))) is not None
-            and (view.state not in _SETTLED_RESERVATIONS or view.hold_micro != 0)
+            and (
+                view.state not in _SETTLED_RESERVATIONS
+                or view.hold_micro != 0
+                or (view.state is ReservationState.USAGE_REPORTED and not view.spent_known)
+            )
         ]
         if unsettled:
-            # Unknown or unfinished costs: never a normal completion.
-            raise self._stop(session, run_id, RunStatus.RUNNING, "UNSETTLED_COSTS")
+            # Unknown or unfinished costs: never a normal completion, and nothing more
+            # runs; the Run waits until the cost is settled (WP-12 / the owner).
+            raise self._stop(session, run_id, RunStatus.PAUSED_BUDGET, "UNSETTLED_COSTS")
         wrote = any(
             (d := deps.ledger.recorded_descriptor(str(a.attempt_id))) is not None
             and d.apply_change is not None
@@ -848,7 +901,5 @@ class AgentLoop:
         return False
 
 
-def _xtu(micro: int) -> Any:
-    from agent_core.types.values import Budget, Currency
-
+def _xtu(micro: int) -> Budget:
     return Budget(currency=Currency.XTU, micro_units=micro)

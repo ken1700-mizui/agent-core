@@ -112,6 +112,7 @@ class ScriptedModel:
 
     outcomes: list[Any]
     requests: list[ModelRequest] = field(default_factory=list)
+    responses: list[ModelResponse] = field(default_factory=list)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
@@ -119,9 +120,11 @@ class ScriptedModel:
             raise AssertionError("the script ran out")
         outcome = self.outcomes.pop(0)
         script = FakeScript.of({request_fingerprint(request): (outcome,)})
-        return FakeModelProvider(profile=profile().model, script=script, price=PRICE).complete(
+        response = FakeModelProvider(profile=profile().model, script=script, price=PRICE).complete(
             request
         )
+        self.responses.append(response)
+        return response
 
 
 __all__ = ["FakeFault"]
@@ -153,12 +156,17 @@ def world(
     complexity: str = "simple",
     specs: tuple[FileCriterion, ...] = (),
     step_cap: int = 10_000,
+    prof: ContextProfile | None = None,
+    goal: str = GOAL,
+    wrap_files: Any = None,
+    wrap_ledger: Any = None,
     **caps: int,
 ) -> World:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     st, tree = fw.world(tmp_path)
     catalog = criteria(*specs)
     task = st.sm.create_task(
-        goal_ref=sha256_digest(GOAL.encode()),
+        goal_ref=sha256_digest(goal.encode()),
         done_criteria=tuple(sorted(c.ref() for c in catalog.criteria)),
         budget_total=lw.xtu(caps.pop("task_budget", 1_000_000)),
         caps_total=b.caps(),
@@ -172,11 +180,11 @@ def world(
     config = LoopConfig(
         tenant_id=b.TENANT,
         workspace_ref=tree.digest,
-        profile=profile(),
+        profile=prof if prof is not None else profile(),
         params=PARAMS,
         price_table=s.PRICE_TABLE,
         rules=RuleCatalog(rules=()),
-        texts=SyntheticTexts.of(GOAL, *(c.text() for c in catalog.criteria)),
+        texts=SyntheticTexts.of(goal, *(c.text() for c in catalog.criteria)),
         criteria=catalog,
         tasks=(TaskProfile(goal_ref=task.goal_ref, complexity=complexity),),  # type: ignore[arg-type]
         limits=limits
@@ -191,14 +199,15 @@ def world(
         cost_cap_micro=5_000,
         user_input=REQUEST,
     )
+    broker = fw.broker(st.keys.owner, tree)
     deps = LoopDeps(
         sm=st.sm,
-        ledger=st.journal,
+        ledger=st.journal if wrap_ledger is None else wrap_ledger(st.journal),
         gate=lw.gate(st),
         model=model,
         registry=s.REGISTRY,
         tools=(s.READ_TOOL, s.WRITE_TOOL),
-        files=fw.broker(st.keys.owner, tree),
+        files=broker if wrap_files is None else wrap_files(broker),
         clock=st.clock,
         new_id=b.new_id,
     )
