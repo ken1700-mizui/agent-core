@@ -13,8 +13,8 @@
 | 単位 | 範囲 | 状態 | 文書 |
 |---|---|---|---|
 | A | アーキテクチャ・Runtime・障害復旧 | **設計段階で合格（98/100）**。実装前に解決すべき課題が6件ある | `docs/design/phase-0/A_RUNTIME.md` |
-| B1 | Context Engine（Memory との接続仕様を含む） | **DRAFT 第2版。独立再審査待ち**。第1版は 89/100 点。指摘 B1-R01〜R08 に対応した | `docs/design/phase-0/B1_CONTEXT.md` |
-| B2 | Memory Engine の詳細設計 | 未着手（B1 の審査の後に始める） | — |
+| B1 | Context Engine（Memory との接続仕様を含む） | **設計段階として条件付き合格（95/100）**。実装の前に、必須解決事項 B1-P01〜P04 を解決すること | `docs/design/phase-0/B1_CONTEXT.md` |
+| B2 | Memory Engine の詳細設計 | **DRAFT 第1版。独立審査待ち** | `docs/design/phase-0/B2_MEMORY.md` |
 | C | Safety Engine・評価環境の隔離 | 未着手 | — |
 | D | Evaluation Engine・統計設計・Cost Engine | 未着手 | — |
 | E | ロードマップ・性能追跡・全体の整合性 | 未着手 | — |
@@ -52,19 +52,20 @@
 - `docs/phase-0-design`：`main` の上に設計資料のコミットを載せた作業用ブランチ。`main` へは Draft PR #1 で提案している。設計B1 も同じ PR に追加した。
 - 今後、`main` への直接の Push とマージは禁止する。
 
+## 設計B1：実装前の必須解決事項（`B1_CONTEXT.md` の14章）
+
+| ID | 課題 | 担当 |
+|---|---|---|
+| B1-P01 | 保存する前に機密を検査すること。送信の認可と、保存の認可を分けること | C |
+| B1-P02 | 認可・承認・Permit を、送信先と最終的なリクエストの内容に結び付けること。ハッシュが推測攻撃に耐えられるか | C |
+| B1-P03 | 削除した記憶から派生したデータの削除 | B2（`B2_MEMORY.md` の7章で対応した。審査待ち） |
+| B1-P04 | Run 全体での処理量（回数・費用・時間）の上限。Safety・予算・Intent・Permit の順序の統一 | D・E |
+
 ## 次の作業
 
-1. **独立再審査：** 設計B1 第2版（`B1_CONTEXT.md`）を審査する。B1 は、再審査が終わるまで DRAFT のままにする。
-2. **設計B2（Memory Engine の詳細）：** B1 の審査が終わってから始める。B1 から引き継ぐ前提は次のとおり。
-   - B1 の6.4章で定めた接続仕様。`MemoryQuery`、`MemoryUsed` イベント、`MemoryCandidateProposed` イベントを使う。
-   - 記憶を削除したときに Replay をどう扱うか。B1 は、記憶ごとに鍵を変えて暗号化し、削除のときはその鍵を破棄する方式（crypto-shredding）と、`REPLAY_UNAVAILABLE` を推している。B2 の B13 で決める。
-   - そのほかの引き継ぎ事項は、`B1_CONTEXT.md` の13章にまとめた。
-3. **設計C への引き継ぎ：** 次の事項を設計C で決める（詳細は `B1_CONTEXT.md` の13章）。
-   - モデルへの送信の認可（`EgressCheck`）
-   - 秘密情報の検出の方法と限界
-   - 取得のたびに行う権限の判定
-   - 鍵の管理
-   - 承認者の役割と、承認できる範囲
+1. **独立審査：** 設計B2（`B2_MEMORY.md`）の第1版を審査する。B2 は、審査が終わるまで DRAFT のままにする。
+2. **設計C・D・E への引き継ぎ：** `B1_CONTEXT.md` の13・14章と、`B2_MEMORY.md` の14章を参照する。
+3. **Memory Engine 本体の実装時期：** 前倒しはしない。Phase 1〜2 では、接続仕様と FakeMemory（偽の実装）を使った契約テストだけを作る。Memory v1 をどの Phase で行うか（初回のロードマップでは Phase 5）は、設計E で調整する。
 4. **Draft PR #1 の確認：** オーナーが確認する。マージはしない。
 
 ## 現在の開発ルール（抜粋。全文は `AGENTS.md`）
