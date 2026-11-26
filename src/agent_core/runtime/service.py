@@ -49,6 +49,7 @@ from agent_core.types.errors import (
     RunTenantMismatchError,
     RuntimeReentryError,
     RuntimeReloadRequiredError,
+    SafetyError,
     StaleEventEpochError,
     StaleStateError,
     StateDivergenceError,
@@ -90,8 +91,9 @@ _NOTHING_STORED = (
     JournalClosedError,
     StaleEventEpochError,
     RunTenantMismatchError,
-    # A refused ledger operation rolls the whole transaction back (WP-09).
+    # A refused ledger or authority operation rolls the whole transaction back (WP-09).
     CostError,
+    SafetyError,
 )
 # Phase 1 is synthetic only (PHASE_1_IMPLEMENTATION_PLAN section 2).
 EVENT_LABELS = ("synthetic",)

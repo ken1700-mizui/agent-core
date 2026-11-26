@@ -7,11 +7,16 @@ transaction. Times come from the ledger's trusted clock, never from an operation
 
 Pairing with runtime transitions (enforced by the SQLite journal):
 
-- An Attempt transition to ``CONTENT_FIXED`` must carry ``AllocateReservation``
-  for the same Attempt and reservation ID; ``BUDGET_RESERVED`` must carry
-  ``ActivateReservation``. Operations bound to a transition are refused without it.
-- Owner operations (caps, counters, run windows) are accepted only through the
-  owner path, with the owner channel's MAC.
+- Every authorizing Attempt transition must carry its operation, for the same
+  Attempt: ``CONTENT_FIXED`` (allocate the reservation ID), ``POLICY_ALLOWED``
+  (record the PDP decision), ``APPROVED`` (confirm the approval),
+  ``BUDGET_RESERVED`` (activate), ``INTENT_RECORDED`` (record the intent),
+  ``PERMIT_ISSUED`` (issue), ``PERMIT_CONSUMED`` (consume),
+  ``DISPATCH_AUTHORIZED`` (claim the receipt) and ``DISPATCH_STARTED`` (mark
+  active). Operations bound to a transition are refused without it.
+- Owner operations (policy, grants, caps, counters, run windows, stop and
+  resume, revocation, deny list) are accepted only through the owner path, with
+  the owner channel's MAC.
 """
 
 from __future__ import annotations
@@ -27,9 +32,30 @@ from agent_core.types.cost import (
     CounterKind,
     ReservationScopes,
 )
-from agent_core.types.ids import AttemptId, ReservationId, RunId
+from agent_core.types.ids import (
+    ApprovalId,
+    AttemptId,
+    PepInstanceId,
+    PermitId,
+    ReceiptId,
+    ReservationId,
+    RunId,
+    TenantId,
+)
 from agent_core.types.model import Usage
-from agent_core.types.safety import ActionKind
+from agent_core.types.safety import (
+    ActionDescriptor,
+    ActionKind,
+    Consumer,
+    Permit,
+    Policy,
+    Receipt,
+    RelPath,
+    RunGrant,
+    SignedApproval,
+    StopScopeType,
+)
+from agent_core.types.tools import ToolRegistration
 from agent_core.types.values import MAX_INT64, Budget, Count, Digest, Identifier
 
 PositiveMicro = Annotated[int, Field(strict=True, ge=1, le=MAX_INT64)]
@@ -79,6 +105,68 @@ class ReleaseReservation(FrozenModel):
     reservation_id: ReservationId
     attempt_id: AttemptId
     not_dispatched_ref: Digest | None
+
+
+class RecordDecision(FrozenModel):
+    """``POLICY_ALLOWED``: the ledger re-runs the PDP inside the transaction with the
+    installed policy and Run grant and the current state, and stores the
+    descriptor. ``registration`` is the trusted registry entry (tool calls)."""
+
+    op: Literal["record_decision"]
+    attempt_id: AttemptId
+    descriptor: ActionDescriptor
+    registration: ToolRegistration | None
+    # What the transition's evidence states; must equal the ledger's own decision.
+    approval_required: bool
+
+
+class ConfirmApproval(FrozenModel):
+    """``APPROVED``: a recorded, valid ExactApproval for this attempt's action."""
+
+    op: Literal["confirm_approval"]
+    attempt_id: AttemptId
+    approval_id: ApprovalId
+
+
+class RecordIntent(FrozenModel):
+    """``INTENT_RECORDED``: needs the attempt's reservation to be RESERVED."""
+
+    op: Literal["record_intent"]
+    attempt_id: AttemptId
+    reservation_id: ReservationId
+    action_hash: Digest
+    intent_ref: Digest
+
+
+class IssuePermit(FrozenModel):
+    """``PERMIT_ISSUED``: every condition of C1 7.4 and E 38.2 is checked again."""
+
+    op: Literal["issue_permit"]
+    attempt_id: AttemptId
+    permit_id: PermitId
+    consumer: Consumer
+    ttl_ms: Annotated[int, Field(strict=True, ge=1, le=600_000)]
+
+
+class ConsumePermit(FrozenModel):
+    """``PERMIT_CONSUMED``: the atomic consumption (C1 7.5, E 3.3)."""
+
+    op: Literal["consume_permit"]
+    permit: Permit
+    consumer: Consumer
+    actual_action_hash: Digest
+    receipt_id: ReceiptId
+    pep_instance_id: PepInstanceId
+    receipt_ttl_ms: Annotated[int, Field(strict=True, ge=1, le=600_000)]
+
+
+class ClaimReceipt(FrozenModel):
+    """``DISPATCH_AUTHORIZED``: the receipt goes ``ISSUED -> CLAIMED`` once (E 3.2)."""
+
+    op: Literal["claim_receipt"]
+    receipt: Receipt
+    pep_instance_id: PepInstanceId
+    actual_action_hash: Digest
 
 
 # ---------------------------------------------------------------- standalone
@@ -132,6 +220,13 @@ class VoidAllocation(FrozenModel):
     reservation_id: ReservationId
 
 
+class RecordApproval(FrozenModel):
+    """An approval from the owner channel. Its MAC is checked with the owner key."""
+
+    op: Literal["record_approval"]
+    signed: SignedApproval
+
+
 class RecoverInFlight(FrozenModel):
     """After a restart: ``CONSUMED`` and ``ACTIVE`` become ``UNKNOWN`` (hold kept)."""
 
@@ -164,7 +259,62 @@ class SetRunWindow(FrozenModel):
     max_elapsed_ms: Annotated[int, Field(strict=True, ge=1, le=86_400_000)]
 
 
-BOUND_OPS = ("allocate", "activate", "mark_active", "release")
+class InstallPolicy(FrozenModel):
+    op: Literal["install_policy"]
+    policy: Policy
+
+
+class InstallRunGrant(FrozenModel):
+    op: Literal["install_run_grant"]
+    grant: RunGrant
+
+
+class StopScope(FrozenModel):
+    """K1-K3 (C1 11.1): no new permit, consumption or receipt claim in the scope.
+    Increments ``revocation_gen``; a tenant or global stop also the access epoch."""
+
+    op: Literal["stop_scope"]
+    scope_type: StopScopeType
+    scope_id: Annotated[str, Field(min_length=1, max_length=128)]
+
+
+class ResumeScope(FrozenModel):
+    """Owner only. Old permits and receipts stay invalid (new revocation_gen)."""
+
+    op: Literal["resume_scope"]
+    scope_type: StopScopeType
+    scope_id: Annotated[str, Field(min_length=1, max_length=128)]
+    stop_seq: Count
+
+
+class RevokeAccess(FrozenModel):
+    op: Literal["revoke_access"]
+    tenant_id: TenantId
+
+
+class DenyResource(FrozenModel):
+    op: Literal["deny_resource"]
+    tenant_id: TenantId
+    path: RelPath
+
+
+class RevokeApproval(FrozenModel):
+    op: Literal["revoke_approval"]
+    approval_id: ApprovalId
+
+
+BOUND_OPS = (
+    "allocate",
+    "record_decision",
+    "confirm_approval",
+    "activate",
+    "record_intent",
+    "issue_permit",
+    "consume_permit",
+    "claim_receipt",
+    "mark_active",
+    "release",
+)
 STANDALONE_OPS = (
     "report_usage",
     "mark_unknown",
@@ -173,11 +323,37 @@ STANDALONE_OPS = (
     "unexplained",
     "void",
     "recover_in_flight",
+    "record_approval",
 )
-OWNER_OPS = ("set_budget_cap", "set_counter_cap", "set_run_window")
+OWNER_OPS = (
+    "set_budget_cap",
+    "set_counter_cap",
+    "set_run_window",
+    "install_policy",
+    "install_run_grant",
+    "stop_scope",
+    "resume_scope",
+    "revoke_access",
+    "deny_resource",
+    "revoke_approval",
+)
 
 LedgerOp = Annotated[
     AllocateReservation
+    | RecordDecision
+    | ConfirmApproval
+    | RecordIntent
+    | IssuePermit
+    | ConsumePermit
+    | ClaimReceipt
+    | RecordApproval
+    | InstallPolicy
+    | InstallRunGrant
+    | StopScope
+    | ResumeScope
+    | RevokeAccess
+    | DenyResource
+    | RevokeApproval
     | ActivateReservation
     | MarkActive
     | ReleaseReservation

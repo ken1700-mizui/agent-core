@@ -182,6 +182,7 @@ def test_experiment_scope_is_checked_when_present(st: Any) -> None:
 def test_a_scope_without_a_cap_is_refused(st: Any) -> None:
     step = lw.step_in(st)
     scopes = lw.scopes_of(st.sm, step)
+    lw.grant_only(st, scopes)
     attempt = lw.fixed_attempt(st, step, scopes)
     with pytest.raises(BudgetCapMissingError):
         lw.reserve(st, attempt, 1_000)

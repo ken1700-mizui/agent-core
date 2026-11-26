@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -10,24 +10,42 @@ from agent_core.adapters.sqlite_journal import SqliteJournal
 from agent_core.adapters.system import OsRandomSource
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.safety.approval import OwnerApprovalChannel
+from agent_core.safety.descriptor import AttemptRef, pin_of
 from agent_core.types.cost import (
     BudgetScopeType,
     CounterKind,
     FixedEstimate,
     ReservationScopes,
 )
-from agent_core.types.ids import ReservationId
+from agent_core.types.ids import (
+    ApprovalId,
+    AttemptId,
+    PepInstanceId,
+    PermitId,
+    ReceiptId,
+    ReservationId,
+)
 from agent_core.types.ledger import (
     ActivateReservation,
     AllocateReservation,
+    ClaimReceipt,
+    ConfirmApproval,
+    ConsumePermit,
+    InstallPolicy,
+    InstallRunGrant,
+    IssuePermit,
     LedgerBatch,
     LedgerOp,
+    RecordApproval,
+    RecordDecision,
+    RecordIntent,
     SetBudgetCap,
     SetCounterCap,
     SetRunWindow,
 )
 from agent_core.types.records import Attempt, AttemptState, Run, Step
-from agent_core.types.safety import ActionKind, LedgerKeys
+from agent_core.types.safety import ActionDescriptor, ActionKind, Consumer, LedgerKeys, RunGrant
+from agent_core.types.transitions import ContentFixedEvidence, PolicyDecisionEvidence
 from agent_core.types.values import Budget, Currency
 from support import builders as b
 from support import runtime_world as w
@@ -70,15 +88,29 @@ class Setup:
     keys: LedgerKeys
     clock: ManualClock
     channel: OwnerApprovalChannel
+    pep: PepInstanceId = field(default_factory=lambda: b.new_id(PepInstanceId))
+    descriptors: dict[Any, ActionDescriptor] = field(default_factory=dict)
+    grants: dict[Any, RunGrant] = field(default_factory=dict)
 
     def owner(self, *ops: LedgerOp) -> None:
         batch = LedgerBatch(ops=ops)
         self.journal.apply_owner_ledger(batch, owner_mac=self.channel.sign_ledger(batch))
 
     def reopen(self) -> Setup:
-        self.journal.close()
+        """A restart: a new owner epoch and a new PEP instance."""
+        if not self.journal.closed:
+            self.journal.close()
         journal = open_journal(self.path, self.clock, self.keys)
-        return Setup(self.path, journal, w.machine(journal), self.keys, self.clock, self.channel)
+        return Setup(
+            self.path,
+            journal,
+            w.machine(journal),
+            self.keys,
+            self.clock,
+            self.channel,
+            descriptors=self.descriptors,
+            grants=self.grants,
+        )
 
 
 def setup(tmp_path: Path, name: str = "journal.db") -> Setup:
@@ -86,7 +118,9 @@ def setup(tmp_path: Path, name: str = "journal.db") -> Setup:
     keys = new_keys()
     path = tmp_path / name
     journal = open_journal(path, clock, keys)
-    return Setup(path, journal, w.machine(journal), keys, clock, OwnerApprovalChannel(keys.owner))
+    st = Setup(path, journal, w.machine(journal), keys, clock, OwnerApprovalChannel(keys.owner))
+    st.owner(InstallPolicy(op="install_policy", policy=s.policy()))
+    return st
 
 
 def scopes_of(sm: RuntimeStateMachine, step: Step, experiment: Any = None) -> ReservationScopes:
@@ -144,6 +178,16 @@ def caps(st: Setup, scopes: ReservationScopes, micro: int = 10_000, **levels: in
                 )
             )
     ops.append(SetRunWindow(op="set_run_window", run_id=scopes.run_id, max_elapsed_ms=3_600_000))
+    if scopes.run_id not in st.grants:
+        at = AttemptRef(
+            tenant_id=scopes.tenant_id,
+            task_id=scopes.task_id,
+            run_id=scopes.run_id,
+            step_id=scopes.step_id,
+            attempt_id=b.new_id(AttemptId),
+        )
+        st.grants[scopes.run_id] = s.grant(at)
+        ops.append(InstallRunGrant(op="install_run_grant", grant=st.grants[scopes.run_id]))
     st.owner(*ops)
 
 
@@ -165,43 +209,96 @@ def allocate_op(
     )
 
 
-def fixed_attempt(st: Setup, step: Step, scopes: ReservationScopes) -> Attempt:
-    """PROPOSED -> VALIDATED -> CONTENT_FIXED (reservation ID allocated)."""
+def ref_of(st: Setup, attempt: Attempt) -> AttemptRef:
+    step = st.sm.state.steps[attempt.step_id]
+    run = st.sm.state.runs[step.run_id]
+    return AttemptRef(
+        tenant_id=b.TENANT,
+        task_id=run.task_id,
+        run_id=run.run_id,
+        step_id=step.step_id,
+        attempt_id=attempt.attempt_id,
+    )
+
+
+def fixed_attempt(
+    st: Setup, step: Step, scopes: ReservationScopes, *, write: bool = False, **descriptor: Any
+) -> Attempt:
+    """PROPOSED -> VALIDATED -> CONTENT_FIXED: the reservation ID is allocated and the
+    ActionDescriptor (which contains it) is fixed (E 38.1)."""
     attempt = st.sm.create_attempt(step)
     attempt = st.sm.advance_attempt(attempt, A.VALIDATED, w.evidence_for(attempt, A.VALIDATED))
     rsv = b.new_id(ReservationId)
-    evidence = w.evidence_for(attempt, A.CONTENT_FIXED, reservation_id=rsv)
+    build = s.write_descriptor if write else s.read_descriptor
+    values: dict[str, Any] = {"reservation_id": rsv, "cost_cap": xtu(5_000)}
+    values.update(descriptor)
+    fixed_descriptor = build(ref_of(st, attempt), **values)
+    st.descriptors[attempt.attempt_id] = fixed_descriptor
+    evidence = ContentFixedEvidence(
+        kind="content_fixed", action_hash=fixed_descriptor.action_hash(), reservation_id=rsv
+    )
     return st.sm.advance_attempt(
         attempt, A.CONTENT_FIXED, evidence, ledger=(allocate_op(attempt, scopes, rsv),)
     )
 
 
-def activate_op(
-    attempt: Attempt, amount: int, cap: int = 5_000, required: int = 100
-) -> ActivateReservation:
-    assert attempt.reservation_id is not None
-    assert attempt.action_hash is not None
-    return ActivateReservation(
-        op="activate",
-        reservation_id=attempt.reservation_id,
+def decision_op(st: Setup, attempt: Attempt, approval_required: bool) -> RecordDecision:
+    descriptor = st.descriptors[attempt.attempt_id]
+    registration = s.WRITE_TOOL if descriptor.tool == pin_of(s.WRITE_TOOL) else s.READ_TOOL
+    return RecordDecision(
+        op="record_decision",
         attempt_id=attempt.attempt_id,
-        action_hash=attempt.action_hash,
-        estimate=fixed(required),
-        amount=xtu(amount),
-        cost_cap=xtu(cap),
+        descriptor=descriptor,
+        registration=registration,
+        approval_required=approval_required,
     )
 
 
-def allowed(st: Setup, attempt: Attempt) -> Attempt:
+def allowed(st: Setup, attempt: Attempt, *, approval_required: bool | None = None) -> Attempt:
+    """POLICY_ALLOWED with the PDP decision recorded by the ledger."""
+    descriptor = st.descriptors[attempt.attempt_id]
+    needed = (
+        descriptor.tool == pin_of(s.WRITE_TOOL) if approval_required is None else approval_required
+    )
+    evidence = PolicyDecisionEvidence(
+        kind="policy_decision",
+        decision_ref=b.digest("decision"),
+        action_hash=descriptor.action_hash(),
+        policy_version=s.POLICY_VERSION,
+        approval_required=needed,
+    )
     return st.sm.advance_attempt(
-        attempt, A.POLICY_ALLOWED, w.evidence_for(attempt, A.POLICY_ALLOWED)
+        attempt, A.POLICY_ALLOWED, evidence, ledger=(decision_op(st, attempt, needed),)
     )
+
+
+def record_approval(st: Setup, attempt: Attempt, **approval: Any) -> ApprovalId:
+    signed = st.channel.approve(
+        s.approval(st.descriptors[attempt.attempt_id].action_hash(), **approval)
+    )
+    st.journal.apply_ledger((RecordApproval(op="record_approval", signed=signed),))
+    return signed.approval.approval_id
+
+
+def approved(st: Setup, attempt: Attempt, approval_id: ApprovalId | None = None) -> Attempt:
+    """APPROVAL_PENDING -> APPROVED with the recorded owner approval."""
+    if approval_id is None:
+        approval_id = record_approval(st, attempt)
+    if attempt.state is A.POLICY_ALLOWED:
+        attempt = st.sm.advance_attempt(attempt, A.APPROVAL_PENDING)
+    evidence = w.evidence_for(attempt, A.APPROVED)
+    op = ConfirmApproval(
+        op="confirm_approval", attempt_id=attempt.attempt_id, approval_id=approval_id
+    )
+    return st.sm.advance_attempt(attempt, A.APPROVED, evidence, ledger=(op,))
 
 
 def reserve(st: Setup, attempt: Attempt, amount: int = 1_000, **kw: Any) -> Attempt:
-    """POLICY_ALLOWED (no approval) -> BUDGET_RESERVED with the activation."""
+    """(POLICY_ALLOWED, APPROVED if needed) -> BUDGET_RESERVED with the activation."""
     if attempt.state is A.CONTENT_FIXED:
         attempt = allowed(st, attempt)
+    if attempt.state is A.POLICY_ALLOWED and attempt.approval_required:
+        attempt = approved(st, attempt)
     return st.sm.advance_attempt(
         attempt,
         A.BUDGET_RESERVED,
@@ -242,19 +339,98 @@ def end_run(st: Setup, run: Run) -> Run:
     return st.sm.set_run_status(st.sm.state.runs[run.run_id], RunStatus.FAILED, termination)
 
 
-def dispatched(st: Setup, step: Step) -> Attempt:
-    """A dispatched attempt through the real ledger path (WP-09B/C)."""
+def intent(st: Setup, attempt: Attempt) -> Attempt:
+    op = RecordIntent(
+        op="record_intent",
+        attempt_id=attempt.attempt_id,
+        reservation_id=rsv(attempt),
+        action_hash=action_of(attempt),
+        intent_ref=b.digest("intent"),
+    )
+    return st.sm.advance_attempt(
+        attempt, A.INTENT_RECORDED, w.evidence_for(attempt, A.INTENT_RECORDED), ledger=(op,)
+    )
+
+
+def issue(
+    st: Setup, attempt: Attempt, *, ttl_ms: int = 30_000, consumer: Consumer = Consumer.BROKER
+) -> Attempt:
+    permit_id = b.new_id(PermitId)
+    op = IssuePermit(
+        op="issue_permit",
+        attempt_id=attempt.attempt_id,
+        permit_id=permit_id,
+        consumer=consumer,
+        ttl_ms=ttl_ms,
+    )
+    evidence = w.evidence_for(attempt, A.PERMIT_ISSUED, permit_id=permit_id)
+    return st.sm.advance_attempt(attempt, A.PERMIT_ISSUED, evidence, ledger=(op,))
+
+
+def consume_op(st: Setup, attempt: Attempt, **overrides: Any) -> ConsumePermit:
+    assert attempt.permit_id is not None
+    permit = st.journal.permit(attempt.permit_id)
+    assert permit is not None
+    values: dict[str, Any] = {
+        "op": "consume_permit",
+        "permit": permit,
+        "consumer": Consumer.BROKER,
+        "actual_action_hash": action_of(attempt),
+        "receipt_id": b.new_id(ReceiptId),
+        "pep_instance_id": st.pep,
+        "receipt_ttl_ms": 30_000,
+    }
+    values.update(overrides)
+    return ConsumePermit(**values)
+
+
+def consume(
+    st: Setup, attempt: Attempt, op: ConsumePermit | None = None, **overrides: Any
+) -> Attempt:
+    op = op if op is not None else consume_op(st, attempt, **overrides)
+    evidence = w.evidence_for(attempt, A.PERMIT_CONSUMED, receipt_id=op.receipt_id)
+    return st.sm.advance_attempt(attempt, A.PERMIT_CONSUMED, evidence, ledger=(op,))
+
+
+def claim_op(st: Setup, attempt: Attempt, **overrides: Any) -> ClaimReceipt:
+    assert attempt.receipt_id is not None
+    receipt = st.journal.receipt(attempt.receipt_id)
+    assert receipt is not None
+    values: dict[str, Any] = {
+        "op": "claim_receipt",
+        "receipt": receipt,
+        "pep_instance_id": st.pep,
+        "actual_action_hash": action_of(attempt),
+    }
+    values.update(overrides)
+    return ClaimReceipt(**values)
+
+
+def claim(st: Setup, attempt: Attempt, op: ClaimReceipt | None = None) -> Attempt:
+    op = op if op is not None else claim_op(st, attempt)
+    evidence = w.evidence_for(attempt, A.DISPATCH_AUTHORIZED)
+    return st.sm.advance_attempt(attempt, A.DISPATCH_AUTHORIZED, evidence, ledger=(op,))
+
+
+def start(st: Setup, attempt: Attempt) -> Attempt:
+    from agent_core.types.ledger import MarkActive
+
+    op = MarkActive(op="mark_active", reservation_id=rsv(attempt), attempt_id=attempt.attempt_id)
+    evidence = w.evidence_for(attempt, A.DISPATCH_STARTED)
+    return st.sm.advance_attempt(attempt, A.DISPATCH_STARTED, evidence, ledger=(op,))
+
+
+def issued(st: Setup, step: Step, *, write: bool = False) -> Attempt:
+    """A fresh attempt up to PERMIT_ISSUED through the real path."""
     scopes = scopes_of(st.sm, step)
     caps(st, scopes)
-    attempt = reserve(st, fixed_attempt(st, step, scopes), 1_000)
-    path = (
-        A.INTENT_RECORDED,
-        A.PERMIT_ISSUED,
-        A.PERMIT_CONSUMED,
-        A.DISPATCH_AUTHORIZED,
-        A.DISPATCH_STARTED,
-    )
-    return w.drive(st.sm, attempt, path)
+    attempt = reserve(st, fixed_attempt(st, step, scopes, write=write), 1_000)
+    return issue(st, intent(st, attempt))
+
+
+def dispatched(st: Setup, step: Step) -> Attempt:
+    """A dispatched attempt through the real ledger path (WP-09B/C)."""
+    return start(st, claim(st, consume(st, issued(st, step))))
 
 
 def completed_scenario(st: Setup) -> Any:
@@ -276,3 +452,35 @@ def completed_scenario(st: Setup) -> Any:
 def rsv(attempt: Attempt) -> ReservationId:
     assert attempt.reservation_id is not None
     return attempt.reservation_id
+
+
+def action_of(attempt: Attempt) -> str:
+    assert attempt.action_hash is not None
+    return attempt.action_hash
+
+
+def activate_op(
+    attempt: Attempt, amount: int, cap: int = 5_000, required: int = 100
+) -> ActivateReservation:
+    return ActivateReservation(
+        op="activate",
+        reservation_id=rsv(attempt),
+        attempt_id=attempt.attempt_id,
+        action_hash=action_of(attempt),
+        estimate=fixed(required),
+        amount=xtu(amount),
+        cost_cap=xtu(cap),
+    )
+
+
+def grant_only(st: Setup, scopes: ReservationScopes) -> None:
+    """Install the Run grant without any budget cap (for missing-cap tests)."""
+    at = AttemptRef(
+        tenant_id=scopes.tenant_id,
+        task_id=scopes.task_id,
+        run_id=scopes.run_id,
+        step_id=scopes.step_id,
+        attempt_id=b.new_id(AttemptId),
+    )
+    st.grants[scopes.run_id] = s.grant(at)
+    st.owner(InstallRunGrant(op="install_run_grant", grant=st.grants[scopes.run_id]))

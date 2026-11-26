@@ -28,6 +28,9 @@ from agent_core.types.base import FrozenModel
 from agent_core.types.ids import (
     ApprovalId,
     AttemptId,
+    PepInstanceId,
+    PermitId,
+    ReceiptId,
     ReservationId,
     RunGrantId,
     RunId,
@@ -408,3 +411,124 @@ class SignedApproval(FrozenModel):
 
     approval: ExactApproval
     owner_mac: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+
+
+# ---------------------------------------------------------------- permits and receipts (WP-09C)
+
+PERMIT_MAC_DOMAIN = b"agent-core/permit/v1\x00"
+AUDIT_HASH_DOMAIN = b"agent-core/mandatory-audit/v1\x00"
+
+
+class Consumer(StrEnum):
+    """The single PEP that consumes a permit (C1 7.5). Phase 1 has the broker only."""
+
+    BROKER = "BROKER"
+    GATEWAY = "GATEWAY"
+
+
+class PermitState(StrEnum):
+    ISSUED = "ISSUED"
+    CONSUMED = "CONSUMED"
+    REVOKED = "REVOKED"
+
+
+class ReceiptState(StrEnum):
+    ISSUED = "ISSUED"
+    CLAIMED = "CLAIMED"
+    USED = "USED"
+    REVOKED = "REVOKED"
+
+
+class PermitReason(StrEnum):
+    """Fixed reasons a permit is not issued or not consumed, or a receipt not claimed."""
+
+    KEY_MISSING = "KEY_MISSING"
+    UNKNOWN_PERMIT = "UNKNOWN_PERMIT"
+    MAC_INVALID = "MAC_INVALID"
+    PERMIT_DIFFERS = "PERMIT_DIFFERS"
+    NOT_ISSUED = "NOT_ISSUED"
+    ATTEMPT_MISMATCH = "ATTEMPT_MISMATCH"
+    TENANT_MISMATCH = "TENANT_MISMATCH"
+    CONSUMER_MISMATCH = "CONSUMER_MISMATCH"
+    ACTION_MISMATCH = "ACTION_MISMATCH"
+    EXPIRED = "EXPIRED"
+    TTL_TOO_LONG = "TTL_TOO_LONG"
+    STALE_ACCESS_EPOCH = "STALE_ACCESS_EPOCH"
+    STALE_OWNER = "STALE_OWNER"
+    STALE_REVOCATION = "STALE_REVOCATION"
+    STOPPED = "STOPPED"
+    RESOURCE_DENIED = "RESOURCE_DENIED"
+    DECISION_MISSING = "DECISION_MISSING"
+    POLICY_DENIED = "POLICY_DENIED"
+    APPROVAL_INVALID = "APPROVAL_INVALID"
+    APPROVAL_MISSING = "APPROVAL_MISSING"
+    RESERVATION_INVALID = "RESERVATION_INVALID"
+    INTENT_MISSING = "INTENT_MISSING"
+    UNKNOWN_RECEIPT = "UNKNOWN_RECEIPT"
+    RECEIPT_DIFFERS = "RECEIPT_DIFFERS"
+    RECEIPT_NOT_ISSUED = "RECEIPT_NOT_ISSUED"
+    RECEIPT_NOT_CLAIMED = "RECEIPT_NOT_CLAIMED"
+    PEP_MISMATCH = "PEP_MISMATCH"
+
+
+class PermitBody(FrozenModel):
+    """C1 7.4 plus the bindings of E 38.2: action, reservation, consumer, epochs."""
+
+    permit_version: Literal[1]
+    permit_id: PermitId
+    tenant_id: TenantId
+    run_id: RunId
+    attempt_id: AttemptId
+    action_hash: Digest
+    reservation_id: ReservationId
+    consumer: Consumer
+    access_epoch: Epoch
+    owner_epoch: Epoch
+    revocation_gen: Epoch
+    policy_version: PolicyVersion
+    issued_at_ms: TimestampMs
+    expires_at_ms: TimestampMs
+
+
+class Permit(FrozenModel):
+    """A permit as handed to its consumer. The MAC is checked only by P1, inside the
+    consumption transaction (C1 7.4 item 1, C2 6.2). Holding one grants nothing."""
+
+    body: PermitBody
+    mac: Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+
+
+class Receipt(FrozenModel):
+    """Issued by the consumption transaction (E 3.3); used once by its PEP."""
+
+    receipt_version: Literal[1]
+    receipt_id: ReceiptId
+    permit_id: PermitId
+    tenant_id: TenantId
+    attempt_id: AttemptId
+    reservation_id: ReservationId
+    consumer: Consumer
+    pep_instance_id: PepInstanceId
+    revocation_gen: Epoch
+    expires_at_ms: TimestampMs
+
+
+class DispatchAuthorization(FrozenModel):
+    """What a PEP (WP-08 file broker) receives after claiming a receipt. It is not
+    authority by itself: right before acting, the PEP asks the ledger to confirm it
+    (``verify_dispatch``), and only the trusted record counts."""
+
+    receipt: Receipt
+    action_hash: Digest
+    descriptor: ActionDescriptor
+
+
+class AuditView(FrozenModel):
+    """One mandatory audit record as read back (IDs and codes only)."""
+
+    audit_seq: Annotated[int, Field(strict=True, ge=1)]
+    action: str
+    decision: str
+    reason: str | None
+    prev_hash: str | None
+    record_hash: str

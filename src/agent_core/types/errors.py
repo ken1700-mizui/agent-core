@@ -550,3 +550,13 @@ class OwnerAuthorizationError(CostError):
     """An owner operation without a valid owner channel MAC."""
 
     code = "OWNER_AUTHORIZATION"
+
+
+# ---------------------------------------------------------------- permits (WP-09C)
+
+
+class PermitRejectedError(SafetyError):
+    """A permit was not issued or not consumed, or a receipt not claimed. The whole
+    transaction is rolled back."""
+
+    code = "PERMIT_REJECTED"

@@ -26,8 +26,10 @@ Summary:
   event's runtime transitions (``sqlite_ledger.check_pairing``). Every append
   checks the pairing, so a transition that needs a ledger operation cannot be
   journaled without it, and vice versa. Ledger refusals roll everything back.
-- Schema version 2 adds the ledger tables. A version 1 file is refused, never
-  migrated (Phase 1 files are synthetic test data).
+- Schema version 3 adds the budget ledger (WP-09B) and the authority tables
+  (WP-09C: policy, grants, decisions, approvals, intents, permits, receipts,
+  stop state, epochs, deny list, mandatory audit). Older files are refused,
+  never migrated (Phase 1 files are synthetic test data).
 - The database directory must be a trusted local directory (A 5.3).
 """
 
@@ -80,11 +82,20 @@ from agent_core.types.event_hash import EVENT_HASH_VERSION, event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
 from agent_core.types.ledger import LedgerBatch, LedgerOp
-from agent_core.types.safety import LedgerKeys
+from agent_core.types.safety import (
+    AuditView,
+    DispatchAuthorization,
+    LedgerKeys,
+    Permit,
+    PermitState,
+    Receipt,
+    ReceiptState,
+    StopEntry,
+)
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 2
+JOURNAL_SCHEMA_VERSION: Final = 3
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -126,7 +137,7 @@ SCHEMA_DDL: Final = (
     CONSTRAINT events_run_position_unique UNIQUE (run_id, run_seq),
     CHECK ((run_id IS NULL) = (run_seq IS NULL))
 ) STRICT""",
-    *sqlite_ledger.LEDGER_DDL,
+    *sqlite_ledger.ALL_DDL,
 )
 
 _SCHEMA_OBJECTS_SQL: Final = (
@@ -303,7 +314,7 @@ class SqliteJournal:
             event, digest = self._position(cur, draft, expected)
             now = self._now()
             for op in ops:
-                sqlite_ledger.apply_op(cur, op, now_ms=now)
+                sqlite_ledger.apply_op(cur, op, now_ms=now, ctx=self._ledger_context())
             self._insert_event(cur, event, digest)
             self._update_heads(cur, event, digest)
         return event
@@ -321,6 +332,9 @@ class SqliteJournal:
         except (ValueError, TypeError) as exc:
             raise JournalArgumentError("ledger operations are invalid") from exc
 
+    def _ledger_context(self) -> sqlite_ledger.LedgerContext:
+        return sqlite_ledger.LedgerContext(keys=self._keys, owner_epoch=self._owner_epoch)
+
     def _now(self) -> int:
         now = self._clock.now_ms()
         if type(now) is not int or not 0 <= now <= MAX_INT64:
@@ -337,7 +351,7 @@ class SqliteJournal:
         with self._write_transaction(conn) as cur:
             now = self._now()
             for op in ops:
-                sqlite_ledger.apply_op(cur, op, now_ms=now)
+                sqlite_ledger.apply_op(cur, op, now_ms=now, ctx=self._ledger_context())
 
     def apply_owner_ledger(self, batch: LedgerBatch, *, owner_mac: str) -> None:
         """Owner operations, accepted only with the owner channel's MAC."""
@@ -352,7 +366,7 @@ class SqliteJournal:
         with self._write_transaction(conn) as cur:
             now = self._now()
             for op in batch.ops:
-                sqlite_ledger.apply_op(cur, op, now_ms=now)
+                sqlite_ledger.apply_op(cur, op, now_ms=now, ctx=self._ledger_context())
 
     def reservation(self, reservation_id: str) -> ReservationView | None:
         with self._read_transaction(self._require_open()) as cur:
@@ -372,6 +386,54 @@ class SqliteJournal:
     def ledger_entries(self, reservation_id: str) -> tuple[LedgerEntryView, ...]:
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.read_entries(cur, str(reservation_id))
+
+    def permit(self, permit_id: str) -> Permit | None:
+        """The stored permit as handed to its consumer (P1 to the PEP)."""
+        with self._read_transaction(self._require_open()) as cur:
+            found = sqlite_ledger.read_permit(cur, str(permit_id))
+        return None if found is None else found[0]
+
+    def permit_state(self, permit_id: str) -> PermitState | None:
+        with self._read_transaction(self._require_open()) as cur:
+            found = sqlite_ledger.read_permit(cur, str(permit_id))
+        return None if found is None else found[1]
+
+    def receipt(self, receipt_id: str) -> Receipt | None:
+        with self._read_transaction(self._require_open()) as cur:
+            found = sqlite_ledger.read_receipt(cur, str(receipt_id))
+        return None if found is None else found[0]
+
+    def receipt_state(self, receipt_id: str) -> ReceiptState | None:
+        with self._read_transaction(self._require_open()) as cur:
+            found = sqlite_ledger.read_receipt(cur, str(receipt_id))
+        return None if found is None else found[1]
+
+    def stop_entries(self) -> tuple[StopEntry, ...]:
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_stops(cur)
+
+    def audit_records(self) -> tuple[AuditView, ...]:
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_audit(cur)
+
+    def approval_uses(self, approval_id: str) -> int | None:
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_approval_uses(cur, str(approval_id))
+
+    def verify_dispatch(
+        self, receipt_id: str, *, pep_instance_id: str, action_hash: str
+    ) -> DispatchAuthorization:
+        """For a PEP right before it acts (WP-08): the claimed receipt must still
+        match the trusted record, the stop state and the revocation generation."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.verify_dispatch(
+                cur,
+                str(receipt_id),
+                pep_instance_id=str(pep_instance_id),
+                action_hash=str(action_hash),
+                now_ms=self._now(),
+                ctx=self._ledger_context(),
+            )
 
     @contextmanager
     def _write_transaction(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Cursor]:
@@ -768,6 +830,8 @@ def _initialize_verify_and_claim(
                 "INSERT INTO runtime_owner (singleton, epoch, instance_id, acquired_at_ms) "
                 "VALUES (1, 0, '', 0)"
             )
+            for statement in sqlite_ledger.LEDGER_INIT:
+                cur.execute(statement)
             cur.execute(f"PRAGMA application_id = {APPLICATION_ID}")
             cur.execute(f"PRAGMA user_version = {JOURNAL_SCHEMA_VERSION}")
         elif _inspect_schema(conn):
