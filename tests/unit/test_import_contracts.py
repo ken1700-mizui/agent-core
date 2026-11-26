@@ -317,3 +317,28 @@ def test_no_agent_core_module_imports_the_file_broker(tmp_path: Path, module: st
     result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
     assert result.returncode == 1
     assert f"{module} -> agent_core.adapters.file_broker" in result.stdout
+
+
+# ---------------------------------------------------- WP-14: the Context Engine is pure
+
+
+@pytest.mark.parametrize(
+    ("statement", "target"),
+    [
+        ("import sqlite3", "sqlite3"),
+        ("from agent_core.adapters import sqlite_journal", "agent_core.adapters.sqlite_journal"),
+        ("from agent_core.runtime import service", "agent_core.runtime.service"),
+        ("from agent_core.tool import registry", "agent_core.tool.registry"),
+        ("from agent_core.safety import pdp", "agent_core.safety.pdp"),
+        ("from agent_core.adapters import fake_model", "agent_core.adapters.fake_model"),
+    ],
+)
+def test_the_context_engine_depends_on_types_and_ports_only(
+    tmp_path: Path, statement: str, target: str
+) -> None:
+    """No storage, no runtime, no registry, no model, no Safety Engine (B1 1.1, C16)."""
+    src = _copy_real_package(tmp_path)
+    _plant(src, "agent_core.context.planted", statement)
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert f"agent_core.context.planted -> {target}" in result.stdout

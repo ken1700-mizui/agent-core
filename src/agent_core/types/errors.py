@@ -610,3 +610,46 @@ class LedgerInconsistencyError(JournalCorruptionError):
     The journal is refused unchanged; nothing is executed."""
 
     code = "LEDGER_INCONSISTENT"
+
+
+# ---------------------------------------------------------------- WP-14 Context Engine
+
+
+class ContextError(AgentCoreError):
+    """The context could not be built or verified. ``reasons`` are fixed codes;
+    the message never contains any text of the context."""
+
+    code = "CONTEXT_REFUSED"
+
+    def __init__(self, *reasons: str) -> None:
+        if not reasons:
+            raise ValueError("a refusal names at least one reason")
+        super().__init__(", ".join(reasons))
+        self.reasons: tuple[str, ...] = tuple(reasons)
+
+
+class ContextInputError(ContextError):
+    code = "CONTEXT_INPUT_INVALID"
+
+
+class ContextProfileError(ContextError):
+    code = "CONTEXT_PROFILE_UNSUPPORTED"
+
+
+class ProtectedFactError(ContextError):
+    code = "PROTECTED_FACT_REFUSED"
+
+
+class ContextVerificationError(ContextError):
+    code = "CONTEXT_VERIFICATION_FAILED"
+
+
+class ContextBudgetExceededError(ContextError):
+    """B1 4.3 step 4: the required items do not fit. Numbers only."""
+
+    code = "CONTEXT_BUDGET_EXCEEDED"
+
+    def __init__(self, *, required_tokens: int, limit: int) -> None:
+        super().__init__("CONTEXT_BUDGET_EXCEEDED")
+        self.required_tokens = required_tokens
+        self.limit = limit
