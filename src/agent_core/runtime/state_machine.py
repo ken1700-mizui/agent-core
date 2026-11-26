@@ -31,6 +31,7 @@ from agent_core.types.errors import (
     TransitionPreconditionError,
     UnknownEntityError,
 )
+from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event
 from agent_core.types.ids import AttemptId, RunId, StepId, TaskId
 from agent_core.types.records import (
@@ -168,7 +169,15 @@ _OUTCOME_TARGETS = frozenset({A.COMPLETED, A.FAILED_DEFINITE, A.OUTCOME_UNKNOWN,
 _PEP_INVOLVED = frozenset({A.PERMIT_CONSUMED, A.DISPATCH_AUTHORIZED})
 # Run states in which attempts may make progress, and in which results may arrive.
 _ACTIVE_RUN = frozenset({R.RUNNING, R.WAITING_TOOL, R.WAITING_APPROVAL})
-_RESULT_RUN = _ACTIVE_RUN | {R.CANCELLING, R.RECONCILIATION_REQUIRED, R.RECOVERING}
+_RESULT_RUN = _ACTIVE_RUN | {
+    R.CANCELLING,
+    R.RECONCILIATION_REQUIRED,
+    R.RECOVERING,
+    # WP04-R03: a terminal run never resumes, but its unresolved attempts can still
+    # be settled (result, unknown, abort or reconciliation) and the record kept.
+    R.FAILED,
+    R.ABORTED_SAFETY,
+}
 
 
 def check_edge(table: Mapping[Any, frozenset[Any]], current: Any, target: Any, what: str) -> None:
@@ -242,6 +251,15 @@ def _all_final(attempts: Iterable[Attempt]) -> bool:
     return all(a.state in FINAL_ATTEMPT_STATES for a in attempts)
 
 
+def _task_settled(state: RuntimeState, task: Task) -> bool:
+    """No attempt of any run of the task is unresolved (WP04-R03).
+
+    A terminal run does not settle its attempts: an OUTCOME_UNKNOWN or an
+    in-flight attempt (reservation held, permit consumed) stays unresolved.
+    """
+    return all(_all_final(state.attempts_of_run(r)) for r in task.runs)
+
+
 # ---------------------------------------------------------------- tasks
 
 
@@ -261,6 +279,9 @@ def plan_task_status(state: RuntimeState, before: Task, target: TaskStatus) -> T
         _require(runs[-1].status is R.COMPLETED, "the last run must be COMPLETED")
     if target in (T.COMPLETED, T.CANCELLED, T.FAILED, T.PAUSED):
         _require(all(r.status in TERMINAL_RUN_STATUSES for r in runs), "a run is still open")
+    if target in (T.COMPLETED, T.CANCELLED, T.PAUSED, T.ACTIVE):
+        # FAILED stays possible: accepting a permanently unknown effect (A 6.1).
+        _require(_task_settled(state, before), "unresolved side effects remain in the task")
     after = before.evolve(status=target)
     return TaskTransition(entity="task", action=TaskAction.SET_STATUS, before=before, after=after)
 
@@ -289,9 +310,14 @@ def plan_run_create(state: RuntimeState, run: Run) -> RunTransition:
         all(state.runs[r].status in TERMINAL_RUN_STATUSES for r in task.runs),
         "the task already has an open run",
     )
+    _require(
+        _task_settled(state, task),
+        "unresolved side effects remain; a new run could repeat them (WP04-R03)",
+    )
     expected_parent = task.runs[-1] if task.runs else None
     _require(run.parent_run_id == expected_parent, "a new run continues from the task's last run")
     _require(run.status is R.CREATED, "a new run starts CREATED")
+    _require(not run.cancel_requested, "a new run has no cancel request")
     return RunTransition(
         entity="run", action=EntityAction.CREATE, before=None, after=run, evidence=None
     )
@@ -353,6 +379,7 @@ def plan_run_status(
             "a RESUME resolution is required",
         )
         _require(not unknown, "unknown outcomes must be reconciled first")
+        _require(not before.cancel_requested, "a cancel request cannot be resumed (WP04-R04)")
     elif target is R.QUEUED and source is R.RECOVERING:
         _no_evidence(evidence)
         _require(not unknown, "unknown outcomes need reconciliation, not a restart")
@@ -360,7 +387,8 @@ def plan_run_status(
         _no_evidence(evidence)
     if target in (R.QUEUED, R.RUNNING):
         _require(task.status is T.ACTIVE, "the task is not ACTIVE")
-    after = before.evolve(status=target)
+    cancel = before.cancel_requested or target is R.CANCELLING
+    after = before.evolve(status=target, cancel_requested=cancel)
     return RunTransition(
         entity="run", action=EntityAction.SET_STATUS, before=before, after=after, evidence=evidence
     )
@@ -376,6 +404,10 @@ def plan_step_create(state: RuntimeState, step: Step) -> StepTransition:
     if run is None:
         raise UnknownEntityError("unknown run")
     _require(run.status is R.RUNNING, "steps are created only while the run is RUNNING")
+    _require(
+        _all_final(state.attempts_of_run(step.run_id)),
+        "an attempt of the run is unresolved; a new step could repeat it (WP04-R03)",
+    )
     _require(step.status is S.PLANNED, "a new step starts PLANNED")
     _require(
         step.run_seq == state.run_seqs.get(step.run_id, 0) + 1,
@@ -393,8 +425,8 @@ def plan_step_status(state: RuntimeState, before: Step, target: StepStatus) -> S
         _require(run.status is R.RUNNING, "the run is not RUNNING")
     elif target is S.COMMITTED:
         _require(
-            run.status in (R.RUNNING, R.RECONCILIATION_REQUIRED),
-            "results are not used while the run is not RUNNING (late results)",
+            run.status in (R.RUNNING, R.RECONCILIATION_REQUIRED) and not run.cancel_requested,
+            "results are not used after a cancel request or outside RUNNING (late results)",
         )
         _require(
             bool(attempts) and _all_final(attempts) and attempts[-1].state is A.COMPLETED,
@@ -406,7 +438,10 @@ def plan_step_status(state: RuntimeState, before: Step, target: StepStatus) -> S
     elif target is S.RECONCILIATION_REQUIRED:
         _require(any(a.state is A.OUTCOME_UNKNOWN for a in attempts), "no unknown outcome")
     elif target is S.CANCELLED:
-        _require(run.status in (R.RUNNING, R.CANCELLING), "the run is not RUNNING or CANCELLING")
+        _require(
+            run.status in (R.RUNNING, R.CANCELLING, R.RECONCILIATION_REQUIRED),
+            "the run is not RUNNING, CANCELLING or RECONCILIATION_REQUIRED",
+        )
         _require(_all_final(attempts), "attempts are still open or unknown")
     after = before.evolve(status=target)
     return StepTransition(entity="step", action=EntityAction.SET_STATUS, before=before, after=after)
@@ -422,7 +457,10 @@ def plan_attempt_create(state: RuntimeState, attempt: Attempt) -> AttemptTransit
     if step is None:
         raise UnknownEntityError("unknown step")
     run = state.runs[step.run_id]
-    _require(run.status is R.RUNNING, "attempts are created only while the run is RUNNING")
+    _require(
+        run.status is R.RUNNING and not run.cancel_requested,
+        "attempts are created only while the run is RUNNING and not cancelled",
+    )
     _require(step.status is S.IN_PROGRESS, "the step is not IN_PROGRESS")
     previous = state.attempts_of_step(step.step_id)
     _require(_all_final(previous), "an earlier attempt is still open or unknown (A.I4)")
@@ -471,8 +509,15 @@ def plan_attempt_status(
     if target in _OUTCOME_TARGETS:
         _require(run.status in _RESULT_RUN, "the run cannot accept results now")
     else:
-        _require(run.status in _ACTIVE_RUN, "attempts progress only while the run is active")
-    late = run.status is R.CANCELLING and target in _OUTCOME_TARGETS
+        _require(
+            run.status in _ACTIVE_RUN and not run.cancel_requested,
+            "attempts progress only while the run is active and not cancelled",
+        )
+    # A result after a cancel request, or in a terminal run, is late (A 6): it is
+    # recorded and settles the attempt, but it is never used to make progress.
+    late = target in _OUTCOME_TARGETS and (
+        run.cancel_requested or run.status in TERMINAL_RUN_STATUSES
+    )
     action = before.action_hash
     changes: dict[str, Any] = {}
 
@@ -633,12 +678,19 @@ def apply_payload(
     run's next position; ``apply_event`` checks that the event has that position.
     """
     runs: set[RunId] = set()
+    created: set[RunId] = set()
+    attached: set[RunId] = set()
     for transition in payload.transitions:
         run_id = _run_of(state, transition)
         if run_id is not None:
             runs.add(run_id)
+        if isinstance(transition, RunTransition) and transition.action is EntityAction.CREATE:
+            created.add(transition.after.run_id)
+        if isinstance(transition, TaskTransition) and transition.action is TaskAction.ATTACH_RUN:
+            attached.add(transition.after.runs[-1])
         state = apply_transition(state, transition)
     _require(len(runs) <= 1, "one event covers at most one run")
+    _require(created == attached, "a run is created and attached in the same event")
     return state, next(iter(runs), None)
 
 
@@ -656,6 +708,13 @@ def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
         new_state, run_id = apply_payload(state, event.payload)
         if run_id != event.run_id:
             raise StateRebuildError("event run_id does not match its transitions")
+        for transition in event.payload.transitions:
+            if (
+                isinstance(transition, RunTransition)
+                and transition.action is EntityAction.CREATE
+                and transition.after.owner_epoch != event.owner_epoch
+            ):
+                raise StateRebuildError("run owner_epoch differs from its creating event")
     except StateTransitionError as exc:
         raise StateRebuildError(f"invalid transition in event: {exc.code}") from exc
     if event.run_id is not None and event.run_seq is not None:
@@ -664,17 +723,34 @@ def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
 
 
 def rebuild(events: Iterable[Event]) -> RuntimeState:
-    """Fold events in ``tenant_seq`` order into a state. Deterministic."""
+    """Full rebuild from an empty state. Deterministic. See ``rebuild_with_head``."""
+    return rebuild_with_head(events)[0]
+
+
+def rebuild_with_head(events: Iterable[Event]) -> tuple[RuntimeState, Event | None, str | None]:
+    """Fold a tenant's complete event sequence from an empty state.
+
+    The sequence must start at ``tenant_seq`` 1, be consecutive, belong to one
+    tenant and form the hash chain (each ``prev_hash`` is the previous event's
+    hash). Returns the state, the last event and its hash (the head the state
+    was built from). Starting from a later position needs a verified snapshot:
+    a separate contract, not provided before WP-12.
+    """
     state = RuntimeState.empty()
     tenant = None
-    expected_seq = None
+    expected_seq = 1
+    previous: Event | None = None
+    previous_hash: str | None = None
     for event in events:
         if tenant is None:
             tenant = event.tenant_id
         elif event.tenant_id != tenant:
             raise StateRebuildError("events of several tenants")
-        if expected_seq is not None and event.tenant_seq != expected_seq:
-            raise StateRebuildError("events are not consecutive in tenant_seq")
-        expected_seq = event.tenant_seq + 1
+        if event.tenant_seq != expected_seq:
+            raise StateRebuildError("a full rebuild starts at tenant_seq 1 without gaps")
+        if event.prev_hash != previous_hash:
+            raise StateRebuildError("hash chain broken")
         state = apply_event(state, event)
-    return state
+        previous, previous_hash = event, event_hash(event)
+        expected_seq += 1
+    return state, previous, previous_hash

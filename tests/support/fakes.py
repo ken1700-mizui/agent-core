@@ -8,9 +8,10 @@ is WP-03's SQLite UNIQUE constraint).
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator
+from typing import Any
 
-from agent_core.ports.journal import JournalHead
-from agent_core.types.errors import DuplicateIdError
+from agent_core.ports.journal import HeadExpectation, JournalHead
+from agent_core.types.errors import DuplicateIdError, JournalHeadMismatchError
 from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import EntityId, EventId, RunId, TenantId
@@ -72,7 +73,9 @@ class InMemoryJournal:
         self._event_ids: set[EventId] = set()
         self._run_seq: dict[RunId, int] = {}
 
-    def append(self, draft: EventDraft) -> Event:
+    def append(self, draft: EventDraft, *, expected: HeadExpectation) -> Event:
+        if HeadExpectation.of(self.head(draft.tenant_id)) != expected:
+            raise JournalHeadMismatchError("tenant head is not the expected head")
         if draft.event_id in self._event_ids:
             raise DuplicateIdError(draft.event_id)
         events = self._events.setdefault(draft.tenant_id, [])
@@ -111,3 +114,10 @@ class InMemoryJournal:
 
 def _stand_in_hash(event: Event) -> Digest:
     return event_hash(event)
+
+
+def append_next(journal: Any, draft: EventDraft) -> Event:
+    """Test helper: append at the journal's current head (reads the head first)."""
+    expected = HeadExpectation.of(journal.head(draft.tenant_id))
+    event: Event = journal.append(draft, expected=expected)
+    return event

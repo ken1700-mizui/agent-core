@@ -21,7 +21,7 @@ from typing import Any
 from agent_core.identity.generator import IdGenerator
 from agent_core.ports.clock import Clock
 from agent_core.ports.evidence import EvidenceVerifier
-from agent_core.ports.journal import JournalPort
+from agent_core.ports.journal import HeadExpectation, JournalPort
 from agent_core.runtime.state_machine import (
     RuntimeState,
     apply_event,
@@ -36,9 +36,21 @@ from agent_core.runtime.state_machine import (
     plan_task_attach,
     plan_task_create,
     plan_task_status,
-    rebuild,
+    rebuild_with_head,
 )
-from agent_core.types.errors import StateDivergenceError, StateRebuildError
+from agent_core.types.errors import (
+    JournalArgumentError,
+    JournalClosedError,
+    JournalHeadMismatchError,
+    JournalStorageError,
+    RunTenantMismatchError,
+    RuntimeReloadRequiredError,
+    StaleEventEpochError,
+    StaleStateError,
+    StateDivergenceError,
+    StateRebuildError,
+)
+from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import AttemptId, EventId, RunGrantId, RunId, StepId, TaskId, TenantId
 from agent_core.types.records import (
@@ -65,6 +77,15 @@ from agent_core.types.transitions import (
 from agent_core.types.values import Budget, EngineVersion, NonMonetaryCaps
 
 READ_PAGE = 1_000
+# Journal errors after which nothing was stored (the write was rolled back or
+# refused before it began). Any other error leaves the outcome unknown.
+_NOTHING_STORED = (
+    JournalStorageError,
+    JournalArgumentError,
+    JournalClosedError,
+    StaleEventEpochError,
+    RunTenantMismatchError,
+)
 # Phase 1 is synthetic only (PHASE_1_IMPLEMENTATION_PLAN section 2).
 EVENT_LABELS = ("synthetic",)
 
@@ -81,6 +102,7 @@ class RuntimeStateMachine:
         engine: EngineVersion,
         policy_version: str,
         state: RuntimeState,
+        head: HeadExpectation,
     ) -> None:
         self._journal = journal
         self._ids = ids
@@ -90,8 +112,10 @@ class RuntimeStateMachine:
         self._engine = engine
         self._policy_version = policy_version
         self._state = state
+        # The journal head this state was built from (WP04-R01).
+        self._head = head
         self._late = False
-        self._diverged = False
+        self._reload_required = False
 
     @classmethod
     def load(
@@ -105,13 +129,28 @@ class RuntimeStateMachine:
         engine: EngineVersion,
         policy_version: str,
     ) -> RuntimeStateMachine:
-        """Rebuild the state from the Journal (the source of truth)."""
+        """Rebuild the state from the Journal (the source of truth).
+
+        Pages are read until the journal's head is the last event read; if the
+        journal grew while reading, reading continues. The resulting state is
+        bound to that head (``tenant_seq`` and hash) for every later append.
+        """
         events: list[Event] = []
         while True:
             page = journal.read_tenant(tenant_id, after_tenant_seq=len(events), limit=READ_PAGE)
             events.extend(page)
-            if len(page) < READ_PAGE:
-                break
+            if len(page) == READ_PAGE:
+                continue
+            head = journal.head(tenant_id)
+            if head is not None and head.tenant_seq > len(events):
+                continue
+            break
+        state, last, last_hash = rebuild_with_head(events)
+        expected = HeadExpectation(
+            tenant_seq=0 if last is None else last.tenant_seq, head_hash=last_hash
+        )
+        if HeadExpectation.of(head) != expected:
+            raise StateRebuildError("journal head does not match the events read")
         return cls(
             journal=journal,
             ids=ids,
@@ -120,7 +159,8 @@ class RuntimeStateMachine:
             tenant_id=tenant_id,
             engine=engine,
             policy_version=policy_version,
-            state=rebuild(events),
+            state=state,
+            head=expected,
         )
 
     @property
@@ -175,6 +215,7 @@ class RuntimeStateMachine:
             status=RunStatus.CREATED,
             owner_epoch=self._journal.owner_epoch,
             parent_run_id=task.runs[-1] if task.runs else None,
+            cancel_requested=False,
         )
         transitions.append(plan_run_create(state, run))
         state = apply_transition(state, transitions[-1])
@@ -243,12 +284,13 @@ class RuntimeStateMachine:
                     self._verifier.verify(evidence, subject=transition.before)
 
     def _commit(self, transitions: tuple[Transition, ...]) -> Event:
-        if self._diverged:
-            raise StateDivergenceError("state diverged from the journal; reload required")
+        if self._reload_required:
+            raise RuntimeReloadRequiredError("reload the runtime from the journal")
         payload = RuntimePayload(transitions=transitions)
         # Dry run of the whole payload on the current state (no I/O, no change).
         _, run_id = apply_payload(self._state, payload)
         self._verify_evidence(transitions)
+        expected = self._head
 
         def write(event_id: EventId) -> Event:
             draft = EventDraft(
@@ -268,12 +310,27 @@ class RuntimeStateMachine:
                 recorded_at_ms=self._clock.now_ms(),
                 payload=payload,
             )
-            return self._journal.append(draft)
+            # The journal compares ``expected`` with its head inside the write
+            # transaction; a state that changed after verification is refused.
+            return self._journal.append(draft, expected=expected)
 
-        event = self._ids.issue_unique(EventId, write)
         try:
+            event = self._ids.issue_unique(EventId, write)
+        except JournalHeadMismatchError as exc:
+            self._reload_required = True
+            raise StaleStateError("the journal changed; this runtime state is stale") from exc
+        except _NOTHING_STORED:
+            raise
+        except BaseException:
+            # Outcome unknown (or unexpected): never continue from the old state.
+            self._reload_required = True
+            raise
+        try:
+            if event.tenant_seq != expected.tenant_seq + 1 or event.prev_hash != expected.head_hash:
+                raise StateRebuildError("stored event is not the next position")
             self._state = apply_event(self._state, event)
         except StateRebuildError as exc:
-            self._diverged = True
+            self._reload_required = True
             raise StateDivergenceError("stored event does not fold into the state") from exc
+        self._head = HeadExpectation(tenant_seq=event.tenant_seq, head_hash=event_hash(event))
         return event

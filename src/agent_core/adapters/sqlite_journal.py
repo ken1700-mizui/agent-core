@@ -38,7 +38,7 @@ from typing import Any, Final
 
 from agent_core.adapters.runtime_lock import RuntimeLock
 from agent_core.ports.clock import Clock
-from agent_core.ports.journal import JournalHead
+from agent_core.ports.journal import HeadExpectation, JournalHead
 from agent_core.ports.randomness import RandomSource
 from agent_core.types.errors import (
     DuplicateIdError,
@@ -48,6 +48,7 @@ from agent_core.types.errors import (
     JournalCorruptionError,
     JournalError,
     JournalFileChangedError,
+    JournalHeadMismatchError,
     JournalSchemaError,
     JournalStorageError,
     JournalWriteOutcomeUnknownError,
@@ -244,14 +245,16 @@ class SqliteJournal:
 
     # ------------------------------------------------------------ append
 
-    def append(self, draft: EventDraft) -> Event:
+    def append(self, draft: EventDraft, *, expected: HeadExpectation) -> Event:
         conn = self._require_open()
         if type(draft) is not EventDraft:
             raise JournalArgumentError("append expects an EventDraft")
+        if type(expected) is not HeadExpectation:
+            raise JournalArgumentError("append expects a HeadExpectation")
         if draft.owner_epoch != self._owner_epoch:
             raise StaleEventEpochError("draft owner_epoch is not the current owner epoch")
         with self._write_transaction(conn) as cur:
-            event, digest = self._position(cur, draft)
+            event, digest = self._position(cur, draft, expected)
             self._insert_event(cur, event, digest)
             self._update_heads(cur, event, digest)
         return event
@@ -276,7 +279,7 @@ class SqliteJournal:
             # Ownership is checked again inside the transaction, just before COMMIT.
             self._check_owner(cur)
             self._check_files()
-        except (DuplicateIdError, RunTenantMismatchError):
+        except (DuplicateIdError, RunTenantMismatchError, JournalHeadMismatchError):
             self._rollback_or_unknown()
             raise
         except JournalError:
@@ -315,9 +318,14 @@ class SqliteJournal:
         if _database_identity(self._path) != self._identity:
             raise JournalFileChangedError("journal path no longer names the opened file")
 
-    def _position(self, cur: sqlite3.Cursor, draft: EventDraft) -> Verified:
+    def _position(
+        self, cur: sqlite3.Cursor, draft: EventDraft, expected: HeadExpectation
+    ) -> Verified:
         tenant = str(draft.tenant_id)
         head = _head_row(cur, tenant)
+        # Compared inside BEGIN IMMEDIATE, so no other write can come in between.
+        if (head or (0, None)) != (expected.tenant_seq, expected.head_hash):
+            raise JournalHeadMismatchError("tenant head is not the expected head")
         if head is not None and head[0] >= MAX_INT64:
             raise SequenceExhaustedError("tenant_seq would exceed 2**63-1")
         _check_tenant_tail(cur, tenant, head)

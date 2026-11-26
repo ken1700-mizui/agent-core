@@ -19,6 +19,7 @@ from agent_core.adapters.system import OsRandomSource, SystemClock
 from agent_core.identity.generator import IdGenerator
 from agent_core.types.ids import EventId
 from support import builders as b
+from support.fakes import append_next
 
 
 def main() -> int:
@@ -33,8 +34,8 @@ def main() -> int:
         return 0
     if mode == "append-then-hang":
         for _ in range(2):
-            journal.append(
-                b.event_draft(owner_epoch=journal.owner_epoch, event_id=ids.new(EventId))
+            append_next(
+                journal, b.event_draft(owner_epoch=journal.owner_epoch, event_id=ids.new(EventId))
             )
 
         def hang(*_args: object, **_kwargs: object) -> None:
@@ -43,7 +44,9 @@ def main() -> int:
                 time.sleep(60)
 
         journal._update_heads = hang  # type: ignore[method-assign]  # test-only fault point
-        journal.append(b.event_draft(owner_epoch=journal.owner_epoch, event_id=ids.new(EventId)))
+        append_next(
+            journal, b.event_draft(owner_epoch=journal.owner_epoch, event_id=ids.new(EventId))
+        )
         return 1
     return 2
 

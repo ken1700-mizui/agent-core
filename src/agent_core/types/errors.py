@@ -139,6 +139,15 @@ class OwnerEpochMismatchError(JournalError):
     code = "OWNER_EPOCH_MISMATCH"
 
 
+class JournalHeadMismatchError(JournalError):
+    """The tenant head is not the one the caller expected. Nothing was stored.
+
+    The caller's state is stale (another writer, or a lost update): reload it."""
+
+    code = "JOURNAL_HEAD_MISMATCH"
+    fatal = False
+
+
 class StaleEventEpochError(JournalError):
     """A draft carries an owner_epoch other than the journal's current one."""
 
@@ -257,6 +266,14 @@ class StateRebuildError(AgentCoreError):
     """Journal events cannot be folded into a valid state. Never ignored."""
 
     code = "STATE_REBUILD_FAILED"
+    fatal = True
+
+
+class RuntimeReloadRequiredError(AgentCoreError):
+    """The runtime's state may no longer match the Journal (stale head, unknown write
+    outcome or divergence). It refuses every command until it is reloaded."""
+
+    code = "RUNTIME_RELOAD_REQUIRED"
     fatal = True
 
 

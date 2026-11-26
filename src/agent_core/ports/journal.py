@@ -7,6 +7,11 @@ Contract (E_INTEGRATION 2.1-2.3, A 2):
   to the previous event's hash, and stores the event, all in one transaction.
 - A duplicate ``event_id`` raises ``DuplicateIdError`` and stores nothing,
   so the caller can retry with a new ID (``IdGenerator.issue_unique``).
+- Every append names the head its caller's state was built from
+  (``HeadExpectation``: ``tenant_seq`` and ``head_hash``). The journal compares
+  it with the actual head inside the write transaction, before storing
+  anything; a mismatch raises ``JournalHeadMismatchError`` and stores nothing.
+  There is no append without an expectation (WP04-R01).
 - Reads return events in ``tenant_seq`` order.
 - The event hash is ``agent_core.types.event_hash`` (version 1). Storage schema
   and transactions are in the SQLite adapter (docs/design/phase-1/WP-03_JOURNAL.md).
@@ -14,12 +19,14 @@ Contract (E_INTEGRATION 2.1-2.3, A 2):
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Annotated, Protocol, Self, runtime_checkable
+
+from pydantic import Field, model_validator
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
-from agent_core.types.values import Digest, Seq
+from agent_core.types.values import MAX_INT64, Digest, Seq
 
 
 class JournalHead(FrozenModel):
@@ -30,6 +37,25 @@ class JournalHead(FrozenModel):
     head_hash: Digest
 
 
+class HeadExpectation(FrozenModel):
+    """The head a caller's state was built from. ``tenant_seq`` 0 means no events."""
+
+    tenant_seq: Annotated[int, Field(strict=True, ge=0, le=MAX_INT64)]
+    head_hash: Digest | None
+
+    @model_validator(mode="after")
+    def _empty_has_no_hash(self) -> Self:
+        if (self.tenant_seq == 0) != (self.head_hash is None):
+            raise ValueError("only an empty journal (tenant_seq 0) has no head hash")
+        return self
+
+    @classmethod
+    def of(cls, head: JournalHead | None) -> HeadExpectation:
+        if head is None:
+            return cls(tenant_seq=0, head_hash=None)
+        return cls(tenant_seq=head.tenant_seq, head_hash=head.head_hash)
+
+
 @runtime_checkable
 class JournalPort(Protocol):
     @property
@@ -37,8 +63,10 @@ class JournalPort(Protocol):
         """The current owner epoch; every draft must carry it."""
         ...
 
-    def append(self, draft: EventDraft) -> Event:
-        """Store the draft at the next position, or raise ``DuplicateIdError``."""
+    def append(self, draft: EventDraft, *, expected: HeadExpectation) -> Event:
+        """Store the draft at the next position if the head is ``expected``.
+
+        Raises ``JournalHeadMismatchError`` or ``DuplicateIdError`` (nothing stored)."""
         ...
 
     def read_tenant(

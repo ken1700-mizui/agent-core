@@ -22,6 +22,7 @@ from agent_core.adapters.sqlite_journal import SqliteJournal
 from agent_core.adapters.system import OsRandomSource, SystemClock
 from agent_core.types.errors import RuntimeLockHeldError
 from support import builders as b
+from support.fakes import append_next
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CHILD = REPO_ROOT / "tests" / "support" / "journal_child.py"
@@ -108,7 +109,7 @@ def test_kill_inside_a_transaction_leaves_no_partial_write_or_gap(tmp_path: Path
         assert head.tenant_seq == 2
         events = journal.read_tenant(b.TENANT, after_tenant_seq=0, limit=10)
         assert [e.tenant_seq for e in events] == [1, 2]
-        nxt = journal.append(b.event_draft(owner_epoch=journal.owner_epoch))
+        nxt = append_next(journal, b.event_draft(owner_epoch=journal.owner_epoch))
         assert nxt.tenant_seq == 3
         assert journal.verify_tenant(b.TENANT) is not None
     finally:

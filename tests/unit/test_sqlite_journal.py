@@ -23,13 +23,14 @@ from agent_core.adapters.sqlite_journal import (
     SqliteJournal,
 )
 from agent_core.adapters.system import OsRandomSource, SystemClock
-from agent_core.ports.journal import JournalPort, JournalVerifier
+from agent_core.ports.journal import HeadExpectation, JournalPort, JournalVerifier
 from agent_core.types.errors import (
     DuplicateIdError,
     JournalArgumentError,
     JournalClosedError,
     JournalCorruptionError,
     JournalFileChangedError,
+    JournalHeadMismatchError,
     JournalSchemaError,
     JournalStorageError,
     JournalWriteOutcomeUnknownError,
@@ -46,7 +47,7 @@ from agent_core.types.events import Event
 from agent_core.types.ids import EventId, RunId, TenantId
 from agent_core.types.values import MAX_INT64
 from support import builders as b
-from support.fakes import ScriptedRandomSource
+from support.fakes import ScriptedRandomSource, append_next
 
 
 def _open(path: Path) -> SqliteJournal:
@@ -157,9 +158,9 @@ def test_symlinked_database_path_is_rejected(tmp_path: Path) -> None:
 
 def test_append_assigns_positions_and_chain(journal: SqliteJournal) -> None:
     run_id = b.new_id(RunId)
-    first = journal.append(_draft(journal))
-    second = journal.append(_draft(journal, run_id=run_id))
-    third = journal.append(_draft(journal, run_id=run_id))
+    first = append_next(journal, _draft(journal))
+    second = append_next(journal, _draft(journal, run_id=run_id))
+    third = append_next(journal, _draft(journal, run_id=run_id))
     assert [e.tenant_seq for e in (first, second, third)] == [1, 2, 3]
     assert (first.run_seq, second.run_seq, third.run_seq) == (None, 1, 2)
     assert first.prev_hash is None
@@ -176,10 +177,10 @@ def test_append_assigns_positions_and_chain(journal: SqliteJournal) -> None:
 def test_tenants_and_runs_are_isolated(journal: SqliteJournal) -> None:
     other_tenant = b.new_id(TenantId)
     run_a, run_b = b.new_id(RunId), b.new_id(RunId)
-    journal.append(_draft(journal, run_id=run_a))
-    journal.append(_draft(journal, tenant_id=other_tenant, run_id=run_b))
-    journal.append(_draft(journal, run_id=run_a))
-    other = journal.append(_draft(journal, tenant_id=other_tenant, run_id=run_b))
+    append_next(journal, _draft(journal, run_id=run_a))
+    append_next(journal, _draft(journal, tenant_id=other_tenant, run_id=run_b))
+    append_next(journal, _draft(journal, run_id=run_a))
+    other = append_next(journal, _draft(journal, tenant_id=other_tenant, run_id=run_b))
     assert other.tenant_seq == 2
     assert other.run_seq == 2
     assert [
@@ -194,16 +195,16 @@ def test_tenants_and_runs_are_isolated(journal: SqliteJournal) -> None:
 
 def test_run_cannot_move_to_another_tenant(journal: SqliteJournal, db_path: Path) -> None:
     run_id = b.new_id(RunId)
-    journal.append(_draft(journal, run_id=run_id))
+    append_next(journal, _draft(journal, run_id=run_id))
     with pytest.raises(RunTenantMismatchError):
-        journal.append(_draft(journal, tenant_id=b.new_id(TenantId), run_id=run_id))
+        append_next(journal, _draft(journal, tenant_id=b.new_id(TenantId), run_id=run_id))
     assert _count(db_path, "events") == 1
-    assert journal.append(_draft(journal, run_id=run_id)).run_seq == 2
+    assert append_next(journal, _draft(journal, run_id=run_id)).run_seq == 2
 
 
 def test_stale_owner_epoch_in_draft_is_rejected(journal: SqliteJournal, db_path: Path) -> None:
     with pytest.raises(StaleEventEpochError):
-        journal.append(b.event_draft(owner_epoch=journal.owner_epoch + 1))
+        append_next(journal, b.event_draft(owner_epoch=journal.owner_epoch + 1))
     assert _count(db_path, "events") == 0
 
 
@@ -228,7 +229,7 @@ def test_read_rejects_untyped_tenant_and_run_ids(journal: SqliteJournal) -> None
 
 
 def test_reads_beyond_the_end_are_empty(journal: SqliteJournal) -> None:
-    journal.append(_draft(journal))
+    append_next(journal, _draft(journal))
     assert journal.read_tenant(b.TENANT, after_tenant_seq=1, limit=5) == ()
     assert journal.read_tenant(b.new_id(TenantId), after_tenant_seq=0, limit=5) == ()
 
@@ -237,29 +238,29 @@ def test_reads_beyond_the_end_are_empty(journal: SqliteJournal) -> None:
 
 
 def test_duplicate_event_id_rolls_back_everything(journal: SqliteJournal, db_path: Path) -> None:
-    taken = journal.append(_draft(journal)).event_id
+    taken = append_next(journal, _draft(journal)).event_id
     new_run = b.new_id(RunId)
     with pytest.raises(DuplicateIdError) as excinfo:
-        journal.append(_draft(journal, event_id=taken, run_id=new_run))
+        append_next(journal, _draft(journal, event_id=taken, run_id=new_run))
     assert excinfo.value.entity_id == taken
     assert _count(db_path, "events") == 1
     assert _count(db_path, "run_head") == 0
     head = journal.head(b.TENANT)
     assert head is not None
     assert head.tenant_seq == 1
-    assert journal.append(_draft(journal)).tenant_seq == 2
+    assert append_next(journal, _draft(journal)).tenant_seq == 2
 
 
 def test_duplicate_across_tenants_is_also_rejected(journal: SqliteJournal) -> None:
-    taken = journal.append(_draft(journal)).event_id
+    taken = append_next(journal, _draft(journal)).event_id
     with pytest.raises(DuplicateIdError):
-        journal.append(_draft(journal, tenant_id=b.new_id(TenantId), event_id=taken))
+        append_next(journal, _draft(journal, tenant_id=b.new_id(TenantId), event_id=taken))
 
 
 def test_non_duplicate_constraint_failure_is_not_a_duplicate(
     journal: SqliteJournal, db_path: Path
 ) -> None:
-    journal.append(_draft(journal))
+    append_next(journal, _draft(journal))
     conn = _raw(db_path)
     conn.execute(
         "CREATE TRIGGER synthetic_fault BEFORE INSERT ON events "
@@ -267,12 +268,12 @@ def test_non_duplicate_constraint_failure_is_not_a_duplicate(
     )
     conn.close()
     with pytest.raises(JournalStorageError) as excinfo:
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert not isinstance(excinfo.value, DuplicateIdError)
     assert _count(db_path, "events") == 1
     # A storage failure stops this instance; restart and verification are required.
     with pytest.raises(JournalClosedError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
 
 
 @pytest.mark.parametrize("fault_point", ["_insert_event", "_update_heads"])
@@ -280,7 +281,7 @@ def test_exception_inside_the_transaction_leaves_no_partial_write(
     journal: SqliteJournal, db_path: Path, monkeypatch: pytest.MonkeyPatch, fault_point: str
 ) -> None:
     run_id = b.new_id(RunId)
-    journal.append(_draft(journal, run_id=run_id))
+    append_next(journal, _draft(journal, run_id=run_id))
     original = getattr(journal, fault_point)
 
     def fail_after(*args: Any, **kwargs: Any) -> Any:
@@ -289,10 +290,10 @@ def test_exception_inside_the_transaction_leaves_no_partial_write(
 
     monkeypatch.setattr(journal, fault_point, fail_after)
     with pytest.raises(RuntimeError, match="synthetic fault"):
-        journal.append(_draft(journal, run_id=run_id))
+        append_next(journal, _draft(journal, run_id=run_id))
     monkeypatch.undo()
     assert _count(db_path, "events") == 1
-    nxt = journal.append(_draft(journal, run_id=run_id))
+    nxt = append_next(journal, _draft(journal, run_id=run_id))
     assert (nxt.tenant_seq, nxt.run_seq) == (2, 2)
     assert journal.verify_tenant(b.TENANT) is not None
 
@@ -305,11 +306,11 @@ def test_commit_failure_is_reported_as_unknown_outcome(
 
     monkeypatch.setattr(journal, "_commit", failing_commit)
     with pytest.raises(JournalWriteOutcomeUnknownError) as excinfo:
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert not isinstance(excinfo.value, DuplicateIdError)
     assert excinfo.value.fatal
     with pytest.raises(JournalClosedError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
 
 
 # ---------------------------------------------------------------- restart
@@ -318,8 +319,8 @@ def test_commit_failure_is_reported_as_unknown_outcome(
 def test_restart_keeps_sequences_head_and_increments_epoch(db_path: Path) -> None:
     run_id = b.new_id(RunId)
     first = _open(db_path)
-    first.append(b.event_draft(owner_epoch=first.owner_epoch, run_id=run_id))
-    last = first.append(b.event_draft(owner_epoch=first.owner_epoch, run_id=run_id))
+    append_next(first, b.event_draft(owner_epoch=first.owner_epoch, run_id=run_id))
+    last = append_next(first, b.event_draft(owner_epoch=first.owner_epoch, run_id=run_id))
     first.close()
 
     second = _open(db_path)
@@ -328,7 +329,7 @@ def test_restart_keeps_sequences_head_and_increments_epoch(db_path: Path) -> Non
         head = second.head(b.TENANT)
         assert head is not None
         assert (head.tenant_seq, head.head_hash) == (2, event_hash(last))
-        nxt = second.append(b.event_draft(owner_epoch=2, run_id=run_id))
+        nxt = append_next(second, b.event_draft(owner_epoch=2, run_id=run_id))
         assert (nxt.tenant_seq, nxt.run_seq, nxt.prev_hash) == (3, 3, event_hash(last))
     finally:
         second.close()
@@ -339,7 +340,7 @@ def test_closed_journal_cannot_be_used(db_path: Path) -> None:
     journal.close()
     journal.close()  # idempotent
     with pytest.raises(JournalClosedError):
-        journal.append(b.event_draft(owner_epoch=1))
+        append_next(journal, b.event_draft(owner_epoch=1))
     with pytest.raises(JournalClosedError):
         journal.read_tenant(b.TENANT, after_tenant_seq=0, limit=1)
 
@@ -352,7 +353,7 @@ def test_second_instance_in_the_same_process_is_refused(
 ) -> None:
     with pytest.raises(RuntimeLockHeldError):
         _open(db_path)
-    assert journal.append(_draft(journal)).tenant_seq == 1
+    assert append_next(journal, _draft(journal)).tenant_seq == 1
 
 
 def test_lock_release_allows_a_new_owner_with_a_higher_epoch(db_path: Path) -> None:
@@ -368,16 +369,16 @@ def test_lock_release_allows_a_new_owner_with_a_higher_epoch(db_path: Path) -> N
 def test_takeover_in_the_database_stops_the_old_owner(
     journal: SqliteJournal, db_path: Path
 ) -> None:
-    journal.append(_draft(journal))
+    append_next(journal, _draft(journal))
     conn = _raw(db_path)
     conn.execute("UPDATE runtime_owner SET epoch = epoch + 1, instance_id = 'synthetic-other'")
     conn.close()
     with pytest.raises(OwnerEpochMismatchError) as excinfo:
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert excinfo.value.fatal
     assert _count(db_path, "events") == 1
     with pytest.raises(JournalClosedError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
 
 
 def test_same_epoch_with_another_instance_id_is_rejected(
@@ -387,7 +388,7 @@ def test_same_epoch_with_another_instance_id_is_rejected(
     conn.execute("UPDATE runtime_owner SET instance_id = 'synthetic-other'")
     conn.close()
     with pytest.raises(OwnerEpochMismatchError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
 
 
 @pytest.mark.parametrize("action", ["delete", "replace"])
@@ -397,7 +398,7 @@ def test_lost_lock_file_stops_writes(journal: SqliteJournal, db_path: Path, acti
     if action == "replace":
         lock_path.write_text("synthetic replacement\n", encoding="utf-8")
     with pytest.raises(RuntimeLockLostError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert _count(db_path, "events") == 0
 
 
@@ -421,13 +422,16 @@ def test_sequence_at_int64_limit_fails_safely(
     journal: SqliteJournal, db_path: Path, table: str, column: str
 ) -> None:
     run_id = b.new_id(RunId)
-    journal.append(_draft(journal, run_id=run_id))
+    first = append_next(journal, _draft(journal, run_id=run_id))
     _tamper(db_path, f"UPDATE {table} SET {column} = ?", (MAX_INT64,))  # noqa: S608
+    # The expectation names the (tampered) head row, so the limit check is reached.
+    seq = MAX_INT64 if table == "tenant_head" else 1
+    expected = HeadExpectation(tenant_seq=seq, head_hash=event_hash(first))
     with pytest.raises(SequenceExhaustedError):
-        journal.append(_draft(journal, run_id=run_id))
+        journal.append(_draft(journal, run_id=run_id), expected=expected)
     assert _count(db_path, "events") == 1
     with pytest.raises(JournalClosedError):
-        journal.append(_draft(journal, run_id=run_id))
+        journal.append(_draft(journal, run_id=run_id), expected=expected)
 
 
 def test_owner_epoch_at_int64_limit_refuses_to_open(db_path: Path) -> None:
@@ -478,7 +482,7 @@ def _rewrite_body_and_hash(db_path: Path, tenant_seq: int) -> None:
 def _open_with_events(db_path: Path, count: int = 3, **overrides: Any) -> SqliteJournal:
     journal = _open(db_path)
     for _ in range(count):
-        journal.append(_draft(journal, **overrides))
+        append_next(journal, _draft(journal, **overrides))
     return journal
 
 
@@ -492,7 +496,7 @@ def _assert_detected_then_stopped(journal: SqliteJournal, db_path: Path, read: A
         read(journal)
     assert journal.closed
     with pytest.raises(JournalClosedError):
-        journal.append(b.event_draft(owner_epoch=journal.owner_epoch))
+        append_next(journal, b.event_draft(owner_epoch=journal.owner_epoch))
     epoch_before = _owner_epoch(db_path)
     with pytest.raises(JournalCorruptionError):
         _open(db_path)
@@ -611,9 +615,9 @@ def test_read_tenant_detects_damage_made_while_open(db_path: Path, damage: str) 
 def test_read_run_detects_a_rewritten_body_and_hash(db_path: Path) -> None:
     run_id = b.new_id(RunId)
     journal = _open(db_path)
-    journal.append(_draft(journal))
-    journal.append(_draft(journal, run_id=run_id))
-    journal.append(_draft(journal))
+    append_next(journal, _draft(journal))
+    append_next(journal, _draft(journal, run_id=run_id))
+    append_next(journal, _draft(journal))
     _rewrite_body_and_hash(db_path, 2)
     _assert_detected_then_stopped(
         journal, db_path, lambda j: j.read_run(run_id, after_run_seq=0, limit=10)
@@ -623,8 +627,8 @@ def test_read_run_detects_a_rewritten_body_and_hash(db_path: Path) -> None:
 def test_read_run_detects_a_rewritten_tail_event(db_path: Path) -> None:
     run_id = b.new_id(RunId)
     journal = _open(db_path)
-    journal.append(_draft(journal))
-    journal.append(_draft(journal, run_id=run_id))
+    append_next(journal, _draft(journal))
+    append_next(journal, _draft(journal, run_id=run_id))
     _rewrite_body_and_hash(db_path, 2)
     _assert_detected_then_stopped(
         journal, db_path, lambda j: j.read_run(run_id, after_run_seq=0, limit=1)
@@ -685,7 +689,7 @@ def test_append_checks_the_current_head_against_the_tail(db_path: Path) -> None:
     journal = _open_with_events(db_path)
     _tamper(db_path, "UPDATE tenant_head SET head_hash = ?", (b.digest("forged"),))
     with pytest.raises(JournalCorruptionError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert _count(db_path, "events") == 3
     assert journal.closed
 
@@ -695,7 +699,7 @@ def test_append_checks_the_run_head_against_its_tail(db_path: Path) -> None:
     journal = _open_with_events(db_path, run_id=run_id)
     _tamper(db_path, "UPDATE run_head SET run_seq = 2")
     with pytest.raises(JournalCorruptionError):
-        journal.append(_draft(journal, run_id=run_id))
+        append_next(journal, _draft(journal, run_id=run_id))
     assert _count(db_path, "events") == 3
 
 
@@ -703,7 +707,7 @@ def test_non_fatal_argument_error_keeps_the_journal_open(journal: SqliteJournal)
     with pytest.raises(JournalArgumentError):
         journal.read_tenant(b.TENANT, after_tenant_seq=-1, limit=1)
     assert not journal.closed
-    assert journal.append(_draft(journal)).tenant_seq == 1
+    assert append_next(journal, _draft(journal)).tenant_seq == 1
 
 
 # ---------------------------------------------------------------- transaction end failures
@@ -730,7 +734,7 @@ def test_unusual_exception_during_commit_is_an_unknown_outcome(
 
     monkeypatch.setattr(journal, "_commit", failing_commit)
     with pytest.raises(JournalWriteOutcomeUnknownError) as excinfo:
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert excinfo.value.__cause__ is error
     assert journal.closed
 
@@ -743,7 +747,7 @@ def test_interrupt_during_commit_stops_the_journal_and_propagates(
 
     monkeypatch.setattr(journal, "_commit", interrupted_commit)
     with pytest.raises(KeyboardInterrupt):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert journal.closed
 
 
@@ -761,7 +765,7 @@ def test_rollback_failure_keeps_the_original_error_as_context(
     monkeypatch.setattr(journal, "_update_heads", failing_update)
     monkeypatch.setattr(journal, "_rollback", failing_rollback)
     with pytest.raises(JournalWriteOutcomeUnknownError) as excinfo:
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert excinfo.value.__context__ is original
     assert journal.closed
 
@@ -800,7 +804,7 @@ def test_hard_linked_database_is_refused(tmp_path: Path) -> None:
 def test_hard_link_created_while_open_stops_writes(journal: SqliteJournal, db_path: Path) -> None:
     os.link(db_path, db_path.with_name("alias.db"))
     with pytest.raises(JournalFileChangedError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert journal.closed
     assert _count(db_path, "events") == 0
 
@@ -812,7 +816,7 @@ def test_database_replaced_while_open_stops_writes(
     other.write_bytes(b"")
     os.replace(other, db_path)
     with pytest.raises(JournalFileChangedError):
-        journal.append(_draft(journal))
+        append_next(journal, _draft(journal))
     assert journal.closed
 
 
@@ -856,3 +860,61 @@ def test_foreign_database_is_not_modified(db_path: Path) -> None:
         _open(db_path)
     assert _db_bytes(db_path) == before
     assert not db_path.with_name(db_path.name + "-wal").exists()
+
+
+# ---------------------------------------------------------------- WP04-R01: expected head
+
+
+def test_append_with_the_current_head_succeeds(journal: SqliteJournal) -> None:
+    first = journal.append(_draft(journal), expected=HeadExpectation.of(None))
+    head = journal.head(b.TENANT)
+    second = journal.append(_draft(journal), expected=HeadExpectation.of(head))
+    assert (first.tenant_seq, second.tenant_seq) == (1, 2)
+
+
+@pytest.mark.parametrize("stale", ["empty", "old_seq", "wrong_hash"])
+def test_append_with_a_stale_head_stores_nothing(
+    journal: SqliteJournal, db_path: Path, stale: str
+) -> None:
+    append_next(journal, _draft(journal))
+    head = journal.head(b.TENANT)
+    assert head is not None
+    expected = {
+        "empty": HeadExpectation.of(None),
+        "old_seq": HeadExpectation(tenant_seq=2, head_hash=head.head_hash),
+        "wrong_hash": HeadExpectation(tenant_seq=1, head_hash=b.digest("other")),
+    }[stale]
+    with pytest.raises(JournalHeadMismatchError) as excinfo:
+        journal.append(_draft(journal), expected=expected)
+    assert not excinfo.value.fatal
+    assert _count(db_path, "events") == 1
+    # Not fatal: the journal stays open and accepts a correct expectation.
+    assert append_next(journal, _draft(journal)).tenant_seq == 2
+
+
+def test_head_is_compared_inside_the_write_transaction(
+    journal: SqliteJournal, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    expected = HeadExpectation.of(journal.head(b.TENANT))
+    original = journal._check_owner
+
+    def owner_check_then_concurrent_write(cur: Any) -> None:
+        original(cur)
+        # Simulates another writer that committed after the caller read the head:
+        # the head row seen inside this transaction is what counts.
+        cur.execute(
+            "INSERT INTO tenant_head (tenant_id, tenant_seq, head_hash) VALUES (?, 1, ?)",
+            (str(b.TENANT), b.digest("concurrent")),
+        )
+
+    monkeypatch.setattr(journal, "_check_owner", owner_check_then_concurrent_write)
+    with pytest.raises(JournalHeadMismatchError):
+        journal.append(_draft(journal), expected=expected)
+    monkeypatch.undo()
+    assert _count(db_path, "events") == 0
+    assert _count(db_path, "tenant_head") == 0
+
+
+def test_append_requires_a_typed_expectation(journal: SqliteJournal) -> None:
+    with pytest.raises(JournalArgumentError):
+        journal.append(_draft(journal), expected=None)  # type: ignore[arg-type]

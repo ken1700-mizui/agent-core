@@ -96,6 +96,7 @@ def run(**overrides: Any) -> Run:
         "status": RunStatus.CREATED,
         "owner_epoch": 1,
         "parent_run_id": None,
+        "cancel_requested": False,
     }
     values.update(overrides)
     return Run(**values)

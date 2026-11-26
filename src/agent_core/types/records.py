@@ -186,11 +186,16 @@ class Run(StateSnapshot):
     status: RunStatus
     owner_epoch: Epoch
     parent_run_id: RunId | None
+    # Set when the run enters CANCELLING and never cleared (WP04-R04): the cancel
+    # intent survives later states such as RECONCILIATION_REQUIRED.
+    cancel_requested: bool
 
     @model_validator(mode="after")
     def _not_own_parent(self) -> Self:
         if self.parent_run_id == self.run_id:
             raise _invalid("own_parent", "a run cannot be its own parent")
+        if self.status in (RunStatus.CANCELLING, RunStatus.CANCELLED) and not self.cancel_requested:
+            raise _invalid("cancel_intent", "CANCELLING and CANCELLED need cancel_requested")
         return self
 
 

@@ -32,11 +32,12 @@ class FailingJournal(InMemoryJournal):
     def __init__(self) -> None:
         super().__init__()
         self.fail = False
+        self.error: Exception = JournalStorageError("synthetic journal failure")
 
-    def append(self, draft: Any) -> Event:
+    def append(self, draft: Any, *, expected: Any) -> Event:
         if self.fail:
-            raise JournalStorageError("synthetic journal failure")
-        return super().append(draft)
+            raise self.error
+        return super().append(draft, expected=expected)
 
 
 def _scenario(sm: Any) -> Any:

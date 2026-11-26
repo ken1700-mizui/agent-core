@@ -23,6 +23,7 @@ from support.fakes import (
     InMemoryJournal,
     ScriptedClock,
     ScriptedRandomSource,
+    append_next,
 )
 
 
@@ -57,9 +58,9 @@ def test_os_random_source_rejects_non_positive_lengths(n: int) -> None:
 def test_synthetic_journal_assigns_gapless_positions_and_a_chain() -> None:
     journal = InMemoryJournal()
     run_id = b.new_id(RunId)
-    first = journal.append(b.event_draft())
-    second = journal.append(b.event_draft(run_id=run_id))
-    third = journal.append(b.event_draft(run_id=run_id))
+    first = append_next(journal, b.event_draft())
+    second = append_next(journal, b.event_draft(run_id=run_id))
+    third = append_next(journal, b.event_draft(run_id=run_id))
     assert [e.tenant_seq for e in (first, second, third)] == [1, 2, 3]
     assert [second.run_seq, third.run_seq] == [1, 2]
     assert first.prev_hash is None
@@ -73,16 +74,16 @@ def test_synthetic_journal_assigns_gapless_positions_and_a_chain() -> None:
 def test_journal_duplicate_event_id_drives_the_generator_retry() -> None:
     journal = InMemoryJournal()
     taken = EventId.compose(b.SITE, b.TS, 5)
-    journal.append(b.event_draft(event_id=taken))
+    append_next(journal, b.event_draft(event_id=taken))
     random = ScriptedRandomSource([(5).to_bytes(10, "big"), (6).to_bytes(10, "big")])
     generator = IdGenerator(b.SITE, ScriptedClock(b.TS), random)
 
     def append(event_id: EventId) -> Event:
         draft: EventDraft = b.event_draft(event_id=event_id)
-        return journal.append(draft)
+        return append_next(journal, draft)
 
     stored = generator.issue_unique(EventId, append)
     assert stored.event_id.random_bits == 6
     assert stored.tenant_seq == 2
     with pytest.raises(DuplicateIdError):
-        journal.append(b.event_draft(event_id=taken))
+        append_next(journal, b.event_draft(event_id=taken))
