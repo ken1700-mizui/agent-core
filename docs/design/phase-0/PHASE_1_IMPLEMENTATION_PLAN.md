@@ -1,6 +1,6 @@
 # Phase 1 の実装計画
 
-> 文書の状態：**DRAFT**（E4 で作成し、Phase 0 の最終修正で直した。Codex による独立した監査を待っている）　作成日：2026-11-26
+> 文書の状態：**DRAFT**（E4 で作成し、Phase 0 の最終修正で直した。Codex の監査（CONDITIONAL_PASS）の指摘 AUDIT-01〜04 に対応した）　作成日：2026-11-26
 >
 > - **これは計画であり、まだ実装していない。** Phase 1 の開始は、承認されていない。始めるのは、Phase 0.5（独立した監査）と、オーナーの承認の後。
 > - Phase 1 で、すべての Engine を完成させることはしない。ただし、Phase 1 で使う機能に必要な安全の条件は、省かない。
@@ -66,7 +66,7 @@ WP-01 → WP-02 → WP-03 → WP-04 → { WP-05, WP-07, WP-11 } → WP-06 → WP
 | WP-05 | Fake Provider | E の7.4、ADR-0003 | Model Gateway | 共通の型、決まった応答、Usage（XTU） | B1.C16 | 決定的であることの試験 | 実際のプロバイダー |
 | WP-06 | Replay | B1 の6.3 | Model Gateway | 人工的な記録、3つのハッシュの検証 | B1.C10・C24、E.Z14 | 改ざんと欠損、`REPLAY_UNAVAILABLE` | 実API の記録 |
 | WP-07 | Tool Registry | C1 の5章 | Tool | マニフェストと実行物の固定、`builtin` だけ、選択は提案だけ | C1.S8・S23、E.Z15 | 登録していないツールの拒否 | MCP、Sandbox のコマンド |
-| WP-09 | Safety・Permit・予算の最小の実装 | C1 の4・6・7章、E の3〜5章、D の11章、ADR-0004 | Safety、Cost | 静的なポリシー、RunGrant、デフォルトの拒否、ExactApproval、Permit の原子的な消費、プロセスの中の Receipt、XTU の台帳、金銭以外の上限、停止の状態 | C1.S1〜S5・S20、D.V10・V11、E.Z6・Z9 | 同時の消費、承認の改ざん、予算の超過、停止との競合 | 外部への通信、ScopedApproval、SpendApproval |
+| WP-09 | Safety・Permit・予算の最小の実装 | C1 の4・6・7章、E の3〜5章、D の11章、ADR-0004 | Safety、Cost | 静的なポリシー、RunGrant、デフォルトの拒否、ExactApproval、Permit の原子的な消費、プロセスの中の Receipt、XTU の台帳、金銭以外の上限、停止の状態。**予約の ID の確保（`ID_ALLOCATED`）と、承認の後の有効化（`RESERVED`）を分け、Permit の発行と消費のときに、承認・ActionDescriptor・予約の一致を確かめる**（E の38章） | C1.S1〜S5・S20、D.V10・V11、E.Z6・Z9・Z42・Z43 | 同時の消費、承認の改ざん、予算の超過、停止との競合。**AUDIT-01 の試験：** ID の確保だけで実行できないこと、予約の失敗で実行しないこと、内容・費用の上限・Attempt を変えると承認が無効になること、古い ID の再使用と二重の予約の拒否 | 外部への通信、ScopedApproval、SpendApproval |
 | WP-08 | 基本のファイル操作 | C1 の8.3・8.5、E の29.5 | Runtime の Execution | **管理された作業ツリーの中だけ**の読み書き。Permit を必須にする。パスの検査。安全な手段がなければ拒否する | C1.S16・S19、E.Z33 | パスの悪用、リンク、Permit のない呼び出しの拒否 | 外部の作業領域への直接の反映 |
 | WP-14 | 最小の Context の組み立て | B1 の3・4章、ROADMAP の0.1 | Context | 階層、ProtectedFact、決まった並べ方、予算の推定、`context_hash` | B1.C1〜C3・C6・C7 | 階層の格上げの拒否、予算の超過で止まること | 圧縮、取り直し（Phase 2） |
 | WP-15 | エージェントのループと、完了の検証 | E の7.1（`simple`）・7.3・29.5 | Runtime、Planning（`simple`）、Verification | Fake で、提案 → 認可 → 実行 → 検証 → 上限付きの修正のループ → 完了の判定 | E.Z15・Z33 | 完了の宣言だけでは完了にならないこと、修正の回数の上限 | `complex` の計画（Phase 2） |

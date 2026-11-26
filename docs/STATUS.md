@@ -11,12 +11,12 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 0 の最終修正（F01〜F07）を提出した。Codex による独立した監査（Phase 0.5）を待っている。** E4 は 89/100、Phase 0 の全体は 94/100 で、条件付き合格。**Phase 1 の開始は、承認されていない** |
-| 次の作業 | Phase 0.5。監査の対象の SHA は、監査を始めるときに、外部の指示で固定する（`docs/reviews/FINAL_AUDIT_CHECKLIST.md`）。Claude Code は、自分では監査に進まない |
+| 今の段階 | **Codex による Phase 0.5 の独立監査が終わった（`e533c4c`、CONDITIONAL_PASS。MEDIUM が4件）。その4件の修正を提出し、確認を待っている。** Phase 1 の開始、技術の構成の確定、依存関係の導入は、**承認されていない** |
+| 次の作業 | AUDIT-01〜04 の修正の確認（`docs/reviews/CODEX_PHASE_0_AUDIT.md`）。その後、オーナーによる Phase 1 の開始の承認（技術の構成、依存関係、対応する OS などを含む）。Claude Code は、承認があるまで、実装に進まない |
 | Phase 1 の開始の条件 | 次のすべてを満たすこと。<br>- Phase 0.5 に合格する。<br>- 「Phase 1 を始める前に必要」な事項を、オーナーが承認する（`RESOLUTION_MATRIX.md` の9章）。対象は、対応する OS、実装の言語とツール、依存関係の方針、CI。<br>- オーナーが、Phase 1 を始めると、はっきり指示する |
 | 作業ブランチ | `docs/phase-0-design`（Draft PR #1）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 本番コードの実装、依存関係のインストール、有料 API、外部調査、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
-| 参照する資料 | `AGENTS.md`、`docs/decisions/OWNER_DECISIONS.md`、`ROADMAP.md`、`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`docs/reviews/PHASE_0_REVIEW.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md` |
+| 参照する資料 | `AGENTS.md`、`docs/decisions/OWNER_DECISIONS.md`、`ROADMAP.md`、`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`docs/reviews/PHASE_0_REVIEW.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md`、`docs/reviews/CODEX_PHASE_0_AUDIT.md` |
 
 ## 2. 作業単位の進捗
 
@@ -33,7 +33,8 @@
 | E3 | 保存・削除・バックアップ・鍵・復元 | 設計段階として条件付き合格（92/100） | `E_INTEGRATION.md` の第2部 |
 | E4 | ロードマップ・残存課題の解決・最終の整合 | 89/100（Phase 0 の全体は 94/100）。条件付き合格 | `E_INTEGRATION.md` の第3部、`ROADMAP.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md`、`RESOLUTION_MATRIX.md` の7〜9章 |
 
-| **最終修正** | F01〜F07（`RESOLUTION_MATRIX.md` の10章） | **DRAFT。Codex による独立した監査を待っている** | `E_INTEGRATION.md` の第4部、`ROADMAP.md` の0.1・0.2、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`AGENTS.md` |
+| 最終修正 | F01〜F07（`RESOLUTION_MATRIX.md` の10章） | Codex の監査で CONDITIONAL_PASS | `E_INTEGRATION.md` の第4部、`ROADMAP.md` の0.1・0.2、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`AGENTS.md` |
+| **Codex の監査への対応** | AUDIT-01〜04（`RESOLUTION_MATRIX.md` の11章） | **DRAFT。確認を待っている** | `E_INTEGRATION.md` の第5部（38〜42章）、`docs/reviews/CODEX_PHASE_0_AUDIT.md` |
 
 - 合格は、どれも設計段階についてのものである。実装、実 API への接続、マージを承認したものではない。
 - 「実装による検証待ち」の課題は、実装して試験するまでは、解決したとは言わない。
@@ -52,7 +53,7 @@
 | 時期 | 事項 |
 |---|---|
 | Phase 1 を始める前 | 対応する OS、技術の候補（Python 3.12 以上、uv、Pydantic v2、sqlite3、pytest、ruff、mypy、import-linter。PHASE_1 の0.1）、ADR の 0001〜0004・0006、依存関係の方針、CI |
-| 実 API を使う前 | 次の事項。<br>- D1 の補足の書き換え（循環を解く。文案は `E_INTEGRATION.md` の31.3）<br>- D5（Run ごとの承認と、月額の上限。文案は同じ）<br>- I10 の書き換え<br>- LiveProvider を有効にする条件<br>- 費用の照合の許容誤差<br>- Anthropic のデータの扱いの方針の確認<br>- 評価の基準と、候補の値<br>- 評価の側の環境 |
+| 実 API を使う前 | 次の事項。<br>- 予算の管理に使うタイムゾーン（AUDIT-02）<br>- D1 の補足の書き換え（循環を解く。文案は `E_INTEGRATION.md` の31.3）<br>- D5（Run ごとの承認と、月額の上限。文案は同じ）<br>- I10 の書き換え<br>- LiveProvider を有効にする条件<br>- 費用の照合の許容誤差<br>- Anthropic のデータの扱いの方針の確認<br>- 評価の基準と、候補の値<br>- 評価の側の環境 |
 | Memory を実装する前 | バックアップの保存の期間、RPO、RTO、独立した複製と証人の置き場所、暗号のライブラリ |
 
 - 全体の一覧は、`RESOLUTION_MATRIX.md` の9章にある。
