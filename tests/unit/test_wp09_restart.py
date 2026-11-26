@@ -14,8 +14,10 @@ import pytest
 from agent_core.runtime.execution_gate import SyntheticResult
 from agent_core.types.errors import LedgerInconsistencyError, PermitRejectedError
 from agent_core.types.ids import TenantId
-from agent_core.types.ledger import RevokeAccess
-from agent_core.types.safety import PermitState, ReceiptState, StopScopeType
+from agent_core.types.ledger import ResumeScope, RevokeAccess
+from agent_core.types.safety import PermitState, ReceiptState, StopScopeType, StopStatus
+from agent_core.types.serialization import dump_json
+from agent_core.types.values import NonMonetaryCaps
 from support import builders as b
 from support import ledger_world as lw
 
@@ -165,3 +167,69 @@ def test_unsettled_reservations_stay_held_after_restart(world: Any) -> None:
             assert view.hold_micro == 1_000
     finally:
         st2.journal.close()
+
+
+# ------------------------------------------------ re-review: stop rows and Task limits
+
+
+def _stopped_tenant(tmp_path: Path) -> Any:
+    """A database whose tenant was stopped (STOP is the scope's last audit record)."""
+    st = lw.setup(tmp_path, "tenant.db")
+    lw.issued(st, lw.step_in(st))
+    st.owner(lw.stop_op(StopScopeType.TENANT, str(b.TENANT)))
+    st.journal.close()
+    return st
+
+
+def test_a_missing_run_stop_row_is_detected(world: Any) -> None:
+    st, _ = world
+    # The audit log ends the run's history with STOP; only its state row is removed.
+    _tamper(st, "DELETE FROM stop_state WHERE scope_type = 'RUN'")
+    _refused(st, "STOP_STATE")
+
+
+def test_a_missing_tenant_stop_row_is_detected(tmp_path: Path) -> None:
+    st = _stopped_tenant(tmp_path)
+    _tamper(st, "DELETE FROM stop_state WHERE scope_type = 'TENANT'")
+    _refused(st, "STOP_STATE")
+
+
+def test_stop_then_resume_reopens(tmp_path: Path) -> None:
+    st = lw.setup(tmp_path)
+    attempt = lw.issued(st, lw.step_in(st))
+    run_id = str(st.sm.state.steps[attempt.step_id].run_id)
+    for kind, scope_id in ((StopScopeType.RUN, run_id), (StopScopeType.TENANT, str(b.TENANT))):
+        st.owner(lw.stop_op(kind, scope_id))
+        entries = {(e.scope_type, e.scope_id): e for e in st.journal.stop_entries()}
+        seq = entries[(kind, scope_id)].stop_seq
+        st.owner(ResumeScope(op="resume_scope", scope_type=kind, scope_id=scope_id, stop_seq=seq))
+    st2 = st.reopen()
+    try:
+        entries = {(e.scope_type, e.scope_id): e for e in st2.journal.stop_entries()}
+        assert entries[(StopScopeType.RUN, run_id)].status is StopStatus.RUNNING
+        assert entries[(StopScopeType.TENANT, str(b.TENANT))].status is StopStatus.RUNNING
+    finally:
+        st2.journal.close()
+
+
+def test_a_changed_task_budget_is_detected(world: Any) -> None:
+    st, _ = world
+    # Same Task ID, same journal; only the mirrored budget differs.
+    _tamper(st, "UPDATE rt_tasks SET budget_micro = budget_micro + 1")
+    _refused(st, "MIRROR")
+
+
+def test_changed_task_caps_are_detected(world: Any) -> None:
+    st, _ = world
+    conn = sqlite3.connect(st.path)
+    try:
+        task_id, caps = conn.execute("SELECT task_id, caps FROM rt_tasks LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    # Well-formed caps with one different limit.
+    changed = NonMonetaryCaps.model_validate_json(caps).model_copy(update={"model_calls": 1})
+    assert changed != NonMonetaryCaps.model_validate_json(caps)
+    _tamper(
+        st, "UPDATE rt_tasks SET caps = ? WHERE task_id = ?", dump_json(changed).decode(), task_id
+    )
+    _refused(st, "MIRROR")

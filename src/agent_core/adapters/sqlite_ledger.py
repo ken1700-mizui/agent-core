@@ -152,7 +152,7 @@ from agent_core.types.transitions import (
     StepTransition,
     TaskTransition,
 )
-from agent_core.types.values import MAX_INT64
+from agent_core.types.values import MAX_INT64, NonMonetaryCaps
 
 R = ReservationState
 
@@ -2644,12 +2644,23 @@ def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
     }
     steps = {r[0]: r[1] for r in cur.execute("SELECT step_id, run_id FROM rt_steps")}
     expected_steps = {k: str(s.run_id) for k, s in view["steps"].items()}
-    tasks = {r[0] for r in cur.execute("SELECT task_id FROM rt_tasks")}
+    # Task limits are compared too: the budget in micro units and every cap, the
+    # caps read back as their type (a malformed copy is a mismatch as well).
+    tasks: dict[str, tuple[int, NonMonetaryCaps | None]] = {}
+    for task_id, budget, caps in cur.execute("SELECT task_id, budget_micro, caps FROM rt_tasks"):
+        try:
+            parsed: NonMonetaryCaps | None = NonMonetaryCaps.model_validate_json(caps)
+        except ValueError:
+            parsed = None
+        tasks[task_id] = (int(budget), parsed)
+    expected_tasks = {
+        k: (t.budget_total.micro_units, t.caps_total) for k, t in view["tasks"].items()
+    }
     if (attempts, runs, steps, tasks) != (
         expected,
         expected_runs,
         expected_steps,
-        set(view["tasks"]),
+        expected_tasks,
     ):
         raise _inconsistent("MIRROR_MISMATCH")
 
@@ -2761,14 +2772,25 @@ def _check_stop_and_revocation(cur: sqlite3.Cursor, rows: list[tuple[Any, ...]])
             by_scope.setdefault(targets.get("scope", ""), []).append(action)
         if action == "REVOCATION_GEN":
             generations.append(targets.get("gen", ""))
-    for scope_type, scope_id, stop_seq, status in stops:
-        actions = by_scope.get(f"{scope_type}:{scope_id}", [])
-        if int(stop_seq) != actions.count("STOP"):
+    # Every scope the audit history names, and every stored row, is checked: the
+    # row must exist, its stop_seq must equal the number of STOPs, and its state
+    # must be the one the last STOP or RESUME leaves. A row without any history is
+    # only the initial global RUNNING row.
+    rows_by_scope = {f"{r[0]}:{r[1]}": (int(r[2]), r[3]) for r in stops}
+    for scope in set(rows_by_scope) | set(by_scope):
+        actions = by_scope.get(scope, [])
+        stored = rows_by_scope.get(scope)
+        if stored is None:
             raise _inconsistent("STOP_STATE_MISMATCH")
-        last = actions[-1] if actions else None
-        if status == StopStatus.STOPPED.value and last != "STOP":
-            raise _inconsistent("STOP_STATE_MISMATCH")
-        if status == StopStatus.RUNNING.value and last not in (None, "RESUME"):
+        stop_seq, status = stored
+        if not actions:
+            if (scope, stop_seq, status) != ("GLOBAL:global", 0, StopStatus.RUNNING.value):
+                raise _inconsistent("STOP_STATE_MISMATCH")
+            continue
+        expected_status = (
+            StopStatus.STOPPED.value if actions[-1] == "STOP" else StopStatus.RUNNING.value
+        )
+        if stop_seq != actions.count("STOP") or status != expected_status:
             raise _inconsistent("STOP_STATE_MISMATCH")
     gen = _revocation_gen(cur)
     if gen != len(generations) or (generations and generations[-1] != str(gen)):

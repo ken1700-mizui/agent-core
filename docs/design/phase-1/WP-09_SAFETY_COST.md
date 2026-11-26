@@ -496,3 +496,37 @@ AUDIT-01 は、Phase 1 の合成の範囲で、実装と試験を記録した。
 - 対象の資源のパスの安全な解決（リンク、ルートの外）は、WP-08。
 - 開くときの整合の検査は、食い違いを見つけるだけで、矛盾のない書き換えは見つけられない。
 - 承認とオーナーの操作の MAC は、対称鍵。別の装置での署名は、後の段階。
+
+### 14.12 再レビューの指摘への対応（R07 の2件）
+
+この節は、14.6 の 1 と 7 より優先する。
+
+**(1) Run とテナントの停止の状態の照合**
+
+- 修正前は、`stop_state` に**ある行**だけを、監査の記録と照合していた。そのため、監査の記録の最後が STOP の Run やテナントで、状態の行だけを消した DB が開いた。
+- 修正後は、監査の記録に現れるすべての範囲と、保存されたすべての行について、次を確かめる。
+  - 状態の行があること。
+  - `stop_seq` が、STOP の監査の数と一致すること。
+  - 状態が、最後の STOP（`STOPPED`）または RESUME（`RUNNING`）から決まる状態と一致すること。
+- 監査の記録のない行として認めるのは、最初からある全体の `RUNNING`（`stop_seq` 0）の行だけである。
+
+**(2) Task の予算と上限の照合**
+
+- 修正前は、写しの `rt_tasks` について、Task の ID の集合だけを比べていた。そのため、予算や上限だけが違う DB が開いた。
+- 修正後は、次を Journal の Task と照合する。
+  - `budget_micro` を、`Task.budget_total.micro_units` と。
+  - `caps` を `NonMonetaryCaps` の型として読み取り、`Task.caps_total` と、各上限の値で。形式が壊れた写しも、不一致とする。
+- 不一致のときは、`LedgerInconsistencyError` で拒否する。
+
+**試験の結果**
+
+| 試験（`tests/unit/test_wp09_restart.py`） | 修正前 | 修正後 |
+|---|---|---|
+| `test_a_missing_run_stop_row_is_detected` | 失敗（DB が開いた。DID NOT RAISE） | 成功（`STOP_STATE_MISMATCH` で拒否。ファイルの内容は変わらない） |
+| `test_a_missing_tenant_stop_row_is_detected` | 失敗（DB が開いた。DID NOT RAISE） | 成功（`STOP_STATE_MISMATCH` で拒否。ファイルの内容は変わらない） |
+| `test_a_changed_task_budget_is_detected` | 失敗（DB が開いた。DID NOT RAISE） | 成功（`MIRROR_MISMATCH` で拒否。ファイルの内容は変わらない） |
+| `test_changed_task_caps_are_detected`（形式として有効で、`model_calls` だけが違う上限） | 失敗（DB が開いた。DID NOT RAISE） | 成功（`MIRROR_MISMATCH` で拒否。ファイルの内容は変わらない） |
+| `test_stop_then_resume_reopens`（Run とテナントの、正常な STOP → RESUME） | 成功 | 成功（再オープンでき、どちらも `RUNNING`） |
+
+- 「ファイルの内容は変わらない」は、2回目の再オープンも同じく拒否されることと、ファイルのバイト列が同じことを確かめた。
+- 試験は 1490 件（5 件を追加）。8種類の品質の検査が、すべて成功した。
