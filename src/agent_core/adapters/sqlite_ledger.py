@@ -96,6 +96,7 @@ from agent_core.types.ledger import (
     MarkActive,
     MarkUnknown,
     Reconcile,
+    ReconcileOutcome,
     RecordApproval,
     RecordDecision,
     RecordIntent,
@@ -149,6 +150,7 @@ from agent_core.types.transitions import (
     AttemptTransition,
     EntityAction,
     PolicyDecisionEvidence,
+    ReconciliationEvidence,
     RuntimePayload,
     RunTransition,
     StepTransition,
@@ -211,7 +213,28 @@ LEDGER_DDL: Final = (
 ) STRICT""",
     """CREATE TABLE rt_steps (
     step_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL
+    run_id TEXT NOT NULL,
+    kind TEXT NOT NULL
+) STRICT""",
+    # WP12-R05: when the ledger first saw a Task or Run (its own time). A source of
+    # truth (it starts the Run's time window), never only a projection: the mirror's
+    # copy in rt_tasks / rt_runs is checked against it and repaired from it.
+    """CREATE TABLE entity_times (
+    entity_id TEXT PRIMARY KEY,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+) STRICT""",
+    # WP12-R04: since when (ledger time) a Run has had its current status; changed
+    # only when the status changes, so other events never reset a deadline.
+    """CREATE TABLE run_status_times (
+    run_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    since_ms INTEGER NOT NULL CHECK (since_ms >= 0)
+) STRICT""",
+    # WP15-R07: what a started operation produced, as the live gate checked it (a
+    # read's bytes by digest), from its MAC-signed execution report. Written once.
+    """CREATE TABLE operation_results (
+    attempt_id TEXT PRIMARY KEY,
+    result_digest TEXT NOT NULL
 ) STRICT""",
     """CREATE TABLE rt_attempts (
     attempt_id TEXT PRIMARY KEY,
@@ -783,6 +806,7 @@ def _report_usage(
             spent_known=0,
         )
     _entry(cur, row, "USAGE", now_ms, usage_event_id=op.usage_event_id)
+    _record_result(cur, str(op.attempt_id), report.result_digest)
 
 
 def _billed_cost(cur: sqlite3.Cursor, attempt_id: str, usage: Usage) -> tuple[int | None, bool]:
@@ -814,6 +838,38 @@ def _billed_cost(cur: sqlite3.Cursor, attempt_id: str, usage: Usage) -> tuple[in
 def _mark_unknown(cur: sqlite3.Cursor, op: MarkUnknown, now_ms: int) -> None:
     row = _bound_row(cur, op.reservation_id, op.attempt_id)
     _move(cur, row, R.UNKNOWN, now_ms, hold_micro=row["reserved_micro"], spent_known=0)
+
+
+def _record_time(cur: sqlite3.Cursor, entity_id: str, created_at_ms: int) -> None:
+    cur.execute(
+        "INSERT INTO entity_times (entity_id, created_at_ms) VALUES (?, ?)",
+        (entity_id, created_at_ms),
+    )
+
+
+def _entity_time(cur: sqlite3.Cursor, entity_id: str) -> int:
+    row = cur.execute(
+        "SELECT created_at_ms FROM entity_times WHERE entity_id = ?", (entity_id,)
+    ).fetchone()
+    if row is None:
+        raise LedgerInconsistencyError("ENTITY_TIME_MISSING")  # not derivable: refused
+    return int(row[0])
+
+
+def _record_result(cur: sqlite3.Cursor, attempt_id: str, digest: str | None) -> None:
+    """WP15-R07: the operation's result digest from a verified report, once."""
+    if digest is None:
+        return
+    found = cur.execute(
+        "SELECT result_digest FROM operation_results WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    if found is not None and found[0] != digest:
+        raise PermitRejectedError(PermitReason.REPORT_MISMATCH, "RESULT_DIFFERS")
+    if found is None:
+        cur.execute(
+            "INSERT INTO operation_results (attempt_id, result_digest) VALUES (?, ?)",
+            (attempt_id, digest),
+        )
 
 
 def _mark_active(
@@ -932,6 +988,56 @@ def _reconcile(cur: sqlite3.Cursor, op: Reconcile, now_ms: int) -> None:
         raise ReservationAmountError("BELOW_RECORDED_COST")
     if actual < row["spent_lower_micro"]:
         raise ReservationAmountError("BELOW_LOWER_BOUND")
+    row = _record_cost(cur, row, R.RECONCILED, actual, now_ms)
+    _entry(cur, row, "RECONCILIATION", now_ms, evidence_ref=op.evidence_ref)
+
+
+def _reconcile_outcome(
+    cur: sqlite3.Cursor, op: ReconcileOutcome, now_ms: int, ctx: LedgerContext | None
+) -> None:
+    """WP12-R02: an unknown outcome and its cost, settled together (see the type)."""
+    keys = _keys(ctx)
+    assert ctx is not None  # noqa: S101 (checked by _keys)
+    row = _bound_row(cur, op.reservation_id, op.attempt_id)
+    if row["state"] != R.UNKNOWN.value:
+        raise ReservationStateError("NOT_UNKNOWN")  # settled already, or never unknown
+    stored = None if row["receipt_id"] is None else _stored_receipt(cur, row["receipt_id"])
+    if stored is None:
+        raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
+    receipt, receipt_state, _run = stored
+    if op.basis == "NOT_STARTED":
+        # The start is recorded with the receipt (USED); a receipt revoked by a
+        # later owner was never used: the operation never ran.
+        if receipt_state is not ReceiptState.REVOKED or receipt.owner_epoch >= ctx.owner_epoch:
+            raise ReservationStateError("NOT_PROVEN_NOT_STARTED")
+        actual = 0
+    else:
+        report = op.report
+        assert report is not None  # noqa: S101 (by the type)
+        if not reports.verify(keys.permit, report):
+            raise PermitRejectedError(PermitReason.REPORT_MAC_INVALID)
+        if (
+            (str(report.reservation_id), str(report.attempt_id), str(report.receipt_id))
+            != (row["reservation_id"], row["attempt_id"], row["receipt_id"])
+            or str(report.pep_instance_id) != str(receipt.pep_instance_id)
+            or report.owner_epoch != receipt.owner_epoch
+        ):
+            raise PermitRejectedError(PermitReason.REPORT_MISMATCH)
+        if receipt_state is not ReceiptState.USED:
+            raise PermitRejectedError(PermitReason.REPORT_MISMATCH, "RECEIPT_NOT_USED")
+        if (report.outcome == "COMPLETED") != (op.outcome == "COMPLETED"):
+            raise PermitRejectedError(PermitReason.REPORT_MISMATCH, "OUTCOME_DIFFERS")
+        cost, complete = _billed_cost(cur, row["attempt_id"], report.usage)
+        stated = report.usage.cost.micro_units if report.usage.cost is not None else None
+        if stated is not None and cost is not None and stated != cost:
+            raise PermitRejectedError(PermitReason.USAGE_COST_MISMATCH)
+        if (
+            not (report.final and report.usage.status is UsageStatus.FINAL and complete)
+            or cost is None
+        ):
+            raise ReservationStateError("COST_NOT_FINAL")  # never inferred, never zero
+        actual = cost
+        _record_result(cur, row["attempt_id"], report.result_digest)
     row = _record_cost(cur, row, R.RECONCILED, actual, now_ms)
     _entry(cur, row, "RECONCILIATION", now_ms, evidence_ref=op.evidence_ref)
 
@@ -1055,6 +1161,8 @@ def apply_op(
         _mark_unknown(cur, op, now_ms)
     elif isinstance(op, Reconcile):
         _reconcile(cur, op, now_ms)
+    elif isinstance(op, ReconcileOutcome):
+        _reconcile_outcome(cur, op, now_ms, ctx)
     elif isinstance(op, Correct | Unexplained):
         _adjust(cur, op, now_ms)
     elif isinstance(op, VoidAllocation):
@@ -1202,6 +1310,26 @@ def check_pairing(draft: EventDraft, ops: tuple[LedgerOp, ...]) -> None:
         if op.op in OWNER_OPS:
             raise LedgerPairingError("OWNER_OPERATION_NOT_ALLOWED")
     for transition in transitions:
+        settles_unknown = (
+            transition.before is not None
+            and transition.before.state is AttemptState.OUTCOME_UNKNOWN
+        )
+        if settles_unknown:
+            # WP12-R02: an unknown outcome is settled only with the ledger's own check.
+            settling = [
+                op
+                for op in ops
+                if isinstance(op, ReconcileOutcome) and op.attempt_id == transition.after.attempt_id
+            ]
+            evidence = transition.evidence
+            if (
+                len(settling) != 1
+                or not isinstance(evidence, ReconciliationEvidence)
+                or evidence.evidence_ref != settling[0].evidence_ref
+                or evidence.outcome.value != settling[0].outcome
+                or settling[0].reservation_id != transition.after.reservation_id
+            ):
+                raise LedgerPairingError("MISSING_RECONCILE_OUTCOME")
         wanted = _REQUIRED_OPS.get(transition.after.state)
         if wanted is None:
             continue
@@ -1211,6 +1339,13 @@ def check_pairing(draft: EventDraft, ops: tuple[LedgerOp, ...]) -> None:
         if len(found) != 1:
             raise LedgerPairingError(f"MISSING_{wanted.upper()}")
     for op in ops:
+        if isinstance(op, ReconcileOutcome) and not any(
+            t.after.attempt_id == op.attempt_id
+            and t.before is not None
+            and t.before.state is AttemptState.OUTCOME_UNKNOWN
+            for t in transitions
+        ):
+            raise LedgerPairingError("UNPAIRED_RECONCILE_OUTCOME")
         state = _BOUND_TO.get(op.op)
         if state is None:
             continue
@@ -2480,6 +2615,7 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
     if not isinstance(payload, RuntimePayload):
         return
     tenant = str(draft.tenant_id)
+    created = now_ms
     for transition in payload.transitions:
         if isinstance(transition, TaskTransition) and transition.before is not None:
             if transition.after.status.value == "COMPLETED":
@@ -2494,9 +2630,10 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
                     tenant,
                     task.budget_total.micro_units,
                     dump_json(task.caps_total).decode(),
-                    now_ms,
+                    created,
                 ),
             )
+            _record_time(cur, str(task.task_id), created)
         elif isinstance(transition, RunTransition):
             run = transition.after
             if transition.before is None:
@@ -2509,8 +2646,13 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
                         tenant,
                         run.status.value,
                         int(run.cancel_requested),
-                        now_ms,
+                        created,
                     ),
+                )
+                _record_time(cur, str(run.run_id), created)
+                cur.execute(
+                    "INSERT INTO run_status_times (run_id, status, since_ms) VALUES (?, ?, ?)",
+                    (str(run.run_id), run.status.value, now_ms),
                 )
             else:
                 if run.status.value == "COMPLETED":
@@ -2520,13 +2662,18 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
                     "UPDATE rt_runs SET status = ?, cancel_requested = ? WHERE run_id = ?",
                     (run.status.value, int(run.cancel_requested), str(run.run_id)),
                 )
+                cur.execute(
+                    "UPDATE run_status_times SET status = ?, since_ms = ? "
+                    "WHERE run_id = ? AND status != ?",
+                    (run.status.value, now_ms, str(run.run_id), run.status.value),
+                )
             if run.cancel_requested or run.status.value in _CLOSED_RUN_STATUSES:
                 _stop_run(cur, str(run.run_id), now_ms)
         elif isinstance(transition, StepTransition) and transition.before is None:
             step = transition.after
             cur.execute(
-                "INSERT INTO rt_steps (step_id, run_id) VALUES (?, ?)",
-                (str(step.step_id), str(step.run_id)),
+                "INSERT INTO rt_steps (step_id, run_id, kind) VALUES (?, ?, ?)",
+                (str(step.step_id), str(step.run_id), step.kind.value),
             )
         elif isinstance(transition, AttemptTransition):
             attempt = transition.after
@@ -2604,14 +2751,27 @@ def _unsettled(cur: sqlite3.Cursor, column: str, scope_id: str) -> None:
 def _completion_basis(
     cur: sqlite3.Cursor, run_id: str, tenant: str, evidence: object, now_ms: int
 ) -> None:
-    """WP15-R06: a COMPLETED Run, in the same transaction as its event, only if its
-    evidence names verification reads that ran for this Run (completed, read-only
-    file reads, cost final) under the current policy, Run grant (not expired) and
-    access epoch, with no stop of the Run, the tenant or everything."""
+    """WP15-R06, R07: a COMPLETED Run, in the same transaction as its event, only if
+    every criterion of its evidence holds on a verification read of this Run:
+
+    - the check's criterion digest is the digest of its own specification (path
+      and expected digest), and the observed digest equals the expected one;
+    - the read is a completed Attempt of a VERIFICATION Step of this Run, a
+      read-only file read of exactly that path, under the current policy and
+      access epoch, its cost final, and the live gate recorded that read's bytes
+      with that digest (a free digest is not evidence); each read proves one
+      criterion only;
+    - the latest committed write of this Run to that path wrote that content;
+
+    and under the current policy, Run grant (not expired) and access epoch, with
+    no stop of the Run, the tenant or everything."""
     reasons: list[str] = []
-    reads = getattr(evidence, "verified_reads", ())
-    if not reads:
+    checks = getattr(evidence, "checks", ())
+    criteria = {c.criterion_ref for c in getattr(evidence, "criteria", ())}
+    if not checks:
         reasons.append("NO_VERIFIED_READS")
+    elif {c.criterion_ref for c in checks} != criteria:
+        reasons.append("CHECKS_DO_NOT_COVER_THE_CRITERIA")
     stopped = cur.execute(
         "SELECT 1 FROM stop_state WHERE status = ? AND ((scope_type = 'RUN' AND scope_id = ?) "
         "OR (scope_type = 'TENANT' AND scope_id = ?) OR scope_type = 'GLOBAL') LIMIT 1",
@@ -2630,38 +2790,86 @@ def _completion_basis(
             reasons.append("POLICY_CHANGED")
         if grant.access_epoch_at_grant != epoch:
             reasons.append("ACCESS_REVOKED")
-    for attempt_id in reads:
-        row = cur.execute(
-            "SELECT a.state, s.run_id FROM rt_attempts a JOIN rt_steps s ON s.step_id = a.step_id "
-            "WHERE a.attempt_id = ?",
-            (str(attempt_id),),
-        ).fetchone()
-        found = cur.execute(
-            "SELECT descriptor FROM decisions WHERE attempt_id = ?", (str(attempt_id),)
-        ).fetchone()
-        reservation = cur.execute(
-            "SELECT state, spent_known FROM reservations WHERE attempt_id = ?", (str(attempt_id),)
-        ).fetchone()
-        if row is None or row[0] != "COMPLETED" or row[1] != run_id or found is None:
-            reasons.append("READ_NOT_OF_THIS_RUN")
-            continue
-        descriptor = ActionDescriptor.model_validate_json(found[0])
-        if (
-            descriptor.kind is not ActionKind.TOOL_CALL
-            or descriptor.effect_class is not ToolEffectClass.READ_ONLY
-            or descriptor.apply_change is not None
-            or not descriptor.target_resources
-            or any(r.access is not ResourceAccess.READ for r in descriptor.target_resources)
-        ):
-            reasons.append("NOT_A_VERIFICATION_READ")
-        if policy is not None and (
-            descriptor.policy_version != policy.policy_version or descriptor.access_epoch != epoch
-        ):
-            reasons.append("READ_UNDER_OLD_AUTHORITY")
-        if reservation is None or reservation[0] != R.USAGE_REPORTED.value or reservation[1] != 1:
-            reasons.append("READ_COST_NOT_FINAL")
+    writes = _latest_writes(cur, run_id)
+    used: set[str] = set()
+    for check in checks:
+        reasons.extend(_check_reasons(cur, check, run_id, policy, epoch, writes, used))
     if reasons:
         raise CompletionRefusedError(*dict.fromkeys(reasons))
+
+
+def _latest_writes(cur: sqlite3.Cursor, run_id: str) -> dict[str, str]:
+    """The content digest of this Run's latest committed write of each path."""
+    latest: dict[str, str] = {}
+    rows = cur.execute(
+        "SELECT d.descriptor FROM decisions d JOIN rt_attempts a ON a.attempt_id = d.attempt_id "
+        "JOIN rt_steps s ON s.step_id = a.step_id WHERE s.run_id = ? AND a.state = 'COMPLETED' "
+        "ORDER BY d.rowid",
+        (run_id,),
+    ).fetchall()
+    for (body,) in rows:
+        descriptor = ActionDescriptor.model_validate_json(body)
+        if descriptor.apply_change is not None:
+            latest[descriptor.apply_change.path] = descriptor.apply_change.content_digest
+    return latest
+
+
+def _check_reasons(
+    cur: sqlite3.Cursor,
+    check: Any,
+    run_id: str,
+    policy: Policy | None,
+    epoch: int,
+    writes: dict[str, str],
+    used: set[str],
+) -> list[str]:
+    reasons: list[str] = []
+    if check.specification_ref() != check.criterion_ref:
+        reasons.append("CRITERION_NOT_ITS_SPECIFICATION")
+    if check.read_attempt_id is None or check.observed_digest != check.expected_digest:
+        return [*reasons, "CRITERION_NOT_MET"]
+    attempt_id = str(check.read_attempt_id)
+    if attempt_id in used:
+        reasons.append("READ_USED_TWICE")
+    used.add(attempt_id)
+    row = cur.execute(
+        "SELECT a.state, s.run_id, s.kind FROM rt_attempts a "
+        "JOIN rt_steps s ON s.step_id = a.step_id WHERE a.attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    found = cur.execute(
+        "SELECT descriptor FROM decisions WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    if row is None or row[0] != "COMPLETED" or row[1] != run_id or found is None:
+        return [*reasons, "READ_NOT_OF_THIS_RUN"]
+    if row[2] != "VERIFICATION":
+        reasons.append("NOT_A_VERIFICATION_READ")
+    descriptor = ActionDescriptor.model_validate_json(found[0])
+    targets = [(r.path, r.access) for r in descriptor.target_resources]
+    if (
+        descriptor.kind is not ActionKind.TOOL_CALL
+        or descriptor.effect_class is not ToolEffectClass.READ_ONLY
+        or descriptor.apply_change is not None
+        or targets != [(check.path, ResourceAccess.READ)]
+    ):
+        reasons.append("NOT_A_READ_OF_THAT_FILE")
+    if policy is not None and (
+        descriptor.policy_version != policy.policy_version or descriptor.access_epoch != epoch
+    ):
+        reasons.append("READ_UNDER_OLD_AUTHORITY")
+    reservation = cur.execute(
+        "SELECT state, spent_known FROM reservations WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    if reservation is None or reservation[0] != R.USAGE_REPORTED.value or reservation[1] != 1:
+        reasons.append("READ_COST_NOT_FINAL")
+    result = cur.execute(
+        "SELECT result_digest FROM operation_results WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    if result is None or result[0] != check.observed_digest:
+        reasons.append("READ_RESULT_NOT_RECORDED")
+    if check.path in writes and writes[check.path] != check.observed_digest:
+        reasons.append("WRITE_DIFFERS_FROM_VERIFIED")
+    return reasons
 
 
 def _stop_run(cur: sqlite3.Cursor, run_id: str, now_ms: int) -> None:
@@ -2736,99 +2944,90 @@ MIRROR_TABLES: Final = ("rt_tasks", "rt_runs", "rt_steps", "rt_attempts")
 
 def repair_mirror(cur: sqlite3.Cursor) -> tuple[str, ...]:
     """WP-12 ProjectionRepair: the runtime mirror (``rt_*``) is a projection of the
-    journal's events; rewrite each table that differs from what the events record.
-    Nothing else is touched: costs, approvals, permits, receipts, stops and the
-    audit are sources of truth, never projections. A row's ``created_at_ms`` is
-    kept when the row exists, else taken from its creating event's recorded time.
-    Returns the names of the tables rewritten (empty when nothing differed)."""
-    tasks: dict[str, tuple[str, int, str, int]] = {}
-    runs: dict[str, tuple[str, str, str, int, int]] = {}
-    steps: dict[str, str] = {}
-    attempts: dict[str, tuple[str, str]] = {}
-    for (body,) in cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq"):
+    journal's events; each table that differs from what the events record is
+    rewritten from them. Every value is derived from the journal (WP12-R05): the
+    tenant from the event, the Task's limits and the Step's kind from the
+    transitions, and a row's ``created_at_ms`` from the ledger's own record of when
+    it first saw the entity (``entity_times``, a source of truth; missing: refused).
+    A damaged projection's values are never
+    kept. Nothing else is touched: costs, approvals, permits, receipts, stops,
+    results and the audit are sources of truth, not projections. Returns the
+    names of the tables rewritten (empty when nothing differed)."""
+    want: dict[str, dict[str, tuple[Any, ...]]] = {
+        "rt_tasks": {},
+        "rt_runs": {},
+        "rt_steps": {},
+        "rt_attempts": {},
+    }
+    bodies = cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq").fetchall()
+    for (body,) in bodies:
         event = Event.model_validate_json(body)
         if not isinstance(event.payload, RuntimePayload):
             continue
         tenant = str(event.tenant_id)
         for tr in event.payload.transitions:
             if isinstance(tr, TaskTransition):
-                old = tasks.get(str(tr.after.task_id))
-                tasks[str(tr.after.task_id)] = (
+                key = str(tr.after.task_id)
+                old = want["rt_tasks"].get(key)
+                want["rt_tasks"][key] = (
                     tenant,
                     tr.after.budget_total.micro_units,
                     dump_json(tr.after.caps_total).decode(),
-                    old[3] if old else event.recorded_at_ms,
+                    old[3] if old else _entity_time(cur, key),
                 )
             elif isinstance(tr, RunTransition):
-                prior = runs.get(str(tr.after.run_id))
-                runs[str(tr.after.run_id)] = (
+                key = str(tr.after.run_id)
+                prior = want["rt_runs"].get(key)
+                want["rt_runs"][key] = (
                     str(tr.after.task_id),
                     tenant,
                     tr.after.status.value,
                     int(tr.after.cancel_requested),
-                    prior[4] if prior else event.recorded_at_ms,
+                    prior[4] if prior else _entity_time(cur, key),
                 )
             elif isinstance(tr, StepTransition):
-                steps[str(tr.after.step_id)] = str(tr.after.run_id)
+                want["rt_steps"][str(tr.after.step_id)] = (
+                    str(tr.after.run_id),
+                    tr.after.kind.value,
+                )
             elif isinstance(tr, AttemptTransition):
-                attempts[str(tr.after.attempt_id)] = (str(tr.after.step_id), tr.after.state.value)
+                want["rt_attempts"][str(tr.after.attempt_id)] = (
+                    str(tr.after.step_id),
+                    tr.after.state.value,
+                )
+    columns = {
+        "rt_tasks": "task_id, tenant_id, budget_micro, caps, created_at_ms",
+        "rt_runs": "run_id, task_id, tenant_id, status, cancel_requested, created_at_ms",
+        "rt_steps": "step_id, run_id, kind",
+        "rt_attempts": "attempt_id, step_id, state",
+    }
     repaired: list[str] = []
-    have_tasks = {
-        r[0]: (r[1], r[2], r[3], r[4])
-        for r in cur.execute(
-            "SELECT task_id, tenant_id, budget_micro, caps, created_at_ms FROM rt_tasks"
-        )
-    }
-    want_tasks = {
-        k: (v[0], v[1], v[2], have_tasks[k][3] if k in have_tasks else v[3])
-        for k, v in tasks.items()
-    }
-    if have_tasks != want_tasks:
-        cur.execute("DELETE FROM rt_tasks")
+    for table in MIRROR_TABLES:
+        cols = columns[table]
+        have = {
+            r[0]: tuple(r[1:])
+            for r in cur.execute(f"SELECT {cols} FROM {table}")  # noqa: S608 (constant names)
+        }
+        if have == want[table]:
+            continue
+        cur.execute(f"DELETE FROM {table}")  # noqa: S608 (constant name)
+        marks = ", ".join("?" * (cols.count(",") + 1))
         cur.executemany(
-            "INSERT INTO rt_tasks (task_id, tenant_id, budget_micro, caps, created_at_ms) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [(k, *v) for k, v in sorted(want_tasks.items())],
+            f"INSERT INTO {table} ({cols}) VALUES ({marks})",  # noqa: S608 (constant names)
+            [(k, *v) for k, v in sorted(want[table].items())],
         )
-        repaired.append("rt_tasks")
-    have_runs = {
-        r[0]: (r[1], r[2], r[3], r[4], r[5])
-        for r in cur.execute(
-            "SELECT run_id, task_id, tenant_id, status, cancel_requested, created_at_ms "
-            "FROM rt_runs"
-        )
-    }
-    want_runs = {k: (*v[:4], have_runs[k][4] if k in have_runs else v[4]) for k, v in runs.items()}
-    if have_runs != want_runs:
-        cur.execute("DELETE FROM rt_runs")
-        cur.executemany(
-            "INSERT INTO rt_runs (run_id, task_id, tenant_id, status, cancel_requested, "
-            "created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
-            [(k, *v) for k, v in sorted(want_runs.items())],
-        )
-        repaired.append("rt_runs")
-    have_steps = {r[0]: r[1] for r in cur.execute("SELECT step_id, run_id FROM rt_steps")}
-    if have_steps != steps:
-        cur.execute("DELETE FROM rt_steps")
-        cur.executemany(
-            "INSERT INTO rt_steps (step_id, run_id) VALUES (?, ?)", sorted(steps.items())
-        )
-        repaired.append("rt_steps")
-    have_attempts = {
-        r[0]: (r[1], r[2])
-        for r in cur.execute("SELECT attempt_id, step_id, state FROM rt_attempts")
-    }
-    if have_attempts != attempts:
-        cur.execute("DELETE FROM rt_attempts")
-        cur.executemany(
-            "INSERT INTO rt_attempts (attempt_id, step_id, state) VALUES (?, ?, ?)",
-            [(k, *v) for k, v in sorted(attempts.items())],
-        )
-        repaired.append("rt_attempts")
+        repaired.append(table)
     return tuple(repaired)
 
 
 def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
+    for table, key in (("rt_tasks", "task_id"), ("rt_runs", "run_id")):
+        mismatch = cur.execute(
+            f"SELECT 1 FROM {table} r LEFT JOIN entity_times e ON e.entity_id = r.{key} "  # noqa: S608
+            "WHERE e.created_at_ms IS NULL OR e.created_at_ms != r.created_at_ms LIMIT 1"
+        ).fetchone()
+        if mismatch is not None:
+            raise LedgerInconsistencyError("the mirror's creation time differs from the ledger's")
     attempts = {
         r[0]: (r[1], r[2])
         for r in cur.execute("SELECT attempt_id, step_id, state FROM rt_attempts")
@@ -2841,8 +3040,8 @@ def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
     expected_runs = {
         k: (str(r.task_id), r.status.value, r.cancel_requested) for k, r in view["runs"].items()
     }
-    steps = {r[0]: r[1] for r in cur.execute("SELECT step_id, run_id FROM rt_steps")}
-    expected_steps = {k: str(s.run_id) for k, s in view["steps"].items()}
+    steps = {r[0]: (r[1], r[2]) for r in cur.execute("SELECT step_id, run_id, kind FROM rt_steps")}
+    expected_steps = {k: (str(s.run_id), s.kind.value) for k, s in view["steps"].items()}
     # Task limits are compared too: the budget in micro units and every cap, the
     # caps read back as their type (a malformed copy is a mismatch as well).
     tasks: dict[str, tuple[int, NonMonetaryCaps | None]] = {}
@@ -3036,3 +3235,10 @@ def revoke_stale(cur: sqlite3.Cursor, new_owner_epoch: int, wall_ms: int) -> Non
         None,
         None,
     )
+
+
+def read_run_status_since(cur: sqlite3.Cursor, run_id: str) -> int | None:
+    row = cur.execute(
+        "SELECT since_ms FROM run_status_times WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    return None if row is None else int(row[0])

@@ -700,4 +700,7 @@ class ExecutionReport(FrozenModel):
     outcome: Literal["COMPLETED", "FAILED_DEFINITE"]
     usage: Usage
     final: bool
+    # WP15-R07: the digest of what the operation produced, as the live gate checked
+    # it against the broker's ticket (a read's bytes). None for other operations.
+    result_digest: Digest | None = None
     mac: MacHex

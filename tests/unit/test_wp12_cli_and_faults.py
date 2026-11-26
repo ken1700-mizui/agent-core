@@ -110,7 +110,7 @@ def test_the_recovery_view_starts_nothing(env: Env) -> None:
 
 def test_an_explicit_recovery_ends_a_run_that_cannot_continue(env: Env) -> None:
     env.shell("start report")
-    code, events, _ = env.shell("recover", "recover", "status", "quit")
+    code, events, _ = env.shell("recover all", "recover all", "status", "quit")
     first, second = kinds(events, "recovered")
     assert (first["changed"], second["changed"]) == (True, False)  # idempotent
     [moved] = kinds(events, "run_recovered")[:1]
@@ -128,7 +128,7 @@ def test_an_unknown_outcome_through_the_cli(env: Env) -> None:
             raise KeyboardInterrupt
 
     assert env.shell("start report", model_wrapper=Interrupt)[0] == 130
-    code, events, _ = env.shell("recovery", "recover", "recovery", "quit")
+    code, events, _ = env.shell("recovery", "recover all", "recovery", "quit")
     views = kinds(events, "recovery")
     [unknown] = views[-1]["unknown"]
     assert unknown["hold_micro"] > 0
@@ -147,10 +147,14 @@ def test_an_unknown_outcome_through_the_cli(env: Env) -> None:
 def test_recovery_refusals_have_fixed_codes(env: Env) -> None:
     env.shell("start report")
     _, events, _ = env.shell(
-        "reconcile att_nope", "declare-unresolved last", "recover x", "recover-temporaries", "quit"
+        "reconcile att_nope",
+        "declare-unresolved last",
+        "recover x y",
+        "recover-temporaries",
+        "quit",
     )
     codes = [e["code"] for e in kinds(events, "error")]
-    assert codes == ["ATTEMPT_NOT_FOUND", "RECOVERY_REFUSED", "USAGE_INVALID_ARGUMENTS"]
+    assert codes == ["ATTEMPT_NOT_FOUND", "NOTHING_UNRESOLVED", "USAGE_INVALID_ARGUMENTS"]
     [temps] = kinds(events, "temporaries")
     assert temps["removed"] == []
 
@@ -181,7 +185,7 @@ def test_injected_commit_outcome_unknown_is_never_taken_as_not_run(
     monkeypatch.setattr(SqliteJournal, "_commit", commit_then_fail)
     env.shell("start report", "quit")
     monkeypatch.undo()
-    _, events, _ = env.shell("recover", "recovery", "quit")
+    _, events, _ = env.shell("recover all", "recovery", "quit")
     [view] = kinds(events, "recovery")[-1:]
     assert view["unknown"], "the started attempt must stay unknown"
     assert kinds(events, "run_recovered")[0]["after"] == "RECONCILIATION_REQUIRED"
@@ -213,7 +217,7 @@ def _kill_at(home: Path, point: str) -> None:
 
 
 def _recover(env: Env) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    _, events, err = env.shell("recover", "recovery", "status", "quit")
+    _, events, err = env.shell("recover all", "recovery", "status", "quit")
     assert not kinds(events, "error"), err
     return kinds(events, "recovery")[-1], kinds(events, "status")[-1]["tasks"][0]["runs"]
 
@@ -249,5 +253,17 @@ def test_a_process_killed_during_the_recovery(env: Env) -> None:
     view, runs = _recover(env)  # a new process continues the recovery
     assert runs[0]["status"] == "FAILED"
     assert view["runs"] == []
-    _, events, _ = env.shell("recover", "quit")
+    _, events, _ = env.shell("recover all", "quit")
     assert kinds(events, "recovered")[0]["changed"] is False
+
+
+def test_the_cli_never_recovers_a_run_of_its_own_live_session(env: Env) -> None:
+    def recover_current(out: str) -> str:
+        run_id = [json.loads(x) for x in out.splitlines() if '"started"' in x][-1]["run_id"]
+        return f"recover {run_id}"
+
+    code, events, _ = env.shell("start report", recover_current, "recover all", "pending", "quit")
+    assert [e["code"] for e in kinds(events, "error")] == ["RUN_ACTIVE"]
+    assert kinds(events, "recovered")[0]["changed"] is False  # "all" skips the live Run
+    assert len(kinds(events, "pending")[0]["items"]) == 1  # still waiting for its approval
+    assert code == 3

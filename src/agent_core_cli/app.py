@@ -64,7 +64,8 @@ HELP: Final = (
     "commands: start <" + "|".join(demo.DEMOS) + ">; status; steps [run]; budget [run]; "
     "pending; approve <action_hash>; stop run [run|last]; stop tenant; stop global; stops; "
     "resume-scope run <run> <stop_seq>; resume-scope tenant|global <stop_seq>; "
-    "recovery; recover; reconcile <attempt>; declare-unresolved <run>; recover-temporaries; "
+    "recovery; recover <run>|all; reconcile <attempt>; declare-unresolved <run>; "
+    "recover-temporaries; "
     "help; quit"
 )
 
@@ -74,7 +75,8 @@ def _recovery_call[T](call: Callable[[], T]) -> T:
     try:
         return call()
     except RecoveryError as refused:
-        raise CliError(refused.code, str(refused.args[0]) if refused.args else None) from None
+        # The refusal's own fixed reason (e.g. RUN_ACTIVE), never a free message.
+        raise CliError(str(refused.args[0]) if refused.args else refused.code) from None
     except WorkspaceRejectedError as refused:
         raise CliError("RECOVERY_REFUSED", "WORKSPACE_REJECTED") from refused
 
@@ -377,19 +379,29 @@ class _Shell:
         self._printer.event("recovery", **views.recovery(self._session))
 
     def recover(self, rest: list[str]) -> None:
-        """The owner's explicit recovery of every unfinished Run."""
-        if rest:
+        """The owner's explicit recovery of the named Run, or of ``all`` the Runs the
+        recovery view lists that are not live in this session."""
+        if len(rest) != 1:
             raise CliError("USAGE_INVALID_ARGUMENTS")
-        report = _recovery_call(self._session.recover)
-        self._printer.event("recovered", changed=report.changed)
-        for plan in report.runs:
-            run = self._session.sm.state.runs[plan.run_id]
-            self._acted = plan.run_id
+        targets = (
+            self._session.recoverable()
+            if rest[0] == "all"
+            else [self._session.resolve_run(rest[0])]
+        )
+        before = {r: self._session.sm.state.runs[r].status for r in targets}
+        report = _recovery_call(lambda: self._session.recover(targets))
+        self._printer.event(
+            "recovered",
+            changed=report.changed,
+            escalated=[str(r) for r in report.escalated],
+        )
+        for run_id, status in before.items():
+            self._acted = run_id
             self._printer.event(
                 "run_recovered",
-                run_id=str(plan.run_id),
-                before=plan.status.value,
-                after=run.status.value,
+                run_id=str(run_id),
+                before=status.value,
+                after=self._session.sm.state.runs[run_id].status.value,
             )
 
     def reconcile(self, rest: list[str]) -> None:

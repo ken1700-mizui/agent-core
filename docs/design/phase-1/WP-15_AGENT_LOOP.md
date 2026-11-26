@@ -309,3 +309,11 @@ spent: 180 + 140 + 180 + 140 = 640 (model only; the file tools cost 0)
 - 既存の試験の変更：`test_wp09_execution.py` の1件は、作っただけの証拠で Run を完了させていた。それが拒否されることを確かめる形に変え、Task の完了の成功の経路は、本物の検証の読み取りを伴う新しい試験 `test_a_verified_run_lets_its_task_complete` に移した。`test_runtime_service.py` の2件（Rebuild と Journal の検証）は、作っただけの証拠の補助関数 `completed_scenario` の代わりに、ループが本物の読み取りで完了させた Run（`loop_world.completed_world`）を使うようにした。
 - **ADR-0008 の限界は変えない：** 協調しない書き込み元（このゲートを通らない別のプロセス、同じユーザーの直接の書き込み）が、最後の読み取りと完了の記録の間にファイルを変えることは防げない。
 
+## 17. 限定修正 WP15-R07：検証の証拠
+
+- `VerificationEvidence.checks`：完了条件ごとに、条件の digest、対象のパス、期待の digest、観測した digest、検証の読み取りの Attempt を対応付ける（`types/criteria.py` の `CriterionCheck`。`FileCriterion` もここに移した）。
+- 実行のゲートは、読み取りの結果（ブローカーのチケットと照合したバイト）の digest を、署名付きの実行報告に含め、台帳がそれを記録する（`operation_results`）。
+- 完了のトランザクションで台帳が確かめること：条件の digest がその仕様（パスと期待の digest）の digest であること、観測が期待と等しいこと、読み取りがこの Run の VERIFICATION の Step の完了した Attempt で、そのパスだけの READ であること、ゲートが記録した digest が観測と等しいこと（自由に書いた digest は証拠にならない）、1つの読み取りは1つの条件だけの証拠であること、そのパスへのこの Run の最後の確定した書き込みが同じ内容であること。
+- 拒否されること（試験）：モデルが求めた古い読み取り、偽の観測 digest、仕様の違う条件、1つの読み取りの使い回し（型が拒否）、確定した書き込みと検証の不一致。
+- 独立した評価の Engine と、実データ用の証拠の保管の基盤は、後の Phase。
+

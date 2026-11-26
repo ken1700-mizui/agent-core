@@ -1,6 +1,6 @@
 # WP-12 障害からの復旧（Recovery）
 
-> 文書の状態：**DRAFT**（ChatGPT のレビュー待ち）　最終更新：2026-11-26
+> 文書の状態：**DRAFT**（90/100 の条件付き合格の後、限定修正 WP12-R01〜R05 を14章に記録した）　最終更新：2026-11-26
 >
 > - 起点：`88ab790`（WP-10）。作業の前に、リモートとの一致、作業ツリーが空であること、`main`（`aa089ae`）、設計のブランチ（`e6b70c0`）、1937 件の試験と8種類の検査の成功を確かめた。
 > - 段階1：`b23b0ac`（WP-10・WP-15 の限定修正。記録は `WP-10_CLI.md` の15章、`WP-15_AGENT_LOOP.md` の16章）。
@@ -167,3 +167,15 @@
 - 完全なバックアップと復元（Phase 4）。
 
 残っている課題（変わらない）：AUDIT-02〜04、A-P6、CI（GitHub Actions は未実行）、OS の隔離、実データのための鍵付きのハッシュ。
+
+## 14. 限定修正 WP12-R01〜R05（90/100 の条件付き合格の後）
+
+起点：`b441b03`。回帰の試験 `tests/unit/test_wp12_fixes.py`（WP15-R07 の6件を含む）を先に書き、振る舞いの赤を確かめた（新しい引数がないことによる失敗のほか、作成時刻の修復、確定した書き込みと検証の不一致、時計の逆行の後の期限が、振る舞いとして失敗した）。
+
+- **R01 復旧の対象：** `recover` は、対象の Run を明示的に受け取る（`run_ids`、CLI は `recover <run>` か `recover all`）。この Runtime のセッションが動かしている Run（`active`）は `RUN_ACTIVE` で拒否する（止めるなら正式な停止の経路）。復旧の再入は `RECOVERY_BUSY` で拒否する。未実行の証明は、その Receipt が以前のオーナーの epoch のもので、失効済み（一度も USED になっていない）ときだけ行う。今の epoch の未完の操作は、結果不明のまま残す。
+- **R02 照合の原子性：** 新しい台帳の操作 `ReconcileOutcome` を、Attempt の OUTCOME_UNKNOWN → COMPLETED / FAILED_DEFINITE の遷移と同じトランザクションで行う（ペアリングで必須）。台帳が自分の記録で決める：未実行の証明は Receipt が REVOKED（USED でない）かつ以前の epoch のときだけ（費用0、結果 FAILED）。実行報告は MAC、Receipt、Attempt、予約、owner_epoch、PEP を照合し、費用は既存の信頼された料金計算（`_billed_cost`）で導き、使用量が FINAL で請求が完全でなければ拒否する（`report.final` だけでは判断しない）。費用だけを別に確定した後は、どの証拠でも結果を変えられない（`NOT_UNKNOWN`）。確定済みの結果は、別の証拠で変わらない（`ALREADY_SETTLED`）。
+- **R03 未確定の費用と終了状態：** 割り当てだけの予約、保留、UNKNOWN、最終でない使用量（0でも）を未確定とする。終わった Attempt に残った割り当ては VOID にする。予約 ID があるのに予約の記録がなければ `RESERVATION_MISSING` で拒否する。未確定の費用を残したまま正常に CANCELLED や FAILED にしない。終わった Run に残った未完の操作や費用も、評価と照合の対象にする。キャンセルが求められていた Run は CANCELLED、停止された Run は FAILED（`OWNER_CANCELLED`）にする（停止の意図を失わない）。`changed` は実際に変えたときだけ True にする。
+- **R04 期限：** 「今」は台帳の時刻の high-water（`observe_time` が、その時の壁時計を記録する）。状態に入った時刻は、台帳が状態の変化のときだけ記録する（`run_status_times`。同じ状態の別のイベントでは変わらない）。期限切れ（`escalated`）と通常の復旧を区別して報告する。常時の監視はなく、明示的な復旧のときに検査する契約とする（Phase 4 のスケジューラーは前倒ししない）。
+- **R05 ProjectionRepair：** 投影の値は、すべて正本から導く。tenant、Task の上限、Step の種類は Journal から。作成時刻は、台帳が最初に見た時刻の記録（`entity_times`、正本）から。正本にない値は推測せず拒否する。開くときの検査も、投影の作成時刻を正本と照合する（壊れた時刻で時間の上限が緩まない）。正本の破損は、引き続き直さずに拒否する。
+- Journal の形式を版 8 にした（`rt_steps.kind`、`entity_times`、`run_status_times`、`operation_results`）。版 7 以前は開かない（合成のデータだけなので移行は作らない）。
+

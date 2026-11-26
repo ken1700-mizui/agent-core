@@ -21,9 +21,9 @@ Pairing with runtime transitions (enforced by the SQLite journal):
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.cost import (
@@ -238,6 +238,32 @@ class RecordApproval(FrozenModel):
     signed: SignedApproval
 
 
+class ReconcileOutcome(FrozenModel):
+    """WP12-R02: settles an unknown outcome and its cost in the same transaction as
+    the Attempt's OUTCOME_UNKNOWN -> COMPLETED / FAILED_DEFINITE transition. The
+    ledger decides from its own records: ``NOT_STARTED`` only when the receipt was
+    never used (the start is recorded as USED) and was revoked at a later owner
+    epoch (actual cost zero, outcome FAILED); ``EXECUTION_REPORT`` only with the
+    live gate's signed report of exactly this receipt, owner epoch and PEP, its
+    cost derived by the trusted billing and final."""
+
+    op: Literal["reconcile_outcome"]
+    attempt_id: AttemptId
+    reservation_id: ReservationId
+    basis: Literal["NOT_STARTED", "EXECUTION_REPORT"]
+    outcome: Literal["COMPLETED", "FAILED"]
+    report: ExecutionReport | None
+    evidence_ref: Digest
+
+    @model_validator(mode="after")
+    def _shape(self) -> Self:
+        if (self.basis == "EXECUTION_REPORT") != (self.report is not None):
+            raise ValueError("an execution report is the evidence of that basis only")
+        if self.basis == "NOT_STARTED" and self.outcome != "FAILED":
+            raise ValueError("an operation that never started did not complete")
+        return self
+
+
 class RecoverInFlight(FrozenModel):
     """After a restart: ``CONSUMED`` and ``ACTIVE`` become ``UNKNOWN`` (hold kept)."""
 
@@ -392,6 +418,7 @@ LedgerOp = Annotated[
     | ReportUsage
     | MarkUnknown
     | Reconcile
+    | ReconcileOutcome
     | Correct
     | Unexplained
     | VoidAllocation

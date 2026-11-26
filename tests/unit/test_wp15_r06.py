@@ -117,7 +117,7 @@ def test_a_made_up_evidence_cannot_complete_a_run(tmp_path: Path) -> None:
         expected_artifact_hash=lp.CRITERION.expected_digest,
         apply_plan=ApplyPlanStatus.NOT_REQUIRED,
         passed=True,
-        verified_reads=(),
+        checks=(),
     )
     with pytest.raises(Exception):  # noqa: B017,PT011 (refused at planning or in the journal)
         sm.set_run_status(run, R.COMPLETED, forged)
@@ -137,7 +137,10 @@ def test_a_read_that_is_not_a_verification_read_is_refused(tmp_path: Path) -> No
             for a in state.attempts.values()
             if a.action_hash and state.steps[a.step_id].kind.value == "TOOL_CALL"
         ]
-        return evidence.model_copy(update={"verified_reads": tuple(writes[:1])})
+        [check] = evidence.checks
+        return evidence.model_copy(
+            update={"checks": (check.model_copy(update={"read_attempt_id": writes[0]}),)}
+        )
 
     loop._verification_evidence = swap  # type: ignore[method-assign]
     outcome = _drive(wd)

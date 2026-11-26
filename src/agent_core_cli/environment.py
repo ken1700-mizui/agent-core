@@ -56,6 +56,7 @@ from agent_core.runtime.recovery import (
     RecoveryDeps,
     RecoveryReport,
     TemporaryRecovery,
+    assess,
     declare_unresolved,
     reconcile,
     recover,
@@ -692,11 +693,19 @@ class Session:
             clock=self.clock,
             report_key=self.report_key,
             journal=self.journal,
+            active=self.continues,
         )
 
-    def recover(self) -> RecoveryReport:
-        """The owner's explicit recovery (never started by a status view)."""
-        return recover(self.recovery_deps(), deadlines=demo.RECOVERY_DEADLINES)
+    def recoverable(self) -> list[RunId]:
+        """The Runs a recovery may name: those the assessment lists that are not
+        live in this session (WP12-R01)."""
+        plan = assess(self.sm.state, self.journal)
+        return [r.run_id for r in plan.runs if not self.continues(r.run_id)]
+
+    def recover(self, run_ids: list[RunId]) -> RecoveryReport:
+        """The owner's explicit recovery of the named Runs (never started by a
+        status view; a Run live in this session is refused)."""
+        return recover(self.recovery_deps(), deadlines=demo.RECOVERY_DEADLINES, run_ids=run_ids)
 
     def reconcile(self, attempt_ref: str) -> Reconciled:
         attempt_id = self._attempt(attempt_ref)

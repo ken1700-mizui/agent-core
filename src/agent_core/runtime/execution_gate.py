@@ -92,6 +92,7 @@ class SyntheticResult(FrozenModel):
     outcome: Literal["COMPLETED", "FAILED_DEFINITE"]
     usage: Usage
     final: bool
+    result_digest: str | None = None
 
 
 class _OpenTicket:
@@ -342,7 +343,10 @@ class SyntheticExecutionGate:
             raise PermitRejectedError(PermitReason.FILE_RESULT_UNVERIFIED)
         if data is not None and not accept_read(data):
             return FileExecution(self._finish(started, _definite()), None)
-        done = self._finish(started, _completed())
+        # A read's bytes, checked above against the redeemed ticket, are recorded
+        # by digest with the signed result (WP15-R07).
+        result = _completed() if data is None else _completed(file_digest(data))
+        done = self._finish(started, result)
         return FileExecution(done, data)
 
     # ------------------------------------------------------------ tickets (WP-08)
@@ -471,6 +475,7 @@ class SyntheticExecutionGate:
             outcome=result.outcome,
             usage=result.usage,
             final=result.final,
+            result_digest=result.result_digest,
             mac=_PLACEHOLDER_MAC,
         )
         signed = reports.sign(self._keys.permit, report)
@@ -504,8 +509,10 @@ def _no_usage() -> Usage:
     )
 
 
-def _completed() -> SyntheticResult:
-    return SyntheticResult(outcome="COMPLETED", usage=_no_usage(), final=True)
+def _completed(result_digest: str | None = None) -> SyntheticResult:
+    return SyntheticResult(
+        outcome="COMPLETED", usage=_no_usage(), final=True, result_digest=result_digest
+    )
 
 
 def _definite() -> SyntheticResult:

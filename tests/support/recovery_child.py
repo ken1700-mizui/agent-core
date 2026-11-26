@@ -95,7 +95,7 @@ def main() -> int:
             block()
 
         recovery._abort = abort  # type: ignore[assignment]
-        lines = ["recover"]
+        lines = ["recover all"]
     else:
         lines = ["start report", "APPROVE"]
     out = io.StringIO()

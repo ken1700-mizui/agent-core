@@ -19,6 +19,7 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, model_validator
 
 from agent_core.types.base import FrozenModel
+from agent_core.types.criteria import CriterionCheck
 from agent_core.types.ids import AttemptId, PermitId, ReceiptId, ReservationId
 from agent_core.types.records import Attempt, Run, Step, Task
 from agent_core.types.values import Digest, PolicyVersion
@@ -198,14 +199,21 @@ class VerificationEvidence(FrozenModel):
     expected_artifact_hash: Digest
     apply_plan: ApplyPlanStatus
     passed: bool
-    # WP15-R06: the verification reads this result rests on (the confirmation
-    # reads). The completion transaction checks each one against the ledger.
-    verified_reads: tuple[AttemptId, ...] = ()
+    # WP15-R06, R07: per criterion, what was expected, what the verification read
+    # observed and which read. The completion transaction checks every one.
+    checks: tuple[CriterionCheck, ...] = ()
+
+    @property
+    def verified_reads(self) -> tuple[AttemptId, ...]:
+        return tuple(c.read_attempt_id for c in self.checks if c.read_attempt_id is not None)
 
     @model_validator(mode="after")
     def _consistent(self) -> Self:
-        if len(set(self.verified_reads)) != len(self.verified_reads):
-            raise ValueError("verified_reads must be unique")
+        reads = self.verified_reads
+        if len(set(reads)) != len(reads):
+            raise ValueError("one read is the evidence of one criterion only")
+        if len({c.criterion_ref for c in self.checks}) != len(self.checks):
+            raise ValueError("one check per criterion")
         derived = bool(self.criteria) and all(c.passed for c in self.criteria)
         derived = derived and self.artifact_hash == self.expected_artifact_hash
         if self.passed != derived:

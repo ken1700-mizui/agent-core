@@ -88,6 +88,7 @@ from agent_core.tool.registry import ToolRegistry
 from agent_core.types.base import FrozenModel
 from agent_core.types.context import ContextProfile, SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind, PriceTable, ReservationState
+from agent_core.types.criteria import CriterionCheck
 from agent_core.types.errors import (
     AgentCoreError,
     CompletionRefusedError,
@@ -1086,18 +1087,16 @@ class AgentLoop:
 
     def _read_all(
         self, run_id: RunId, session: _Session, specs: list[FileCriterion | None]
-    ) -> tuple[list[str | None], list[AttemptId]]:
-        """The digest of each criterion's file, and the read Attempts that ran."""
+    ) -> tuple[list[str | None], list[AttemptId | None]]:
+        """The digest of each criterion's file, and the read Attempt of each."""
         found: list[str | None] = []
-        reads: list[AttemptId] = []
+        reads: list[AttemptId | None] = []
         for spec in specs:
             before = {a.attempt_id for a in self._attempts(run_id)}
             data = None if spec is None else self._read(run_id, session, spec.path)
             found.append(None if data is None else file_digest(data))
-            if data is not None:
-                reads.extend(
-                    a.attempt_id for a in self._attempts(run_id) if a.attempt_id not in before
-                )
+            new = [a.attempt_id for a in self._attempts(run_id) if a.attempt_id not in before]
+            reads.append(new[-1] if data is not None and new else None)
         return found, reads
 
     def _committed_writes(self, run_id: RunId) -> dict[str, str]:
@@ -1118,7 +1117,7 @@ class AgentLoop:
         specs: list[FileCriterion | None],
         found: list[str | None],
         passed: list[bool],
-        reads: tuple[AttemptId, ...],
+        reads: tuple[AttemptId | None, ...],
         run_id: RunId,
     ) -> VerificationEvidence:
         observed = [
@@ -1140,7 +1139,19 @@ class AgentLoop:
             expected_artifact_hash=sha256_digest("|".join(expected).encode()),
             apply_plan=ApplyPlanStatus.COMMITTED if wrote else ApplyPlanStatus.NOT_REQUIRED,
             passed=bool(refs) and all(passed),
-            verified_reads=reads,
+            checks=tuple(
+                CriterionCheck(
+                    criterion_ref=ref,
+                    path=spec.path,
+                    expected_digest=spec.expected_digest,
+                    observed_digest=digest,
+                    read_attempt_id=read,
+                )
+                for ref, spec, digest, read in zip(refs, specs, found, reads, strict=True)
+                if spec is not None
+            )
+            if reads
+            else (),
         )
 
     def _verify(self, run_id: RunId, session: _Session) -> bool:

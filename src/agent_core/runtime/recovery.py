@@ -36,9 +36,9 @@ The deadline values are explicit inputs, not approved operating values.
 from __future__ import annotations
 
 from collections.abc import Callable, Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Annotated, Any, Final, Protocol
+from typing import Annotated, Any, Final, Literal, Protocol
 
 from pydantic import Field
 
@@ -56,12 +56,12 @@ from agent_core.types.ids import AttemptId, RunId
 from agent_core.types.ledger import (
     LedgerOp,
     MarkUnknown,
-    Reconcile,
+    ReconcileOutcome,
     ReleaseReservation,
     VoidAllocation,
 )
 from agent_core.types.records import Attempt, AttemptState, Run, RunStatus, StepStatus
-from agent_core.types.safety import ExecutionReport, Policy, SecretKey
+from agent_core.types.safety import ExecutionReport, Policy, ReceiptState, SecretKey
 from agent_core.types.transitions import (
     AbortEvidence,
     AbortReason,
@@ -69,13 +69,14 @@ from agent_core.types.transitions import (
     OutcomeEvidence,
     ReconciledOutcome,
     ReconciliationEvidence,
+    ReconciliationResolution,
     ReconciliationTrigger,
     ReconciliationTriggerReason,
-    RunTransition,
+    ResolutionDecision,
     Termination,
     TerminationReason,
 )
-from agent_core.types.values import Budget, Currency, sha256_digest
+from agent_core.types.values import sha256_digest
 
 A = AttemptState
 R = RunStatus
@@ -189,6 +190,9 @@ class RecoveryDeps:
     # The permit key: verifies the live gate's signed execution reports.
     report_key: SecretKey | None = None
     journal: JournalPort | None = None
+    # Whether a Run is live in this Runtime (a session holds it): never recovered
+    # as if it had crashed (WP12-R01). The composition root knows its sessions.
+    active: Callable[[RunId], bool] = field(default=lambda _run_id: False)
 
     def events(self) -> JournalPort:
         journal = self.journal if self.journal is not None else self.ledger
@@ -203,7 +207,7 @@ class AttemptPlan:
     attempt_id: AttemptId
     state: AttemptState
     rule: str
-    action: str  # ABORT, MARK_UNKNOWN, PROVE_NOT_STARTED, KEEP_UNKNOWN, NONE
+    action: str  # ABORT, MARK_UNKNOWN, PROVE_NOT_STARTED, KEEP_UNKNOWN, VOID, NONE
 
 
 @dataclass(frozen=True)
@@ -214,9 +218,21 @@ class RunPlan:
 
 
 @dataclass(frozen=True)
+class Unsettled:
+    attempt_id: AttemptId
+    reservation_state: ReservationState
+    hold_micro: int
+    cost_final: bool
+
+
+@dataclass(frozen=True)
 class RecoveryReport:
     runs: tuple[RunPlan, ...]
     changed: bool = False
+    # Runs moved to RECONCILIATION_REQUIRED because a deadline passed (A.I17),
+    # apart from the normal recovery (WP12-R04).
+    escalated: tuple[RunId, ...] = ()
+    unsettled: tuple[Unsettled, ...] = ()
 
 
 def _run_attempts(state: RuntimeState, run_id: RunId) -> list[Attempt]:
@@ -231,92 +247,114 @@ def _action(state: AttemptState) -> str:
     rule = RECOVERY_TABLE[state]
     if rule is _FINAL_RULE:
         return "NONE"
-    if rule.provably_not_executed and state not in (A.PERMIT_CONSUMED, A.DISPATCH_AUTHORIZED):
-        return "ABORT"
     if state in (A.PERMIT_CONSUMED, A.DISPATCH_AUTHORIZED):
         return "PROVE_NOT_STARTED"
+    if rule.provably_not_executed:
+        return "ABORT"
     return "MARK_UNKNOWN" if state is A.DISPATCH_STARTED else "KEEP_UNKNOWN"
 
 
-def assess(state: RuntimeState, ledger: LedgerPort | None = None) -> RecoveryReport:
-    """The recovery plan of every Run that is not finished. Reads only."""
-    runs = []
-    for run in state.runs.values():
-        if run.status in _TERMINAL_RUN:
+def _unsettled_view(view: Any) -> bool:
+    """A reservation whose cost is not settled: an allocation left, a hold, an
+    unknown, or a reported cost that is not final (even at zero) (WP12-R03)."""
+    if view is None:
+        return False
+    return (
+        view.state not in _SETTLED_RESERVATION
+        or view.hold_micro != 0
+        or (view.state is RS.USAGE_REPORTED and not view.spent_known)
+    )
+
+
+def _unsettled(state: RuntimeState, ledger: LedgerPort | None, run_id: RunId) -> list[Unsettled]:
+    found: list[Unsettled] = []
+    if ledger is None:
+        return found
+    for attempt in _run_attempts(state, run_id):
+        if attempt.reservation_id is None:
             continue
-        attempts = tuple(
+        view = ledger.reservation(str(attempt.reservation_id))
+        if view is None:
+            raise RecoveryError("RESERVATION_MISSING")  # an Attempt names a reservation
+        if _unsettled_view(view):
+            found.append(
+                Unsettled(attempt.attempt_id, view.state, view.hold_micro, bool(view.spent_known))
+            )
+    return found
+
+
+def assess(state: RuntimeState, ledger: LedgerPort | None = None) -> RecoveryReport:
+    """The recovery plan: every Run that is not finished, and every finished Run
+    that still has unfinished work or an unsettled cost (WP12-R03). Reads only."""
+    runs = []
+    unsettled: list[Unsettled] = []
+    for run in state.runs.values():
+        open_attempts = tuple(
             AttemptPlan(a.attempt_id, a.state, RECOVERY_TABLE[a.state].code, _action(a.state))
             for a in _run_attempts(state, run.run_id)
             if a.state not in _FINAL
         )
-        runs.append(RunPlan(run.run_id, run.status, attempts))
-    return RecoveryReport(runs=tuple(runs))
+        costs = _unsettled(state, ledger, run.run_id)
+        unsettled.extend(costs)
+        if run.status in _TERMINAL_RUN and not open_attempts and not costs:
+            continue
+        runs.append(RunPlan(run.run_id, run.status, open_attempts))
+    return RecoveryReport(runs=tuple(runs), unsettled=tuple(unsettled))
 
 
 # ================================================================ recovery (explicit)
 
+_RECOVERING: set[int] = set()  # the state machines under recovery (no reentry)
 
-def _started_in_history(deps: RecoveryDeps, attempt: Attempt) -> bool:
-    """Whether the journal ever recorded this Attempt's start (DISPATCH_STARTED)."""
-    run_id = deps.sm.state.steps[attempt.step_id].run_id
+
+def _history(deps: RecoveryDeps, run_id: RunId) -> list[Any]:
+    found: list[Any] = []
     after = 0
     journal = deps.events()
     while True:
         events = journal.read_run(run_id, after_run_seq=after, limit=500)
         if not events:
-            return False
-        for event in events:
-            payload = event.payload
-            if payload is None:
-                continue
-            for t in payload.transitions:
-                if (
-                    isinstance(t, AttemptTransition)
-                    and t.after.attempt_id == attempt.attempt_id
-                    and t.after.state is A.DISPATCH_STARTED
-                ):
-                    return True
+            return found
+        found.extend(events)
         last = events[-1].run_seq
         if last is None:
-            return False
+            return found
         after = last
+
+
+def _started_in_history(deps: RecoveryDeps, attempt: Attempt) -> bool:
+    """Whether the journal ever recorded this Attempt's start (DISPATCH_STARTED)."""
+    run_id = deps.sm.state.steps[attempt.step_id].run_id
+    for event in _history(deps, run_id):
+        for t in event.payload.transitions if event.payload is not None else ():
+            if (
+                isinstance(t, AttemptTransition)
+                and t.after.attempt_id == attempt.attempt_id
+                and t.after.state is A.DISPATCH_STARTED
+            ):
+                return True
+    return False
 
 
 def _now(deps: RecoveryDeps) -> int:
-    """Never earlier than the latest recorded event: a wall clock that went back
-    cannot extend a deadline."""
-    latest = 0
-    journal = deps.events()
-    after = 0
-    tenant = deps.sm.tenant_id
-    while True:
-        events = journal.read_tenant(tenant, after_tenant_seq=after, limit=500)
-        if not events:
-            break
-        latest = max(latest, max(e.recorded_at_ms for e in events))
-        after = events[-1].tenant_seq
-    return max(deps.clock.now_ms(), latest)
+    """The recovery's time: the ledger's high-water, with this wall clock recorded
+    as observed, so a wall clock that goes back later cannot extend a deadline
+    (WP12-R04)."""
+    return deps.ledger.observe_time(deps.clock.now_ms())
 
 
 def _entered(deps: RecoveryDeps, run: Run) -> int:
-    """When the Run last entered its current status (the event's recorded time)."""
-    entered = 0
-    after = 0
-    journal = deps.events()
-    while True:
-        events = journal.read_run(run.run_id, after_run_seq=after, limit=500)
-        if not events:
-            return entered
-        for event in events:
-            if event.payload is None:
-                continue
-            for t in event.payload.transitions:
-                if isinstance(t, RunTransition) and t.after.status is run.status:
-                    entered = event.recorded_at_ms
-        last = events[-1].run_seq
-        if last is None:
-            return entered
-        after = last
+    """When the Run entered its current status, in the ledger's time (the same
+    time the deadline is measured in); a later event in the same status does not
+    reset it."""
+    since = deps.ledger.run_status_since(str(run.run_id))
+    if since is None:
+        raise RecoveryError("RUN_TIME_MISSING")
+    return since
+
+
+def _set_run(deps: RecoveryDeps, run_id: RunId, status: RunStatus, evidence: Any = None) -> None:
+    deps.sm.set_run_status(deps.sm.state.runs[run_id], status, evidence)
 
 
 def _stopped(deps: RecoveryDeps, run_id: RunId) -> bool:
@@ -325,10 +363,6 @@ def _stopped(deps: RecoveryDeps, run_id: RunId) -> bool:
         (e.scope_type.value, e.scope_id) in scopes and e.status.value == "STOPPED"
         for e in deps.ledger.stop_entries()
     )
-
-
-def _set_run(deps: RecoveryDeps, run_id: RunId, status: RunStatus, evidence: Any = None) -> None:
-    deps.sm.set_run_status(deps.sm.state.runs[run_id], status, evidence)
 
 
 def _trigger(run_id: RunId, reason: ReconciliationTriggerReason) -> ReconciliationTrigger:
@@ -342,7 +376,10 @@ def _trigger(run_id: RunId, reason: ReconciliationTriggerReason) -> Reconciliati
 def _reservation(deps: RecoveryDeps, attempt: Attempt) -> Any:
     if attempt.reservation_id is None:
         return None
-    return deps.ledger.reservation(str(attempt.reservation_id))
+    view = deps.ledger.reservation(str(attempt.reservation_id))
+    if view is None:
+        raise RecoveryError("RESERVATION_MISSING")
+    return view
 
 
 def _abort(deps: RecoveryDeps, attempt: Attempt) -> None:
@@ -385,36 +422,60 @@ def _mark_unknown(deps: RecoveryDeps, attempt: Attempt) -> Attempt:
 
 
 def _settle(
-    deps: RecoveryDeps, attempt: Attempt, target: AttemptState, actual: int, proof: str
-) -> None:
-    """The owner's reconciliation at a recorded cost, then the Attempt's outcome.
-    Each its own transaction; a crash between them is continued by a second call
-    (an already reconciled reservation is not reconciled again)."""
-    view = _reservation(deps, attempt)
-    if view is not None and view.state is RS.UNKNOWN and attempt.reservation_id is not None:
-        deps.owner(
-            Reconcile(
-                op="reconcile",
-                reservation_id=attempt.reservation_id,
-                actual=Budget(currency=Currency.XTU, micro_units=actual),
-                evidence_ref=proof,
-            )
-        )
+    deps: RecoveryDeps,
+    attempt: Attempt,
+    basis: Literal["NOT_STARTED", "EXECUTION_REPORT"],
+    report: ExecutionReport | None,
+    proof: str,
+) -> AttemptState:
+    """The outcome and its cost in one journal transaction (WP12-R02): the ledger
+    checks the basis against its own records and derives the cost itself."""
+    completed = report is not None and report.outcome == "COMPLETED"
+    target = A.COMPLETED if completed else A.FAILED_DEFINITE
+    assert attempt.reservation_id is not None  # noqa: S101 (consumed or later)
+    op = ReconcileOutcome(
+        op="reconcile_outcome",
+        attempt_id=attempt.attempt_id,
+        reservation_id=attempt.reservation_id,
+        basis=basis,
+        outcome="COMPLETED" if completed else "FAILED",
+        report=report,
+        evidence_ref=proof,
+    )
     evidence = ReconciliationEvidence(
         kind="reconciliation",
         evidence_ref=proof,
-        outcome=ReconciledOutcome.COMPLETED if target is A.COMPLETED else ReconciledOutcome.FAILED,
+        outcome=ReconciledOutcome.COMPLETED if completed else ReconciledOutcome.FAILED,
     )
-    deps.sm.advance_attempt(deps.sm.state.attempts[attempt.attempt_id], target, evidence)
+    deps.sm.advance_attempt(
+        deps.sm.state.attempts[attempt.attempt_id], target, evidence, ledger=(op,)
+    )
+    return target
+
+
+def _old_authority_revoked(deps: RecoveryDeps, attempt: Attempt) -> bool:
+    """The Attempt's receipt is of an earlier owner and was revoked, never used:
+    its old authority cannot start it any more (WP12-R01)."""
+    if attempt.receipt_id is None:
+        return False
+    receipt = deps.ledger.receipt(str(attempt.receipt_id))
+    state = deps.ledger.receipt_state(str(attempt.receipt_id))
+    epoch = getattr(deps.ledger, "owner_epoch", None)
+    return (
+        receipt is not None
+        and state is ReceiptState.REVOKED
+        and isinstance(epoch, int)
+        and receipt.owner_epoch < epoch
+    )
 
 
 def _prove_not_started(deps: RecoveryDeps, attempt: Attempt) -> bool:
-    if _started_in_history(deps, attempt):
+    if _started_in_history(deps, attempt) or not _old_authority_revoked(deps, attempt):
         return False
     proof = sha256_digest(
         f"recovery:not-started:{attempt.attempt_id}:{attempt.receipt_id}".encode()
     )
-    _settle(deps, attempt, A.FAILED_DEFINITE, 0, proof)
+    _settle(deps, attempt, "NOT_STARTED", None, proof)
     return True
 
 
@@ -433,6 +494,14 @@ def _recover_attempts(deps: RecoveryDeps, run_id: RunId) -> bool:
                 _prove_not_started(deps, current)
         elif action == "KEEP_UNKNOWN":
             changed = _prove_not_started(deps, current) or changed
+        elif current.state in _FINAL and current.reservation_id is not None:
+            view = _reservation(deps, current)
+            if view is not None and view.state is RS.ID_ALLOCATED:
+                # An allocation left by an ended Attempt: voided (WP12-R03).
+                deps.ledger.apply_ledger(
+                    (VoidAllocation(op="void", reservation_id=current.reservation_id),)
+                )
+                changed = True
     return changed
 
 
@@ -453,20 +522,45 @@ def _close_steps(deps: RecoveryDeps, run_id: RunId, target: StepStatus) -> bool:
 
 
 def _settled(deps: RecoveryDeps, run_id: RunId) -> bool:
-    for attempt in _run_attempts(deps.sm.state, run_id):
-        if attempt.state not in _FINAL:
-            return False
-        view = _reservation(deps, attempt)
-        if view is not None and (
-            view.state not in _SETTLED_RESERVATION | {RS.ID_ALLOCATED} or view.hold_micro
-        ):
-            return False
-    return True
+    if any(a.state not in _FINAL for a in _run_attempts(deps.sm.state, run_id)):
+        return False
+    return not _unsettled(deps.sm.state, deps.ledger, run_id)
 
 
-def _recover_run(deps: RecoveryDeps, run_id: RunId, deadlines: RecoveryDeadlines, now: int) -> bool:
-    changed = False
+def _end(deps: RecoveryDeps, run_id: RunId) -> None:
+    """A Run with nothing unknown and every cost settled, that cannot continue:
+    CANCELLED when its cancel was requested, else FAILED (stopped by the owner, or
+    its transcript lost). Never resumed."""
     run = deps.sm.state.runs[run_id]
+    if run.cancel_requested:
+        resolution = ReconciliationResolution(
+            kind="reconciliation_resolution",
+            decision=ResolutionDecision.CANCEL,
+            evidence_ref=sha256_digest(f"recovery:cancel:{run_id}".encode()),
+        )
+        _set_run(deps, run_id, R.CANCELLED, resolution)
+        return
+    reason = (
+        TerminationReason.OWNER_CANCELLED
+        if _stopped(deps, run_id)
+        else TerminationReason.RECOVERY_FAILED
+    )
+    termination = Termination(
+        kind="termination",
+        reason=reason,
+        evidence_ref=sha256_digest(f"recovery:ended:{run_id}".encode()),
+    )
+    _set_run(deps, run_id, R.FAILED, termination)
+
+
+def _recover_run(
+    deps: RecoveryDeps, run_id: RunId, deadlines: RecoveryDeadlines, now: int
+) -> tuple[bool, bool]:
+    """(changed, escalated)."""
+    changed = escalated = False
+    run = deps.sm.state.runs[run_id]
+    if run.status in _TERMINAL_RUN:
+        return _recover_attempts(deps, run_id), False
     if run.status in (R.RECOVERING, R.CANCELLING):
         limit = deadlines.recovering_ms if run.status is R.RECOVERING else deadlines.cancelling_ms
         if now - _entered(deps, run) > limit:
@@ -476,7 +570,7 @@ def _recover_run(deps: RecoveryDeps, run_id: RunId, deadlines: RecoveryDeadlines
                 R.RECONCILIATION_REQUIRED,
                 _trigger(run_id, ReconciliationTriggerReason.DEADLINE_EXCEEDED),
             )
-            changed = True
+            changed = escalated = True
     current = deps.sm.state.runs[run_id].status
     if current in _INTERRUPTED:
         # A stopped Run is cancelled (its stop is kept); any other is recovering.
@@ -503,34 +597,52 @@ def _recover_run(deps: RecoveryDeps, run_id: RunId, deadlines: RecoveryDeadlines
                 R.RECONCILIATION_REQUIRED,
                 _trigger(run_id, ReconciliationTriggerReason.OUTCOME_UNKNOWN),
             )
-        else:
-            _close_steps(deps, run_id, StepStatus.CANCELLED)
-            if _settled(deps, run_id):
-                _set_run(deps, run_id, R.CANCELLED)
-        return True
+            return True, escalated
+        changed = _close_steps(deps, run_id, StepStatus.CANCELLED) or changed
+        if _settled(deps, run_id):
+            _set_run(deps, run_id, R.CANCELLED)
+            changed = True
+        return changed, escalated
     if deps.sm.state.runs[run_id].status is R.RECONCILIATION_REQUIRED:
         changed = _close_steps(deps, run_id, StepStatus.FAILED) or changed
         if not unknown and _settled(deps, run_id):
-            # Nothing is unknown, and the Run cannot continue (its transcript is
-            # gone): the owner's recovery ends it, never resumes it.
-            termination = Termination(
-                kind="termination",
-                reason=TerminationReason.RECOVERY_FAILED,
-                evidence_ref=sha256_digest(f"recovery:session-lost:{run_id}".encode()),
-            )
-            _set_run(deps, run_id, R.FAILED, termination)
+            _end(deps, run_id)
             changed = True
-    return changed
+    return changed, escalated
 
 
-def recover(deps: RecoveryDeps, *, deadlines: RecoveryDeadlines) -> RecoveryReport:
-    """The owner's explicit recovery of every unfinished Run (idempotent)."""
-    plan = assess(deps.sm.state, deps.ledger)
-    now = _now(deps)
-    changed = False
-    for run_plan in plan.runs:
-        changed = _recover_run(deps, run_plan.run_id, deadlines, now) or changed
-    return RecoveryReport(runs=plan.runs, changed=changed)
+def recover(
+    deps: RecoveryDeps, *, deadlines: RecoveryDeadlines, run_ids: Collection[RunId]
+) -> RecoveryReport:
+    """The owner's explicit recovery of the named Runs (idempotent). A Run that is
+    live in this Runtime is refused (``RUN_ACTIVE``): stop it by the stop path
+    first. Not reentrant (``RECOVERY_BUSY``). Deadlines are checked here, at an
+    explicit recovery; there is no background watcher in Phase 1 (WP12-R04)."""
+    key = id(deps.sm)
+    if key in _RECOVERING:
+        raise RecoveryError("RECOVERY_BUSY")
+    targets = list(dict.fromkeys(run_ids))
+    for run_id in targets:
+        if run_id not in deps.sm.state.runs:
+            raise RecoveryError("RUN_NOT_FOUND")
+        if deps.active(run_id):
+            raise RecoveryError("RUN_ACTIVE")
+    _RECOVERING.add(key)
+    try:
+        now = _now(deps)
+        changed = False
+        escalated: list[RunId] = []
+        for run_id in targets:
+            moved, late = _recover_run(deps, run_id, deadlines, now)
+            changed = moved or changed
+            if late:
+                escalated.append(run_id)
+        plan = assess(deps.sm.state, deps.ledger)
+        return RecoveryReport(
+            runs=plan.runs, changed=changed, escalated=tuple(escalated), unsettled=plan.unsettled
+        )
+    finally:
+        _RECOVERING.discard(key)
 
 
 # ================================================================ reconciliation
@@ -559,6 +671,9 @@ class ReconcileResult:
 def reconcile(
     deps: RecoveryDeps, attempt_id: AttemptId, evidence: ExecutionEvidence | None
 ) -> ReconcileResult:
+    """Settle an unknown outcome with trusted evidence, in one transaction with its
+    cost (the ledger re-checks the basis, the receipt, the owner epoch, the PEP and
+    derives the cost). A settled Attempt is never changed by other evidence."""
     attempt = deps.sm.state.attempts[attempt_id]
     if attempt.state in _FINAL:
         return ReconcileResult(Reconciled.ALREADY_SETTLED)
@@ -582,16 +697,14 @@ def reconcile(
         or report.reservation_id != attempt.reservation_id
     ):
         raise ReconciliationEvidenceError("REPORT_OF_ANOTHER_ATTEMPT")
-    if not report.final or report.usage.cost is None:
-        raise ReconciliationEvidenceError("COST_NOT_FINAL")  # an unknown cost is never zero
-    target = A.COMPLETED if report.outcome == "COMPLETED" else A.FAILED_DEFINITE
-    _settle(deps, attempt, target, report.usage.cost.micro_units, reports.report_ref(report))
+    target = _settle(deps, attempt, "EXECUTION_REPORT", report, reports.report_ref(report))
     return ReconcileResult(Reconciled.EXECUTED if target is A.COMPLETED else Reconciled.FAILED)
 
 
 def declare_unresolved(deps: RecoveryDeps, run_id: RunId) -> Run:
     """The owner records that an unknown external effect cannot be resolved (A):
-    the Run FAILS with UNRESOLVED_EXTERNAL_EFFECT; the unknown holds are kept."""
+    the Run FAILS with UNRESOLVED_EXTERNAL_EFFECT; the unknown holds are kept, and
+    the work stays open to a later reconciliation."""
     run = deps.sm.state.runs[run_id]
     unknown = [a for a in _run_attempts(deps.sm.state, run_id) if a.state is A.OUTCOME_UNKNOWN]
     if run.status is not R.RECONCILIATION_REQUIRED or not unknown:

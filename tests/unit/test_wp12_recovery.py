@@ -121,6 +121,11 @@ def _deps(st: lw.Setup) -> rc.RecoveryDeps:
     )
 
 
+def _all(deps: rc.RecoveryDeps) -> list[Any]:
+    """Every Run of this Runtime (none is live in a session here)."""
+    return list(deps.sm.state.runs)
+
+
 def _view(st: lw.Setup, attempt: Any) -> Any:
     if attempt.reservation_id is None:
         return None
@@ -165,7 +170,8 @@ def test_a_crash_before_the_permit_is_consumed(tmp_path: Path, state: AttemptSta
     st = lw.setup(tmp_path)
     attempt = _at(st, state)
     st2, deps = _restart(st)
-    report = rc.recover(deps, deadlines=DEADLINES)
+    plan = rc.assess(st2.sm.state, st2.journal)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     after = st2.sm.state.attempts[attempt.attempt_id]
     assert after.state is A.ABORTED_BEFORE_DISPATCH
     view = _view(st2, after)
@@ -175,7 +181,7 @@ def test_a_crash_before_the_permit_is_consumed(tmp_path: Path, state: AttemptSta
     run = _run_of(st2, after)
     assert run.status is R.FAILED  # the transcript is gone: ended, never resumed
     assert st2.sm.state.steps[after.step_id].status is StepStatus.FAILED
-    assert report.runs[0].attempts[0].rule == rc.RECOVERY_TABLE[state].code
+    assert plan.runs[0].attempts[0].rule == rc.RECOVERY_TABLE[state].code
 
 
 @pytest.mark.parametrize("state", CONSUMED_NOT_STARTED)
@@ -185,7 +191,7 @@ def test_a_crash_after_consumption_but_before_the_start(
     st = lw.setup(tmp_path)
     attempt = _at(st, state)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     after = st2.sm.state.attempts[attempt.attempt_id]
     # The journal proves the start was never recorded (the operation runs only
     # after it): not executed, the hold released with a recorded zero cost.
@@ -200,7 +206,7 @@ def test_a_crash_after_the_start_is_kept_unknown(tmp_path: Path, state: AttemptS
     st = lw.setup(tmp_path)
     attempt = _at(st, state)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     after = st2.sm.state.attempts[attempt.attempt_id]
     assert after.state is A.OUTCOME_UNKNOWN
     view = _view(st2, after)
@@ -215,9 +221,9 @@ def test_recovery_is_idempotent(tmp_path: Path) -> None:
     unknown = _at(st, A.DISPATCH_STARTED)
     _at(st, A.PERMIT_ISSUED)
     st2, deps = _restart(st)
-    first = rc.recover(deps, deadlines=DEADLINES)
+    first = rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     snapshot = (st2.sm.state, [_view(st2, a) for a in st2.sm.state.attempts.values()])
-    second = rc.recover(deps, deadlines=DEADLINES)
+    second = rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert (st2.sm.state, [_view(st2, a) for a in st2.sm.state.attempts.values()]) == snapshot
     assert second.changed is False
     assert first.changed is True
@@ -240,7 +246,7 @@ def test_a_crash_during_the_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyP
     reference_st = lw.setup(tmp_path / "ref")
     _at(reference_st, A.PERMIT_CONSUMED)
     ref2, ref_deps = _restart(reference_st)
-    rc.recover(ref_deps, deadlines=DEADLINES)
+    rc.recover(ref_deps, deadlines=DEADLINES, run_ids=_all(ref_deps))
     expected = sorted(a.state.value for a in ref2.sm.state.attempts.values())
 
     st = lw.setup(tmp_path / "crash")
@@ -257,10 +263,10 @@ def test_a_crash_during_the_recovery(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(st2.journal, "append_with_ledger", flaky)
     with pytest.raises(sqlite3.OperationalError):
-        rc.recover(deps, deadlines=DEADLINES)
+        rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     monkeypatch.undo()
     st3, deps3 = _restart(st2)
-    rc.recover(deps3, deadlines=DEADLINES)
+    rc.recover(deps3, deadlines=DEADLINES, run_ids=_all(deps3))
     assert sorted(a.state.value for a in st3.sm.state.attempts.values()) == expected
 
 
@@ -270,7 +276,7 @@ def test_a_ledger_unknown_is_matched_by_the_attempt(tmp_path: Path) -> None:
     st.journal.apply_ledger((RecoverInFlight(op="recover_in_flight"),))  # ledger: UNKNOWN
     st2, deps = _restart(st)
     assert _view(st2, attempt).state is RS.UNKNOWN
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     after = st2.sm.state.attempts[attempt.attempt_id]
     assert after.state is A.FAILED_DEFINITE  # proven not started, reconciled at zero
     assert _view(st2, after).state is RS.RECONCILED
@@ -281,8 +287,8 @@ def test_no_unknown_work_is_run_again(tmp_path: Path) -> None:
     attempt = _at(st, A.DISPATCH_STARTED)
     st2, deps = _restart(st)
     before = set(st2.sm.state.attempts)
-    rc.recover(deps, deadlines=DEADLINES)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert set(st2.sm.state.attempts) == before  # no new Attempt
     assert _run_of(st2, attempt).status is not R.RUNNING
 
@@ -294,9 +300,9 @@ def test_no_double_release_and_no_double_count(tmp_path: Path) -> None:
     st = lw.setup(tmp_path)
     attempt = _at(st, A.BUDGET_RESERVED)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     view = _view(st2, st2.sm.state.attempts[attempt.attempt_id])
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert _view(st2, st2.sm.state.attempts[attempt.attempt_id]) == view
     from agent_core.types.ledger import ReleaseReservation
 
@@ -320,7 +326,7 @@ def test_the_task_budget_is_kept_across_runs(tmp_path: Path) -> None:
     attempt = _at(st, A.DISPATCH_STARTED)
     task_id = _run_of(st, attempt).task_id
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     usage = st2.journal.scope_usage(BudgetScopeType.TASK, str(task_id))
     assert usage.hold_micro > 0  # the unknown hold still counts for the Task
 
@@ -351,7 +357,7 @@ def test_reconciliation_with_a_trusted_execution_report(tmp_path: Path) -> None:
     st = lw.setup(tmp_path)
     attempt, report = _started_with_report(st)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     result = rc.reconcile(deps, attempt.attempt_id, rc.ExecutionEvidence(report=report))
     assert result.outcome is rc.Reconciled.EXECUTED
     after = st2.sm.state.attempts[attempt.attempt_id]
@@ -367,7 +373,7 @@ def test_a_report_of_a_definite_failure(tmp_path: Path) -> None:
     st = lw.setup(tmp_path)
     attempt, report = _started_with_report(st, "FAILED_DEFINITE")
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     result = rc.reconcile(deps, attempt.attempt_id, rc.ExecutionEvidence(report=report))
     assert result.outcome is rc.Reconciled.FAILED
     assert st2.sm.state.attempts[attempt.attempt_id].state is A.FAILED_DEFINITE
@@ -396,7 +402,7 @@ def test_invalid_reconciliation_evidence_is_refused(tmp_path: Path, tamper: dict
     }
     forged = report.model_copy(update=values)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     with pytest.raises(rc.ReconciliationEvidenceError):
         rc.reconcile(deps, attempt.attempt_id, rc.ExecutionEvidence(report=forged))
     assert st2.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
@@ -407,7 +413,7 @@ def test_without_evidence_it_stays_unknown(tmp_path: Path) -> None:
     st = lw.setup(tmp_path)
     attempt = _at(st, A.DISPATCH_STARTED)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert rc.reconcile(deps, attempt.attempt_id, None).outcome is rc.Reconciled.STILL_UNKNOWN
     assert st2.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
 
@@ -416,7 +422,7 @@ def test_an_unresolved_external_effect_fails_the_run_and_keeps_the_hold(tmp_path
     st = lw.setup(tmp_path)
     attempt = _at(st, A.DISPATCH_STARTED)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     run = rc.declare_unresolved(deps, _run_of(st2, attempt).run_id)
     assert run.status is R.FAILED
     view = _view(st2, attempt)
@@ -442,7 +448,7 @@ def test_stops_survive_the_restart_and_the_recovery(tmp_path: Path) -> None:
     run_id = _run_of(st, attempt).run_id
     st.owner(lw.stop_op(StopScopeType.RUN, str(run_id)))
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert any(e.scope_id == str(run_id) for e in st2.journal.stop_entries())
     assert st2.sm.state.runs[run_id].status is R.CANCELLED
 
@@ -461,7 +467,7 @@ def test_an_old_approval_is_not_used_again(tmp_path: Path) -> None:
     approval_id = lw.record_approval(st, pending)
     lw.approved(st, pending, approval_id)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     # The same tool and arguments again, in a new Attempt: a new reservation, so a
     # new action hash. The old exact approval does not approve it.
     step = lw.step_in(st2)
@@ -500,7 +506,7 @@ def test_a_recovery_past_its_deadline_is_escalated(tmp_path: Path) -> None:
     run, _ = _entered_recovering(st)
     st.clock.now += DEADLINES.recovering_ms + 1
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert st2.sm.state.runs[run.run_id].status is R.RECONCILIATION_REQUIRED
     assert _trigger(st2, run.run_id) == ["DEADLINE_EXCEEDED"]
 
@@ -512,7 +518,7 @@ def test_a_clock_going_back_does_not_extend_the_deadline(tmp_path: Path) -> None
     w.task(st.sm)  # an event recorded at the later time
     st.clock.now -= 10 * DEADLINES.recovering_ms  # the wall clock goes back
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert _trigger(st2, run.run_id) == ["DEADLINE_EXCEEDED"]
 
 
@@ -676,7 +682,7 @@ def _unknown_write(tmp_path: Path) -> tuple[Any, Any, Any, Path]:
 def test_recovery_itself_never_removes_a_file(tmp_path: Path) -> None:
     st, _, attempt, temp = _unknown_write(tmp_path)
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     assert temp.exists()
     assert st2.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
 
@@ -691,7 +697,7 @@ def test_the_explicit_temporary_recovery(tmp_path: Path) -> None:
     stranger.chmod(0o600)
     target = out / "new.txt"
     st2, deps = _restart(st)
-    rc.recover(deps, deadlines=DEADLINES)
+    rc.recover(deps, deadlines=DEADLINES, run_ids=_all(deps))
     result = rc.recover_temporaries(
         deps, fw.broker(st2.keys.owner, tree), workspace_ref=tree.digest
     )

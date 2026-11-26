@@ -39,6 +39,14 @@ class LedgerPort(Protocol):
 
     def reservation(self, reservation_id: str) -> ReservationView | None: ...
 
+    def run_status_since(self, run_id: str) -> int | None:
+        """Since when (ledger time) the Run has had its current status (WP12-R04)."""
+        ...
+
+    def observe_time(self, wall_ms: int) -> int:
+        """The ledger's time high-water, with ``wall_ms`` recorded (WP12-R04)."""
+        ...
+
     def counter(
         self, scope_type: BudgetScopeType, scope_id: str, counter: CounterKind
     ) -> CounterView | None:

@@ -16,33 +16,10 @@ not the independent Evaluation of Phase 2.
 
 from __future__ import annotations
 
-from typing import Literal
-
-from pydantic import field_validator
-
 from agent_core.types.base import FrozenModel
-from agent_core.types.safety import RelPath
-from agent_core.types.serialization import dump_json
-from agent_core.types.values import Digest, sha256_digest
+from agent_core.types.criteria import FileCriterion
 
-
-class FileCriterion(FrozenModel):
-    kind: Literal["file_content"]
-    path: RelPath
-    expected_digest: Digest
-
-    @field_validator("path")
-    @classmethod
-    def _concrete(cls, value: str) -> str:
-        if "*" in value or ".." in value.split("/"):
-            raise ValueError("a criterion names one concrete file")
-        return value
-
-    def text(self) -> str:
-        return dump_json(self).decode("utf-8")
-
-    def ref(self) -> str:
-        return sha256_digest(dump_json(self))
+__all__ = ["CriteriaCatalog", "FileCriterion"]
 
 
 class CriteriaCatalog(FrozenModel):

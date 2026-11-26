@@ -101,7 +101,7 @@ from agent_core.types.safety import (
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 7
+JOURNAL_SCHEMA_VERSION: Final = 8
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -400,6 +400,19 @@ class SqliteJournal:
     @property
     def read_only(self) -> bool:
         return self._read_only
+
+    def run_status_since(self, run_id: str) -> int | None:
+        """Since when (ledger time) the Run has had its current status (WP12-R04)."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_run_status_since(cur, str(run_id))
+
+    def observe_time(self, wall_ms: int) -> int:
+        """WP12-R04: the ledger's time (never earlier than any time it used), with
+        ``wall_ms`` recorded as observed, so a later wall clock that went back cannot
+        extend a deadline measured now."""
+        conn = self._require_open()
+        with self._write_transaction(conn) as cur:
+            return sqlite_ledger.effective_now(cur, int(wall_ms))
 
     def last_owner_seq(self) -> int:
         """The last owner batch number the ledger applied (WP10-R02)."""
