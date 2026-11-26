@@ -17,8 +17,9 @@
 | B2 | Memory Engine の詳細設計 | **設計段階として条件付き合格（96/100）**。実装の前に、必須解決事項 B2-P01〜P05 を解決すること。B1 の接続仕様の変更案 P-1〜P-5 は、基本方針として採用された（最終的な統一は E） | `docs/design/phase-0/B2_MEMORY.md` |
 | C1 | 権限管理・ツール実行・Sandbox・外部通信 | **設計段階として条件付き合格（95/100）**。実装の前に、C1-P01〜P05 を解決すること（C1-P01 は C1 の中で修正済み） | `docs/design/phase-0/C1_SAFETY.md` |
 | C2 | 機密情報・暗号化・削除・監査・評価環境の隔離 | **設計段階として条件付き合格（94/100）**。実装の前に、C2-P01〜P06 を解決すること。実装や実API への接続を承認したものではない | `docs/design/phase-0/C2_DATA_SECURITY.md` |
-| D | Evaluation Engine・統計的な比較・Cost Engine | **DRAFT 第2版。独立再審査待ち**。第1版は 89/100 点。指摘 D-R01〜R08 に対応した | `docs/design/phase-0/D_EVALUATION_COST.md` |
-| E | ロードマップ・性能追跡・全体の整合性 | 未着手 | — |
+| D | Evaluation Engine・統計的な比較・Cost Engine | **設計段階として条件付き合格（95/100）**。残存課題の詳細は未受領 | `docs/design/phase-0/D_EVALUATION_COST.md` |
+| E1 | 全体の整合、残存課題と変更案の一覧、12 の Engine の責務と状態の正本 | **DRAFT。独立審査待ち** | `docs/design/phase-0/E_INTEGRATION.md`、`docs/design/phase-0/RESOLUTION_MATRIX.md` |
+| E2〜E4 | 実行の経路と状態の統一（E2）、削除・バックアップ・鍵（E3）、ロードマップ・Phase・オーナーの判断（E4） | 未着手（E1 での分け方の案。`RESOLUTION_MATRIX.md` の0章） | — |
 
 設計A の合格は設計段階についてのものである。実装の品質や、実際の安全性を保証するものではない。
 
@@ -111,17 +112,17 @@ Agent Core は商用の製品ではなく、**まずオーナー自身が使う�
 
 ## 次の作業
 
-1. **独立再審査：** 設計D（`D_EVALUATION_COST.md`）の第2版を審査する。D は、再審査が終わるまで DRAFT のままにする。
-2. **設計E（ロードマップ・全体の整合）：** D の審査が終わってから始める。引き継ぎ事項は、`D_EVALUATION_COST.md` の20章、`C2_DATA_SECURITY.md` の17〜19章などにある。
+1. **独立審査：** 設計E1（`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`）を審査する。E1 は、審査が終わるまで DRAFT のままにする。
+2. **受け取っていないもの：** 次の2つは、このセッションに届いていない。
+   - 設計D 第2版の審査で出た残存課題の詳細
+   - 以前に出された「設計E の詳細な指示」
+   - そのため、E2 以降の分け方と、12 の Engine の一覧は、E1 での暫定の案である。初回報告書の Engine の一覧との照合も必要。
+3. **E2 以降：** E1 の審査の後に始める。範囲は `E_INTEGRATION.md` の8章にある。
    - D で示した候補の値（D の6.2・9.4・11.2・12.4）は、どれもまだ承認されていない。実験の前に、オーナーの承認が必要。
-3. **holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：** まだ作らず、接続もしていない。開発用の Claude Code のセッションには、接続しない方針。
-4. **設計E で統一するもの：** 次の変更案を、設計E でまとめて統一する。
-   - CP-1〜CP-8（`C1_SAFETY.md` の15章）
-   - CP-9〜CP-12（`C2_DATA_SECURITY.md` の18章）
-   - CP-13〜CP-17（`D_EVALUATION_COST.md` の20章）
-   - P-1〜P-5（`B2_MEMORY.md` の8.2）
-   - **CP-6：** 進捗の正本を、この `STATUS.md` にする。`AGENTS.md` の7章の進捗の表は古くなっているので、参照だけを残す形に、E で整理する。
-5. **Draft PR #1 の確認：** オーナーが確認する。マージはしない。
+4. **holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：** まだ作らず、接続もしていない。開発用の Claude Code のセッションには、接続しない方針。
+5. **変更案の統一：** P-1〜P-5 と CP-1〜CP-17 の状態と推奨は、`RESOLUTION_MATRIX.md` の3章にまとめた。
+   - **CP-6：** 進捗の正本は、この `STATUS.md` にする。`AGENTS.md` の7章の進捗の表は古いので、E4 で、参照だけを残す形に整理する。
+6. **Draft PR #1 の確認：** オーナーが確認する。マージはしない。
 
 ## 現在の開発ルール（抜粋。全文は `AGENTS.md`）
 
