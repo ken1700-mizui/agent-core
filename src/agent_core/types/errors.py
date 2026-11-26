@@ -182,8 +182,27 @@ class JournalWriteOutcomeUnknownError(JournalError):
 
     code = "JOURNAL_WRITE_OUTCOME_UNKNOWN"
 
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        # A failure during clean-up (rollback) is kept here, so it does not hide
+        # the original error, which stays the ``__context__``.
+        self.rollback_error: BaseException | None = None
+
 
 class SequenceExhaustedError(JournalError):
     """A sequence or epoch would exceed the signed 64-bit range."""
 
     code = "SEQUENCE_EXHAUSTED"
+
+
+class RuntimeLockFileError(JournalError):
+    """The lock file is not one this Runtime may use (link, unexpected content).
+    It is left unchanged."""
+
+    code = "RUNTIME_LOCK_FILE_REJECTED"
+
+
+class JournalFileChangedError(JournalError):
+    """The database path no longer names the opened file, or it gained a hard link."""
+
+    code = "JOURNAL_FILE_CHANGED"
