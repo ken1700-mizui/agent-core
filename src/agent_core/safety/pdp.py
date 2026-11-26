@@ -81,6 +81,13 @@ def _approval_required(
     )
 
 
+def approval_required(
+    policy: Policy, descriptor: ActionDescriptor, registration: ToolRegistration | None
+) -> bool:
+    """The approval rule the ledger applies (the PDP's own), for the runtime to state."""
+    return _approval_required(policy, descriptor, registration)
+
+
 def _tool_reasons(
     policy: Policy,
     grant: RunGrant,

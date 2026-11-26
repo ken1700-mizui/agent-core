@@ -59,6 +59,10 @@ class TerminationReason(StrEnum):
     OWNER_CANCELLED = "OWNER_CANCELLED"
     RECOVERY_FAILED = "RECOVERY_FAILED"
     INTERNAL_ERROR = "INTERNAL_ERROR"
+    # WP-15: a loop limit (repairs, calls, iterations, time) was reached.
+    LIMIT_EXCEEDED = "LIMIT_EXCEEDED"
+    # WP-15: only simple tasks are planned in Phase 1.
+    PLANNING_UNSUPPORTED = "PLANNING_UNSUPPORTED"
 
 
 class ReconciliationTriggerReason(StrEnum):

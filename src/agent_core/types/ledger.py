@@ -254,6 +254,15 @@ class SetBudgetCap(FrozenModel):
     cap: Budget
 
 
+class SetStepCapDefault(FrozenModel):
+    """WP-15: the owner's budget cap for every Step of one Run that has no cap of
+    its own (the agent loop creates its Steps; it never sets caps)."""
+
+    op: Literal["set_step_cap_default"]
+    run_id: RunId
+    cap: Budget
+
+
 class SetCounterCap(FrozenModel):
     op: Literal["set_counter_cap"]
     scope_type: Literal[BudgetScopeType.RUN, BudgetScopeType.TASK]
@@ -350,6 +359,7 @@ OWNER_OPS = (
     "set_budget_cap",
     "set_counter_cap",
     "set_run_window",
+    "set_step_cap_default",
     "install_policy",
     "install_run_grant",
     "stop_scope",
@@ -388,7 +398,8 @@ LedgerOp = Annotated[
     | RecoverInFlight
     | SetBudgetCap
     | SetCounterCap
-    | SetRunWindow,
+    | SetRunWindow
+    | SetStepCapDefault,
     Field(discriminator="op"),
 ]
 

@@ -107,6 +107,7 @@ from agent_core.types.ledger import (
     SetBudgetCap,
     SetCounterCap,
     SetRunWindow,
+    SetStepCapDefault,
     StopScope,
     Unexplained,
     VoidAllocation,
@@ -162,6 +163,11 @@ LEDGER_DDL: Final = (
     scope_id TEXT NOT NULL,
     cap_micro INTEGER NOT NULL CHECK (cap_micro >= 0),
     PRIMARY KEY (scope_type, scope_id)
+) STRICT""",
+    # WP-15: the owner's cap for the Steps of a Run that have none of their own.
+    """CREATE TABLE step_cap_defaults (
+    run_id TEXT PRIMARY KEY,
+    cap_micro INTEGER NOT NULL CHECK (cap_micro >= 0)
 ) STRICT""",
     """CREATE TABLE counter_caps (
     scope_type TEXT NOT NULL,
@@ -394,6 +400,14 @@ def _effective_cap(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) ->
         (kind.value, scope_id),
     ).fetchone()
     cap = None if found is None else int(found[0])
+    if cap is None and kind is BudgetScopeType.STEP:
+        # The owner's default for this Run's Steps (SetStepCapDefault), never a guess.
+        default = cur.execute(
+            "SELECT d.cap_micro FROM step_cap_defaults d JOIN rt_steps s ON s.run_id = d.run_id "
+            "WHERE s.step_id = ?",
+            (scope_id,),
+        ).fetchone()
+        cap = None if default is None else int(default[0])
     if kind is BudgetScopeType.TASK:
         task = cur.execute(
             "SELECT budget_micro FROM rt_tasks WHERE task_id = ?", (scope_id,)
@@ -1048,6 +1062,17 @@ def apply_op(
         _recover(cur, now_ms)
     elif isinstance(op, SetBudgetCap | SetCounterCap | SetRunWindow | InstallPriceTable):
         _owner(cur, op, now_ms)
+    elif isinstance(op, SetStepCapDefault):
+        old = cur.execute(
+            "SELECT cap_micro FROM step_cap_defaults WHERE run_id = ?", (str(op.run_id),)
+        ).fetchone()
+        if old is not None and op.cap.micro_units < int(old[0]):
+            _revoke_in_scope(cur, BudgetScopeType.RUN, str(op.run_id), now_ms)
+        cur.execute(
+            "INSERT INTO step_cap_defaults (run_id, cap_micro) VALUES (?, ?) "
+            "ON CONFLICT (run_id) DO UPDATE SET cap_micro = excluded.cap_micro",
+            (str(op.run_id), op.cap.micro_units),
+        )
     else:
         raise LedgerPairingError("UNKNOWN_OPERATION")
 
@@ -2429,6 +2454,10 @@ def read_policy(cur: sqlite3.Cursor, tenant_id: str) -> Policy | None:
 
 def read_grant(cur: sqlite3.Cursor, run_id: str) -> RunGrant | None:
     return _grant(cur, run_id)
+
+
+def read_access_epoch(cur: sqlite3.Cursor, tenant_id: str) -> int:
+    return _access_epoch(cur, tenant_id)
 
 
 def read_approval_uses(cur: sqlite3.Cursor, approval_id: str) -> int | None:

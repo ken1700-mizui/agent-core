@@ -691,3 +691,10 @@ def raw_apply(st: Setup, op: Any) -> None:
             conn.execute("ROLLBACK")
     finally:
         conn.close()
+
+
+def record_approval_for(st: Setup, action_hash: str, **approval: Any) -> ApprovalId:
+    """The owner's signed exact approval of ``action_hash``, recorded in the ledger."""
+    signed = st.channel.approve(s.approval(action_hash, **approval))
+    st.journal.apply_ledger((RecordApproval(op="record_approval", signed=signed),))
+    return signed.approval.approval_id

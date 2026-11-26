@@ -100,7 +100,7 @@ from agent_core.types.safety import (
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 6
+JOURNAL_SCHEMA_VERSION: Final = 7
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -433,6 +433,11 @@ class SqliteJournal:
         """The tenant's installed policy (owner-trusted), or None."""
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.read_policy(cur, str(tenant_id))
+
+    def access_epoch(self, tenant_id: str) -> int:
+        """The tenant's current access epoch (bumped by each revocation)."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_access_epoch(cur, str(tenant_id))
 
     def run_grant(self, run_id: str) -> RunGrant | None:
         """The Run's installed grant (owner-trusted), or None."""
