@@ -14,7 +14,7 @@
 |---|---|---|---|
 | A | アーキテクチャ・Runtime・障害復旧 | **設計段階で合格（98/100）**。実装前に解決すべき課題が6件ある | `docs/design/phase-0/A_RUNTIME.md` |
 | B1 | Context Engine（Memory との接続仕様を含む） | **設計段階として条件付き合格（95/100）**。実装の前に、必須解決事項 B1-P01〜P04 を解決すること | `docs/design/phase-0/B1_CONTEXT.md` |
-| B2 | Memory Engine の詳細設計 | **DRAFT 第1版。独立審査待ち** | `docs/design/phase-0/B2_MEMORY.md` |
+| B2 | Memory Engine の詳細設計 | **DRAFT 第2版。独立再審査待ち**。第1版は 91/100 点。指摘 B2-R01〜R08 に対応した。B1 の接続仕様の変更案（P-1〜P-5）は、確定させずに記録した | `docs/design/phase-0/B2_MEMORY.md` |
 | C | Safety Engine・評価環境の隔離 | 未着手 | — |
 | D | Evaluation Engine・統計設計・Cost Engine | 未着手 | — |
 | E | ロードマップ・性能追跡・全体の整合性 | 未着手 | — |
@@ -63,7 +63,8 @@
 
 ## 次の作業
 
-1. **独立審査：** 設計B2（`B2_MEMORY.md`）の第1版を審査する。B2 は、審査が終わるまで DRAFT のままにする。
+1. **独立再審査：** 設計B2（`B2_MEMORY.md`）の第2版を審査する。B2 は、再審査が終わるまで DRAFT のままにする。
+   - あわせて、B1 の接続仕様の変更案（`B2_MEMORY.md` の8.2、P-1〜P-5）を確定するかどうかを判断してもらう。
 2. **設計C・D・E への引き継ぎ：** `B1_CONTEXT.md` の13・14章と、`B2_MEMORY.md` の14章を参照する。
 3. **Memory Engine 本体の実装時期：** 前倒しはしない。Phase 1〜2 では、接続仕様と FakeMemory（偽の実装）を使った契約テストだけを作る。Memory v1 をどの Phase で行うか（初回のロードマップでは Phase 5）は、設計E で調整する。
 4. **Draft PR #1 の確認：** オーナーが確認する。マージはしない。
