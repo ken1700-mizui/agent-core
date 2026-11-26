@@ -93,8 +93,7 @@ class SiteId(str):
 
     @classmethod
     def _validate(cls, value: object) -> SiteId:
-        if type(value) is cls:
-            return value
+        # Always re-check the content: an instance can be forged with str.__new__.
         if not isinstance(value, str):
             raise PydanticCustomError("id_type", "site id must be a string")
         try:
@@ -165,8 +164,8 @@ class EntityId(str):
 
     @classmethod
     def _validate(cls, value: object) -> EntityId:
-        if type(value) is cls:
-            return value
+        # Always re-check the content: being typed is not proof of validity
+        # (an instance can be forged with str.__new__).
         if not isinstance(value, str):
             raise PydanticCustomError("id_type", "id must be a string")
         try:

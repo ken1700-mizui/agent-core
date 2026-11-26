@@ -110,7 +110,9 @@ class _Holder(BaseModel):
 
 def test_pydantic_field_accepts_only_its_own_kind() -> None:
     run_id = RunId.compose(SITE, TS, RAND)
-    assert _Holder(run_id=run_id).run_id is run_id
+    held = _Holder(run_id=run_id).run_id
+    assert held == run_id
+    assert type(held) is RunId
     assert type(_Holder.model_validate_json(f'{{"run_id": "{run_id}"}}').run_id) is RunId
 
     task_id = TaskId.compose(SITE, TS, RAND)
@@ -134,3 +136,26 @@ def test_ids_serialize_as_plain_strings() -> None:
         event_id: EventId
 
     assert _EventHolder(event_id=event_id).model_dump(mode="json") == {"event_id": str(event_id)}
+
+
+# ---------------------------------------------------- WP02-R03: typed IDs are re-validated
+
+
+def test_forged_typed_instance_is_rejected_by_pydantic_fields() -> None:
+    # str.__new__ bypasses RunId.__new__, producing a RunId with invalid content.
+    forged = str.__new__(RunId, "run_dev01_not-hex")
+    with pytest.raises(ValidationError) as excinfo:
+        _Holder(run_id=forged)
+    assert excinfo.value.errors()[0]["type"] == "invalid_id"
+
+
+def test_forged_typed_instance_is_rejected_by_the_constructor() -> None:
+    forged = str.__new__(RunId, "run_dev01_" + "Z" * 32)
+    with pytest.raises(InvalidIdError):
+        RunId(forged)
+
+
+def test_forged_site_instance_is_rejected() -> None:
+    forged = str.__new__(SiteId, "prod")
+    with pytest.raises(InvalidIdError):
+        RunId.compose(forged, TS, RAND)

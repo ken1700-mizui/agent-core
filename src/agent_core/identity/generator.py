@@ -10,6 +10,11 @@
   ``DuplicateIdError``, the random part is regenerated (same timestamp) and
   the write retried, at most ``MAX_DUPLICATE_RETRIES`` times; then
   ``IdCollisionRetryExhaustedError`` (fatal). Other errors propagate unchanged.
+- Contract for ``write``: raise ``DuplicateIdError`` only when it is certain
+  that nothing was stored (the store detected the duplicate and rolled the
+  whole transaction back). A write whose outcome is unknown must raise a
+  different error (for example ``JournalWriteOutcomeUnknownError``), which is
+  never retried here, so an unknown write is not repeated under a new ID.
 
 Durable uniqueness is the Journal's UNIQUE constraint (WP-03), not this class.
 """
