@@ -28,7 +28,7 @@ required-version = ">=0.11"
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
-pythonpath = ["src", "tools"]
+pythonpath = ["src", "tools", "tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 xfail_strict = true
 filterwarnings = ["error"]
@@ -69,9 +69,15 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
-mypy_path = ["src", "tools"]
+mypy_path = ["src", "tools", "tests"]
+plugins = ["pydantic.mypy"]
 files = ["src", "tools", "tests"]
 explicit_package_bases = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
 
 # ---------------------------------------------------------------- import-linter
 # Run with src/ on the path: `PYTHONPATH=src uv run lint-imports`.
@@ -80,6 +86,19 @@ explicit_package_bases = true
 [tool.importlinter]
 root_package = "agent_core"
 include_external_packages = true
+
+[[tool.importlinter.contracts]]
+id = "ports-and-adapters-layers"
+name = "Ports & Adapters layers: (adapters | identity) -> ports -> types"
+type = "layers"
+# Higher layers may import lower ones, never the reverse. Siblings separated by
+# "|" are independent: adapters and identity never import each other.
+# Cycles between layers are reported because one direction is always upward.
+layers = [
+    "agent_core.adapters | agent_core.identity",
+    "agent_core.ports",
+    "agent_core.types",
+]
 
 [[tool.importlinter.contracts]]
 id = "phase1-no-network-or-process"

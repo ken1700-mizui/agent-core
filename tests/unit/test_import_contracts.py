@@ -120,3 +120,72 @@ def test_layers_contract_rejects_cycle_between_layers(tmp_path: Path) -> None:
     result = _lint_imports(tmp_path / "layers.toml", tmp_path, tmp_path)
     assert result.returncode == 1
     assert "layered.low -> layered.mid" in result.stdout
+
+
+# ---------------------------------------------------------------- WP-02 layer contract
+
+
+def _plant(src: Path, module: str, statement: str) -> None:
+    path = src / Path(*module.split(".")).with_suffix(".py")
+    path.write_text(f'"""Planted."""\n\n{statement}\n')
+
+
+def test_real_layer_contract_is_configured_and_kept(tmp_path: Path) -> None:
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", REPO_ROOT / "src", tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Ports & Adapters layers" in result.stdout
+    assert "KEPT" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("module", "statement", "expected"),
+    [
+        (
+            "agent_core.types.planted",
+            "from agent_core.ports import clock",
+            "agent_core.types.planted -> agent_core.ports.clock",
+        ),
+        (
+            "agent_core.types.planted",
+            "from agent_core.identity import generator",
+            "agent_core.types.planted -> agent_core.identity.generator",
+        ),
+        (
+            "agent_core.ports.planted",
+            "from agent_core.adapters import system",
+            "agent_core.ports.planted -> agent_core.adapters.system",
+        ),
+        (
+            "agent_core.ports.planted",
+            "from agent_core.identity import generator",
+            "agent_core.ports.planted -> agent_core.identity.generator",
+        ),
+        (
+            "agent_core.identity.planted",
+            "from agent_core.adapters import system",
+            "agent_core.identity.planted -> agent_core.adapters.system",
+        ),
+        (
+            "agent_core.adapters.planted",
+            "from agent_core.identity import generator",
+            "agent_core.adapters.planted -> agent_core.identity.generator",
+        ),
+    ],
+)
+def test_forbidden_layer_direction_breaks_the_real_contract(
+    tmp_path: Path, module: str, statement: str, expected: str
+) -> None:
+    src = _copy_real_package(tmp_path)
+    _plant(src, module, statement)
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert expected in result.stdout
+
+
+def test_cycle_between_layers_breaks_the_real_contract(tmp_path: Path) -> None:
+    src = _copy_real_package(tmp_path)
+    _plant(src, "agent_core.types.planted_low", "from agent_core.ports import planted_high")
+    _plant(src, "agent_core.ports.planted_high", "from agent_core.types import planted_low")
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert "agent_core.types.planted_low -> agent_core.ports.planted_high" in result.stdout

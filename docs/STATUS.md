@@ -11,8 +11,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1 の WP-01 は、ChatGPT のレビューで 92/100 の条件付き合格。指摘 WP01-R01〜R04 を修正し、確認を待っている**（`impl/phase-1-foundation`）。WP-02 以降は、まだ認められていない |
-| 次の作業 | WP01-R01〜R04 の修正の確認。WP-02 には、指示があるまで進まない |
+| 今の段階 | **Phase 1 の WP-02（共通の型と Ports）を実装した。ChatGPT によるコードレビューを待っている**（`impl/phase-1-foundation`）。WP-01 は、手元での実装が合格（96/100）。ただし CI は未実行のため、WP-01 の完了の条件をすべて満たしたとは記録しない。WP-03 以降は、まだ認められていない |
+| 次の作業 | WP-02 のレビュー。WP-03 には、指示があるまで進まない |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
@@ -43,8 +43,9 @@
 
 | WP | 状態 | 確かめたこと | 確かめていないこと |
 |---|---|---|---|
-| WP-01 プロジェクトの構成と CI | 実装した。レビューは 92/100 の条件付き合格。WP01-R01〜R04 を修正し、確認を待っている | 手元の環境（Ubuntu 24.04、Python 3.12.3、uv 0.11.32、SQLite 3.45.1）で、8種類の検査（秘密情報の検査、`uv lock --check`、`uv sync --locked --check`、ruff check、ruff format --check、mypy（strict）、import-linter、pytest）が、すべて成功した | **GitHub Actions の上での CI の実行**（手動の実行だけで動く設定。まだ動かしていない）。GitHub Actions の無料の枠と、課金を防ぐ条件。Action の正式なコミットの SHA。OS のレベルのネットワークの隔離 |
-| WP-02〜WP-15 | 始めていない | — | — |
+| WP-01 プロジェクトの構成と CI | 手元での実装は合格（修正の後、96/100）。**CI が未実行のため、完了の条件をすべて満たしたとは記録しない** | 手元の環境（Ubuntu 24.04、Python 3.12.3、uv 0.11.32、SQLite 3.45.1）で、8種類の検査が、すべて成功した | **GitHub Actions の上での CI の実行**（手動の実行だけで動く設定。まだ動かしていない）。GitHub Actions の無料の枠と、課金を防ぐ条件。Action の正式なコミットの SHA。OS のレベルのネットワークの隔離 |
+| WP-02 共通の型と Ports | 実装した。レビューを待っている。記録は `docs/design/phase-1/WP-02_COMMON_TYPES.md` | 8種類の検査が、すべて成功した。試験は 299 件（WP-02 で 173 件を追加）。import-linter の契約は2件（層の契約を追加）。`uv.lock` は変えていない | 再起動をまたいだ ID の一意性（WP-03 の UNIQUE の制約で確かめる）。Task と Step の状態と種類は PROVISIONAL（WP-04 で確かめる） |
+| WP-03〜WP-15 | 始めていない | — | — |
 
 - 依存関係の版とライセンスは、`docs/adr/0006-toolchain.md` に記録した。
 - WP-01 のレビューの指摘への対応：
@@ -52,6 +53,13 @@
   - WP01-R02：シンボリックリンクはたどらずに拒否する。gitlink、バイナリ、UTF-8 でないファイル、特殊なファイルも拒否する。許可の一覧は、Phase 1 では設けない。
   - WP01-R03：CI は手動の実行だけにした。依存関係を取得した後は `uv run --locked --offline` を使う。権限は `contents: read`、`persist-credentials: false` のまま。**Action をコミットの SHA に固定することは、未解決**（外部での確認が認められていないため。推測では設定しない）。
   - WP01-R04：試験の中で、TCP、UDP、IPv6、名前解決、`sendto`、`bind` なども拒否するようにした。import-linter の契約に `_socket`、`asyncio`、`multiprocessing`、`ctypes` などを加えた。`os.system`、`os.exec*`、`eval`、動的な import などを使わないことを、静的に検査する。
+- WP-01 から引き継いだ、残っている課題（ChatGPT のレビューで維持とされたもの）：
+  - WP01-R03：Action を、正式なコミットの SHA に固定すること。
+  - CI を初めて実行する前に、無料の枠と、課金を防ぐ条件を確かめること。
+  - Phase 1 を完了する前に、CI を実行すること。
+  - 信頼しない作業ツリーを扱う前に、親のディレクトリを入れ替える競合への対策をすること。
+  - OS のレベルのネットワークの隔離。
+  - 静的な検査と、秘密情報の検査の限界。
 - **今の検査が保証できる範囲**（詳しくは `README.md`）：
   - `UV_OFFLINE` と `--offline` は、uv の通信だけを止める。
   - 試験の中の遮断は、pytest のプロセスの中の、Python の `socket` を通る通信だけを止める。子プロセスは対象外。
