@@ -13,6 +13,7 @@ from pydantic import Field, StringConstraints
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.ids import ExperimentId, RunId, StepId, TaskId, TenantId, UserId
+from agent_core.types.model import ModelId
 from agent_core.types.values import Budget, Count, Identifier, SemVer
 
 # A synthetic budget period ("synthetic-2026-11"). Real calendar months and time
@@ -87,7 +88,7 @@ class PriceTable(FrozenModel):
     price_table_id: Identifier
     version: SemVer
     status: Literal["test"]
-    items: tuple[tuple[Identifier, PriceItem], ...]
+    items: tuple[tuple[ModelId, PriceItem], ...]
 
     def item(self, model_id: str) -> PriceItem | None:
         for name, item in self.items:
@@ -136,7 +137,10 @@ class ReservationView(FrozenModel):
     state: ReservationState
     reserved_micro: Count
     hold_micro: Count
+    # spent = actual (base cost) + adjust (CORRECTION and UNEXPLAINED), WP09-R02.
     spent_micro: Count
+    actual_micro: Count
+    adjust_micro: Count
     spent_lower_micro: Count
     # False while the cost is not final (UNKNOWN): spent_micro is then not a total.
     spent_known: bool

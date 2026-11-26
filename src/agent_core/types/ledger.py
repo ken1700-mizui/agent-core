@@ -28,9 +28,8 @@ from pydantic import Field
 from agent_core.types.base import FrozenModel
 from agent_core.types.cost import (
     BudgetScopeType,
-    CostEstimate,
     CounterKind,
-    ReservationScopes,
+    PriceTable,
 )
 from agent_core.types.ids import (
     ApprovalId,
@@ -44,8 +43,8 @@ from agent_core.types.ids import (
 )
 from agent_core.types.model import Usage
 from agent_core.types.safety import (
+    ActionContent,
     ActionDescriptor,
-    ActionKind,
     Consumer,
     Permit,
     Policy,
@@ -66,25 +65,28 @@ TtlMs = Annotated[int, Field(strict=True, ge=1, le=86_400_000)]
 
 
 class AllocateReservation(FrozenModel):
-    """``CONTENT_FIXED``: allocate the ID only (no hold, no authority; E 38.1)."""
+    """``CONTENT_FIXED``: allocate the ID only (no hold, no authority; E 38.1).
+
+    The budget scopes are not given by the caller (WP09-R06): the ledger takes
+    Task, Run, Step and tenant from the journaled runtime chain, and the user,
+    period and experiment from the Run's installed grant."""
 
     op: Literal["allocate"]
     reservation_id: ReservationId
     attempt_id: AttemptId
-    scopes: ReservationScopes
-    action_kind: ActionKind
     ttl_ms: TtlMs
 
 
 class ActivateReservation(FrozenModel):
     """``BUDGET_RESERVED``: the one ``ID_ALLOCATED -> RESERVED`` step (E 38.1).
-    The ledger recomputes the required amount from ``estimate``."""
+
+    There is no estimate here (WP09-R01): the ledger computes the required amount
+    from the recorded descriptor's cost basis and the owner's price table."""
 
     op: Literal["activate"]
     reservation_id: ReservationId
     attempt_id: AttemptId
     action_hash: Digest
-    estimate: CostEstimate
     amount: Budget
     cost_cap: Budget
 
@@ -115,6 +117,8 @@ class RecordDecision(FrozenModel):
     op: Literal["record_decision"]
     attempt_id: AttemptId
     descriptor: ActionDescriptor
+    # The actual content; the ledger rebuilds the descriptor from it (WP09-R06).
+    content: ActionContent
     registration: ToolRegistration | None
     # What the transition's evidence states; must equal the ledger's own decision.
     approval_required: bool
@@ -252,11 +256,19 @@ class SetCounterCap(FrozenModel):
 
 
 class SetRunWindow(FrozenModel):
-    """Elapsed-time limit of a Run, from now (ledger clock)."""
+    """Elapsed-time limit of a Run, counted from the Run's creation as journaled
+    (WP09-R02): setting it again changes the limit, never the start."""
 
     op: Literal["set_run_window"]
     run_id: RunId
     max_elapsed_ms: Annotated[int, Field(strict=True, ge=1, le=86_400_000)]
+
+
+class InstallPriceTable(FrozenModel):
+    """The owner's synthetic price table (``status=test``). Immutable once installed."""
+
+    op: Literal["install_price_table"]
+    table: PriceTable
 
 
 class InstallPolicy(FrozenModel):
@@ -318,14 +330,16 @@ BOUND_OPS = (
 STANDALONE_OPS = (
     "report_usage",
     "mark_unknown",
-    "reconcile",
-    "correct",
-    "unexplained",
     "void",
     "recover_in_flight",
     "record_approval",
 )
 OWNER_OPS = (
+    # Cost evidence comes only from the trusted owner path (WP09-R04).
+    "reconcile",
+    "correct",
+    "unexplained",
+    "install_price_table",
     "set_budget_cap",
     "set_counter_cap",
     "set_run_window",
@@ -347,6 +361,7 @@ LedgerOp = Annotated[
     | ConsumePermit
     | ClaimReceipt
     | RecordApproval
+    | InstallPriceTable
     | InstallPolicy
     | InstallRunGrant
     | StopScope

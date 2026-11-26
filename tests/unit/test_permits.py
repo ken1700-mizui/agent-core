@@ -51,9 +51,7 @@ from agent_core.types.safety import (
     SignedApproval,
     StopScopeType,
     StopStatus,
-    TargetResource,
 )
-from agent_core.types.tools import ResourceAccess
 from support import builders as b
 from support import ledger_world as lw
 from support import runtime_world as w
@@ -352,7 +350,6 @@ def test_changing_content_cost_or_attempt_voids_the_approval(st: Any, change: st
         other = s.write_descriptor(
             at,
             canonical_input='{"path":"workspace/out/x.txt"}',
-            resources=(TargetResource(path="workspace/out/x.txt", access=ResourceAccess.WRITE),),
             reservation_id=attempt.reservation_id,
             cost_cap=lw.xtu(5_000),
         )

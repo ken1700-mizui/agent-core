@@ -35,9 +35,10 @@ from agent_core.cost.rules import (
     checked_add,
     checked_sum,
     known_cost,
-    required_amount,
+    required_for,
 )
 from agent_core.safety.approval import check_approval, verify_signature
+from agent_core.safety.descriptor import rebuild
 from agent_core.safety.paths import any_match
 from agent_core.safety.pdp import decide, require_allowed
 from agent_core.types.cost import (
@@ -45,16 +46,19 @@ from agent_core.types.cost import (
     CounterKind,
     CounterView,
     LedgerEntryView,
+    PriceTable,
     ReservationState,
     ReservationView,
     ScopeUsage,
 )
 from agent_core.types.errors import (
+    ActionDescriptorError,
     ApprovalRejectedError,
     AuditRecursionError,
     BudgetBlockedError,
     BudgetCapMissingError,
     BudgetExceededError,
+    CostBasisMissingError,
     CounterCapExceededError,
     DuplicateUsageReportError,
     LedgerKeyMissingError,
@@ -78,6 +82,7 @@ from agent_core.types.ledger import (
     Correct,
     DenyResource,
     InstallPolicy,
+    InstallPriceTable,
     InstallRunGrant,
     IssuePermit,
     LedgerOp,
@@ -113,6 +118,7 @@ from agent_core.types.safety import (
     DispatchAuthorization,
     ExactApproval,
     LedgerKeys,
+    ModelCostBasis,
     Permit,
     PermitBody,
     PermitReason,
@@ -136,6 +142,9 @@ from agent_core.types.transitions import (
     EntityAction,
     PolicyDecisionEvidence,
     RuntimePayload,
+    RunTransition,
+    StepTransition,
+    TaskTransition,
 )
 from agent_core.types.values import MAX_INT64
 
@@ -153,13 +162,48 @@ LEDGER_DDL: Final = (
     scope_id TEXT NOT NULL,
     counter TEXT NOT NULL,
     cap INTEGER NOT NULL CHECK (cap >= 0),
+    PRIMARY KEY (scope_type, scope_id, counter)
+) STRICT""",
+    """CREATE TABLE counter_usage (
+    scope_type TEXT NOT NULL,
+    scope_id TEXT NOT NULL,
+    counter TEXT NOT NULL,
     used INTEGER NOT NULL CHECK (used >= 0),
     PRIMARY KEY (scope_type, scope_id, counter)
 ) STRICT""",
     """CREATE TABLE run_windows (
     run_id TEXT PRIMARY KEY,
-    started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
     max_elapsed_ms INTEGER NOT NULL CHECK (max_elapsed_ms >= 1)
+) STRICT""",
+    """CREATE TABLE price_tables (
+    price_table_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (price_table_id, version)
+) STRICT""",
+    """CREATE TABLE rt_tasks (
+    task_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    budget_micro INTEGER NOT NULL CHECK (budget_micro >= 0),
+    caps TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+) STRICT""",
+    """CREATE TABLE rt_runs (
+    run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    tenant_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    cancel_requested INTEGER NOT NULL CHECK (cancel_requested IN (0, 1)),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+) STRICT""",
+    """CREATE TABLE rt_steps (
+    step_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL
+) STRICT""",
+    """CREATE TABLE rt_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    step_id TEXT NOT NULL,
+    state TEXT NOT NULL
 ) STRICT""",
     """CREATE TABLE budget_blocks (
     scope_type TEXT NOT NULL,
@@ -178,13 +222,15 @@ LEDGER_DDL: Final = (
     step_id TEXT NOT NULL,
     period_id TEXT NOT NULL,
     experiment_id TEXT,
-    action_kind TEXT NOT NULL,
+    action_kind TEXT,
     state TEXT NOT NULL,
     action_hash TEXT,
     cost_cap_micro INTEGER CHECK (cost_cap_micro >= 0),
+    required_micro INTEGER CHECK (required_micro >= 0),
     reserved_micro INTEGER NOT NULL CHECK (reserved_micro >= 0),
     hold_micro INTEGER NOT NULL CHECK (hold_micro >= 0),
     spent_micro INTEGER NOT NULL CHECK (spent_micro >= 0),
+    adjust_micro INTEGER NOT NULL CHECK (adjust_micro >= 0),
     spent_lower_micro INTEGER NOT NULL CHECK (spent_lower_micro >= 0),
     spent_known INTEGER NOT NULL CHECK (spent_known IN (0, 1)),
     allocated_at_ms INTEGER NOT NULL CHECK (allocated_at_ms >= 0),
@@ -222,9 +268,9 @@ _SCOPE_COLUMNS: Final = {
 }
 _ROW: Final = (
     "reservation_id, attempt_id, tenant_id, user_id, task_id, run_id, step_id, period_id, "
-    "experiment_id, action_kind, state, action_hash, cost_cap_micro, reserved_micro, "
-    "hold_micro, spent_micro, spent_lower_micro, spent_known, allocated_at_ms, "
-    "expires_at_ms, permit_id, receipt_id"
+    "experiment_id, action_kind, state, action_hash, cost_cap_micro, required_micro, "
+    "reserved_micro, hold_micro, spent_micro, adjust_micro, spent_lower_micro, spent_known, "
+    "allocated_at_ms, expires_at_ms, permit_id, receipt_id"
 )
 _NAMES: Final = tuple(name.strip() for name in _ROW.split(","))
 # Overruns stop new reservations in the run, task, experiment and period (E 4.1);
@@ -314,11 +360,44 @@ def _scopes_of(row: dict[str, Any]) -> list[tuple[BudgetScopeType, str]]:
 
 
 def _totals(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) -> tuple[int, int]:
+    """(held, spent) of one scope. Spent is the base cost plus every adjustment."""
     rows = cur.execute(
-        f"SELECT hold_micro, spent_micro FROM reservations WHERE {_SCOPE_COLUMNS[kind]} = ?",  # noqa: S608
+        "SELECT hold_micro, spent_micro, adjust_micro FROM reservations "  # noqa: S608
+        f"WHERE {_SCOPE_COLUMNS[kind]} = ?",
         (scope_id,),
     ).fetchall()
-    return checked_sum(r[0] for r in rows), checked_sum(r[1] for r in rows)
+    held = checked_sum(r[0] for r in rows)
+    spent = checked_sum(checked_add(r[1], r[2]) for r in rows)
+    return held, spent
+
+
+def _effective_cap(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) -> int | None:
+    """The owner's cap; for a Task, never above the Task's own ``budget_total``."""
+    found = cur.execute(
+        "SELECT cap_micro FROM budget_caps WHERE scope_type = ? AND scope_id = ?",
+        (kind.value, scope_id),
+    ).fetchone()
+    cap = None if found is None else int(found[0])
+    if kind is BudgetScopeType.TASK:
+        task = cur.execute(
+            "SELECT budget_micro FROM rt_tasks WHERE task_id = ?", (scope_id,)
+        ).fetchone()
+        if task is not None:
+            cap = int(task[0]) if cap is None else min(cap, int(task[0]))
+    return cap
+
+
+def _check_overrun(cur: sqlite3.Cursor, row: dict[str, Any], now_ms: int) -> None:
+    """After a cost change: any scope above its cap records an OVERRUN and stops new
+    reservations there (E 4.1). The cost itself is kept in full."""
+    for kind, scope_id in _scopes_of(row):
+        cap = _effective_cap(cur, kind, scope_id)
+        if cap is None:
+            continue
+        total = checked_sum(_totals(cur, kind, scope_id))
+        if total > cap:
+            _entry(cur, row, "OVERRUN", now_ms, delta=total - cap)
+            _block(cur, row, (kind,), "OVERRUN")
 
 
 def _block(
@@ -336,15 +415,30 @@ def _block(
 def _record_cost(
     cur: sqlite3.Cursor, row: dict[str, Any], target: ReservationState, actual: int, now_ms: int
 ) -> dict[str, Any]:
+    """Record the base cost. Adjustments (CORRECTION, UNEXPLAINED) stay as they are."""
     row = _move(cur, row, target, now_ms, hold_micro=0, spent_micro=actual, spent_known=1)
     if actual > row["reserved_micro"]:
         # The actual amount is recorded in full; new reservations stop (E 4.1).
         _entry(cur, row, "OVERRUN", now_ms, delta=actual - row["reserved_micro"])
         _block(cur, row, _OVERRUN_SCOPES, "OVERRUN")
+    _check_overrun(cur, row, now_ms)
     return row
 
 
 # ---------------------------------------------------------------- operations
+
+
+def _chain(cur: sqlite3.Cursor, attempt_id: str) -> dict[str, str]:
+    """The journaled Task-Run-Step-Attempt chain of an attempt (WP09-R06)."""
+    row = cur.execute(
+        "SELECT a.step_id, s.run_id, r.task_id, r.tenant_id FROM rt_attempts a "
+        "JOIN rt_steps s ON s.step_id = a.step_id JOIN rt_runs r ON r.run_id = s.run_id "
+        "WHERE a.attempt_id = ?",
+        (str(attempt_id),),
+    ).fetchone()
+    if row is None:
+        raise ReservationMismatchError("ATTEMPT_CHAIN_UNKNOWN")
+    return {"step_id": row[0], "run_id": row[1], "task_id": row[2], "tenant_id": row[3]}
 
 
 def _allocate(cur: sqlite3.Cursor, op: AllocateReservation, now_ms: int) -> None:
@@ -355,38 +449,116 @@ def _allocate(cur: sqlite3.Cursor, op: AllocateReservation, now_ms: int) -> None
     ).fetchone()
     if taken is not None:
         raise ReservationReuseError("ATTEMPT_HAS_RESERVATION")
-    scopes = op.scopes
+    # Every scope from trusted state: the journaled chain and the Run's grant.
+    chain = _chain(cur, op.attempt_id)
+    found = cur.execute(
+        "SELECT body FROM run_grants WHERE run_id = ?", (chain["run_id"],)
+    ).fetchone()
+    if found is None:
+        raise BudgetCapMissingError("RUN_GRANT")
+    grant = RunGrant.model_validate_json(found[0])
+    if (str(grant.tenant_id), str(grant.task_id)) != (chain["tenant_id"], chain["task_id"]):
+        raise ReservationMismatchError("GRANT_SCOPE")
     expires = checked_add(now_ms, op.ttl_ms)
+    values = {
+        "reservation_id": str(op.reservation_id),
+        "attempt_id": str(op.attempt_id),
+        "tenant_id": chain["tenant_id"],
+        "user_id": str(grant.user_id),
+        "task_id": chain["task_id"],
+        "run_id": chain["run_id"],
+        "step_id": chain["step_id"],
+        "period_id": grant.period_id,
+        "experiment_id": None if grant.experiment_id is None else str(grant.experiment_id),
+        "action_kind": None,
+        "state": R.ID_ALLOCATED.value,
+        "action_hash": None,
+        "cost_cap_micro": None,
+        "required_micro": None,
+        "reserved_micro": 0,
+        "hold_micro": 0,
+        "spent_micro": 0,
+        "adjust_micro": 0,
+        "spent_lower_micro": 0,
+        "spent_known": 1,
+        "allocated_at_ms": now_ms,
+        "expires_at_ms": expires,
+        "permit_id": None,
+        "receipt_id": None,
+    }
     cur.execute(
         f"INSERT INTO reservations ({_ROW}) VALUES ({', '.join('?' * len(_NAMES))})",  # noqa: S608
-        (
-            str(op.reservation_id),
-            str(op.attempt_id),
-            str(scopes.tenant_id),
-            str(scopes.user_id),
-            str(scopes.task_id),
-            str(scopes.run_id),
-            str(scopes.step_id),
-            scopes.period_id,
-            None if scopes.experiment_id is None else str(scopes.experiment_id),
-            op.action_kind.value,
-            R.ID_ALLOCATED.value,
-            None,
-            None,
-            0,
-            0,
-            0,
-            0,
-            1,
-            now_ms,
-            expires,
-            None,
-            None,
-        ),
+        tuple(values[name] for name in _NAMES),
     )
     row = _row(cur, op.reservation_id)
     assert row is not None  # noqa: S101 (just inserted in this transaction)
     _entry(cur, row, "STATE", now_ms)
+
+
+_TASK_CAP_FIELDS: Final = {
+    CounterKind.MODEL_CALLS: "model_calls",
+    CounterKind.TOOL_CALLS: "tool_calls",
+    CounterKind.RETRIES: "retries",
+    CounterKind.WORK_UNITS: "total_operations",
+}
+
+
+def _task_caps(cur: sqlite3.Cursor, task_id: str) -> tuple[dict[str, int], int] | None:
+    found = cur.execute(
+        "SELECT caps, created_at_ms FROM rt_tasks WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    return None if found is None else (json.loads(found[0]), int(found[1]))
+
+
+def _counter_cap(
+    cur: sqlite3.Cursor,
+    scope: BudgetScopeType,
+    scope_id: str,
+    counter: CounterKind,
+    task: dict[str, int] | None,
+) -> int | None:
+    """The owner's counter cap, never above the Task's ``caps_total`` (WP09-R02).
+    A Task scope without an owner cap uses the Task's own cap."""
+    found = cur.execute(
+        "SELECT cap FROM counter_caps WHERE scope_type = ? AND scope_id = ? AND counter = ?",
+        (scope.value, scope_id, counter.value),
+    ).fetchone()
+    cap = None if found is None else int(found[0])
+    if task is not None:
+        task_cap = int(task[_TASK_CAP_FIELDS[counter]])
+        if cap is None and scope is BudgetScopeType.TASK:
+            return task_cap
+        if cap is not None:
+            cap = min(cap, task_cap)
+    return cap
+
+
+def _used(cur: sqlite3.Cursor, scope: BudgetScopeType, scope_id: str, counter: CounterKind) -> int:
+    found = cur.execute(
+        "SELECT used FROM counter_usage WHERE scope_type = ? AND scope_id = ? AND counter = ?",
+        (scope.value, scope_id, counter.value),
+    ).fetchone()
+    return 0 if found is None else int(found[0])
+
+
+def _elapsed_reasons(cur: sqlite3.Cursor, run_id: str, task_id: str, now_ms: int) -> list[str]:
+    """Run and Task elapsed time, from their journaled creation (WP09-R02, R05)."""
+    reasons: list[str] = []
+    run = cur.execute("SELECT created_at_ms FROM rt_runs WHERE run_id = ?", (run_id,)).fetchone()
+    window = cur.execute(
+        "SELECT max_elapsed_ms FROM run_windows WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if run is None or window is None:
+        raise BudgetCapMissingError("ELAPSED_MS")
+    task = _task_caps(cur, task_id)
+    limit = int(window[0])
+    if task is not None:
+        limit = min(limit, int(task[0]["wall_clock_ms"]))
+        if now_ms - task[1] > int(task[0]["wall_clock_ms"]):
+            reasons.append("ELAPSED_MS")
+    if now_ms < int(run[0]) or now_ms - int(run[0]) > limit:
+        reasons.append("ELAPSED_MS")
+    return reasons
 
 
 def _check_counters(cur: sqlite3.Cursor, row: dict[str, Any], now_ms: int) -> None:
@@ -402,35 +574,45 @@ def _check_counters(cur: sqlite3.Cursor, row: dict[str, Any], now_ms: int) -> No
     ).fetchone()[0]
     if earlier:
         counters.append(CounterKind.RETRIES)
+    found_task = _task_caps(cur, row["task_id"])
+    task = None if found_task is None else found_task[0]
     exceeded: list[str] = []
     for counter in counters:
         for scope in (BudgetScopeType.RUN, BudgetScopeType.TASK):
             scope_id = row[_SCOPE_COLUMNS[scope]]
-            found = cur.execute(
-                "SELECT cap, used FROM counter_caps WHERE scope_type = ? AND scope_id = ? "
-                "AND counter = ?",
-                (scope.value, scope_id, counter.value),
-            ).fetchone()
-            if found is None:
+            cap = _counter_cap(cur, scope, scope_id, counter, task)
+            if cap is None:
                 raise BudgetCapMissingError(f"{scope.value}_{counter.value}")
-            used = checked_add(found[1], 1)
-            if used > found[0]:
+            used = checked_add(_used(cur, scope, scope_id, counter), 1)
+            if used > cap:
                 exceeded.append(counter.value)
                 continue
             cur.execute(
-                "UPDATE counter_caps SET used = ? WHERE scope_type = ? AND scope_id = ? "
-                "AND counter = ?",
-                (used, scope.value, scope_id, counter.value),
+                "INSERT INTO counter_usage (scope_type, scope_id, counter, used) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT (scope_type, scope_id, counter) "
+                "DO UPDATE SET used = excluded.used",
+                (scope.value, scope_id, counter.value, used),
             )
-    window = cur.execute(
-        "SELECT started_at_ms, max_elapsed_ms FROM run_windows WHERE run_id = ?", (row["run_id"],)
-    ).fetchone()
-    if window is None:
-        raise BudgetCapMissingError("ELAPSED_MS")
-    if now_ms < window[0] or now_ms - window[0] > window[1]:
-        exceeded.append("ELAPSED_MS")
+    exceeded += _elapsed_reasons(cur, row["run_id"], row["task_id"], now_ms)
     if exceeded:
         raise CounterCapExceededError(*dict.fromkeys(exceeded))
+
+
+def _price_table(cur: sqlite3.Cursor, table_id: str, version: str) -> PriceTable | None:
+    found = cur.execute(
+        "SELECT body FROM price_tables WHERE price_table_id = ? AND version = ?",
+        (table_id, version),
+    ).fetchone()
+    return None if found is None else PriceTable.model_validate_json(found[0])
+
+
+def required_of(cur: sqlite3.Cursor, descriptor: ActionDescriptor) -> int:
+    """The trusted required amount of a recorded descriptor (WP09-R01)."""
+    basis = descriptor.cost_basis
+    table = None
+    if isinstance(basis, ModelCostBasis):
+        table = _price_table(cur, basis.price_table_id, basis.price_table_version)
+    return required_for(basis, table)
 
 
 def _activate(cur: sqlite3.Cursor, op: ActivateReservation, now_ms: int) -> None:
@@ -438,12 +620,6 @@ def _activate(cur: sqlite3.Cursor, op: ActivateReservation, now_ms: int) -> None
     check_transition(ReservationState(row["state"]), R.RESERVED)
     if now_ms >= row["expires_at_ms"]:
         raise ReservationExpiredError("ALLOCATION_EXPIRED")
-    required = required_amount(op.estimate)
-    amount = op.amount.micro_units
-    if amount < required:
-        raise ReservationAmountError("BELOW_REQUIRED")
-    if amount > op.cost_cap.micro_units:
-        raise ReservationAmountError("ABOVE_COST_CAP")
     decided = cur.execute(
         "SELECT action_hash, descriptor, approval_required, approval_id FROM decisions "
         "WHERE attempt_id = ?",
@@ -451,10 +627,18 @@ def _activate(cur: sqlite3.Cursor, op: ActivateReservation, now_ms: int) -> None
     ).fetchone()
     if decided is None or decided[0] != op.action_hash:
         raise ReservationMismatchError("NO_DECISION_FOR_ACTION")
-    if ActionDescriptor.model_validate_json(decided[1]).cost_cap != op.cost_cap:
+    descriptor = ActionDescriptor.model_validate_json(decided[1])
+    if descriptor.cost_cap != op.cost_cap:
         raise ReservationMismatchError("COST_CAP_DIFFERS")
     if decided[2] and decided[3] is None:
         raise ReservationStateError("APPROVAL_REQUIRED")
+    # The required amount comes from the recorded basis, never from the caller.
+    required = required_of(cur, descriptor)
+    amount = op.amount.micro_units
+    if amount < required:
+        raise ReservationAmountError("BELOW_REQUIRED")
+    if amount > op.cost_cap.micro_units:
+        raise ReservationAmountError("ABOVE_COST_CAP")
     scopes = _scopes_of(row)
     blocked = [
         kind.value
@@ -468,14 +652,11 @@ def _activate(cur: sqlite3.Cursor, op: ActivateReservation, now_ms: int) -> None
         raise BudgetBlockedError(*blocked)
     exceeded: list[str] = []
     for kind, scope_id in scopes:
-        cap = cur.execute(
-            "SELECT cap_micro FROM budget_caps WHERE scope_type = ? AND scope_id = ?",
-            (kind.value, scope_id),
-        ).fetchone()
+        cap = _effective_cap(cur, kind, scope_id)
         if cap is None:
             raise BudgetCapMissingError(kind.value)
         hold, spent = _totals(cur, kind, scope_id)
-        if checked_sum((hold, spent, amount)) > cap[0]:
+        if checked_sum((hold, spent, amount)) > cap:
             exceeded.append(kind.value)
     if exceeded:
         raise BudgetExceededError(*exceeded)
@@ -487,6 +668,7 @@ def _activate(cur: sqlite3.Cursor, op: ActivateReservation, now_ms: int) -> None
         now_ms,
         action_hash=op.action_hash,
         cost_cap_micro=op.cost_cap.micro_units,
+        required_micro=required,
         reserved_micro=amount,
         hold_micro=amount,
     )
@@ -576,10 +758,12 @@ def _reconcile(cur: sqlite3.Cursor, op: Reconcile, now_ms: int) -> None:
 
 
 def _adjust(cur: sqlite3.Cursor, op: Correct | Unexplained, now_ms: int) -> None:
+    """An adjustment is kept apart from the base cost, so a later reconciliation
+    never erases it; a total above a cap is an overrun (WP09-R02)."""
     row = _row(cur, op.reservation_id)
     if row is None or row["state"] in (R.ID_ALLOCATED.value, R.VOID.value):
         raise ReservationStateError("NOTHING_TO_ADJUST")
-    row = _update(cur, row, spent_micro=checked_add(row["spent_micro"], op.delta_micro))
+    row = _update(cur, row, adjust_micro=checked_add(row["adjust_micro"], op.delta_micro))
     if isinstance(op, Correct):
         _entry(
             cur,
@@ -593,6 +777,7 @@ def _adjust(cur: sqlite3.Cursor, op: Correct | Unexplained, now_ms: int) -> None
     else:
         _entry(cur, row, "UNEXPLAINED", now_ms, delta=op.delta_micro, evidence_ref=op.evidence_ref)
         _block(cur, row, _UNEXPLAINED_SCOPES, "UNEXPLAINED")
+    _check_overrun(cur, row, now_ms)
 
 
 def _void(cur: sqlite3.Cursor, op: VoidAllocation, now_ms: int) -> None:
@@ -614,7 +799,9 @@ def _recover(cur: sqlite3.Cursor, now_ms: int) -> None:
 
 
 def _owner(
-    cur: sqlite3.Cursor, op: SetBudgetCap | SetCounterCap | SetRunWindow, now_ms: int
+    cur: sqlite3.Cursor,
+    op: SetBudgetCap | SetCounterCap | SetRunWindow | InstallPriceTable,
+    now_ms: int,
 ) -> None:
     if isinstance(op, SetBudgetCap):
         cur.execute(
@@ -624,17 +811,28 @@ def _owner(
         )
     elif isinstance(op, SetCounterCap):
         cur.execute(
-            "INSERT INTO counter_caps (scope_type, scope_id, counter, cap, used) "
-            "VALUES (?, ?, ?, ?, 0) ON CONFLICT (scope_type, scope_id, counter) "
-            "DO UPDATE SET cap = excluded.cap",
+            "INSERT INTO counter_caps (scope_type, scope_id, counter, cap) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (scope_type, scope_id, counter) DO UPDATE SET cap = excluded.cap",
             (op.scope_type.value, op.scope_id, op.counter.value, op.cap),
         )
-    else:
+    elif isinstance(op, SetRunWindow):
+        # Only the limit changes; elapsed time counts from the Run's creation.
         cur.execute(
-            "INSERT INTO run_windows (run_id, started_at_ms, max_elapsed_ms) VALUES (?, ?, ?) "
-            "ON CONFLICT (run_id) DO UPDATE SET started_at_ms = excluded.started_at_ms, "
-            "max_elapsed_ms = excluded.max_elapsed_ms",
-            (str(op.run_id), now_ms, op.max_elapsed_ms),
+            "INSERT INTO run_windows (run_id, max_elapsed_ms) VALUES (?, ?) "
+            "ON CONFLICT (run_id) DO UPDATE SET max_elapsed_ms = excluded.max_elapsed_ms",
+            (str(op.run_id), op.max_elapsed_ms),
+        )
+    else:
+        table = op.table
+        current = _price_table(cur, table.price_table_id, table.version)
+        if current is not None:
+            if current != table:
+                # A price table version never changes once installed.
+                raise ReservationMismatchError("PRICE_TABLE_IMMUTABLE")
+            return
+        cur.execute(
+            "INSERT INTO price_tables (price_table_id, version, body) VALUES (?, ?, ?)",
+            (table.price_table_id, table.version, dump_json(table).decode()),
         )
 
 
@@ -667,7 +865,7 @@ def apply_op(
         _void(cur, op, now_ms)
     elif isinstance(op, RecoverInFlight):
         _recover(cur, now_ms)
-    elif isinstance(op, SetBudgetCap | SetCounterCap | SetRunWindow):
+    elif isinstance(op, SetBudgetCap | SetCounterCap | SetRunWindow | InstallPriceTable):
         _owner(cur, op, now_ms)
     else:
         raise LedgerPairingError("UNKNOWN_OPERATION")
@@ -686,7 +884,9 @@ def read_reservation(cur: sqlite3.Cursor, reservation_id: str) -> ReservationVie
         state=ReservationState(row["state"]),
         reserved_micro=row["reserved_micro"],
         hold_micro=row["hold_micro"],
-        spent_micro=row["spent_micro"],
+        spent_micro=checked_add(row["spent_micro"], row["adjust_micro"]),
+        actual_micro=row["spent_micro"],
+        adjust_micro=row["adjust_micro"],
         spent_lower_micro=row["spent_lower_micro"],
         spent_known=bool(row["spent_known"]),
         action_hash=row["action_hash"],
@@ -696,10 +896,6 @@ def read_reservation(cur: sqlite3.Cursor, reservation_id: str) -> ReservationVie
 
 
 def scope_usage(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) -> ScopeUsage:
-    cap = cur.execute(
-        "SELECT cap_micro FROM budget_caps WHERE scope_type = ? AND scope_id = ?",
-        (kind.value, scope_id),
-    ).fetchone()
     hold, spent = _totals(cur, kind, scope_id)
     blocked = cur.execute(
         "SELECT 1 FROM budget_blocks WHERE scope_type = ? AND scope_id = ? LIMIT 1",
@@ -708,7 +904,7 @@ def scope_usage(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) -> Sc
     return ScopeUsage(
         scope_type=kind,
         scope_id=scope_id,
-        cap_micro=None if cap is None else cap[0],
+        cap_micro=_effective_cap(cur, kind, scope_id),
         hold_micro=hold,
         spent_micro=spent,
         blocked=blocked is not None,
@@ -718,11 +914,15 @@ def scope_usage(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) -> Sc
 def read_counter(
     cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str, counter: CounterKind
 ) -> CounterView | None:
-    found = cur.execute(
-        "SELECT used, cap FROM counter_caps WHERE scope_type = ? AND scope_id = ? AND counter = ?",
-        (kind.value, scope_id, counter.value),
-    ).fetchone()
-    return None if found is None else CounterView(used=found[0], cap=found[1])
+    task_id: str | None = scope_id
+    if kind is BudgetScopeType.RUN:
+        found = cur.execute("SELECT task_id FROM rt_runs WHERE run_id = ?", (scope_id,)).fetchone()
+        task_id = None if found is None else found[0]
+    task = None if task_id is None else _task_caps(cur, task_id)
+    cap = _counter_cap(cur, kind, scope_id, counter, None if task is None else task[0])
+    if cap is None:
+        return None
+    return CounterView(used=_used(cur, kind, scope_id, counter), cap=cap)
 
 
 def read_entries(cur: sqlite3.Cursor, reservation_id: str) -> tuple[LedgerEntryView, ...]:
@@ -818,14 +1018,7 @@ def check_pairing(draft: EventDraft, ops: tuple[LedgerOp, ...]) -> None:
         if hasattr(op, "reservation_id") and op.reservation_id != after.reservation_id:
             raise LedgerPairingError("RESERVATION_DIFFERS")
         _check_bound(op, after, evidence)
-        if isinstance(op, AllocateReservation):
-            scopes = op.scopes
-            if (
-                scopes.step_id != after.step_id
-                or scopes.tenant_id != draft.tenant_id
-                or scopes.run_id != draft.run_id
-            ):
-                raise LedgerPairingError("SCOPES_DIFFER")
+        # Allocation scopes are derived inside the transaction (WP09-R06).
         if isinstance(op, ActivateReservation) and op.action_hash != after.action_hash:
             raise LedgerPairingError("ACTION_HASH_DIFFERS")
         if isinstance(op, ReleaseReservation):
@@ -1333,6 +1526,24 @@ def _record_decision(
         "SELECT 1 FROM decisions WHERE attempt_id = ?", (str(op.attempt_id),)
     ).fetchone():
         raise PermitRejectedError(PermitReason.DECISION_MISSING, "DECISION_ALREADY_RECORDED")
+    # WP09-R06: the descriptor belongs to the journaled chain of its attempt, and it
+    # is exactly the descriptor its content builds (targets, hashes, cost basis).
+    chain = _chain(cur, op.attempt_id)
+    if (
+        str(descriptor.step_id),
+        str(descriptor.run_id),
+        str(descriptor.task_id),
+        str(descriptor.tenant_id),
+    ) != (chain["step_id"], chain["run_id"], chain["task_id"], chain["tenant_id"]):
+        raise PermitRejectedError(PermitReason.ATTEMPT_MISMATCH, "ATTEMPT_CHAIN_MISMATCH")
+    try:
+        rebuilt = rebuild(descriptor, op.content, op.registration)
+    except ActionDescriptorError:
+        raise PermitRejectedError(
+            PermitReason.ACTION_MISMATCH, "DESCRIPTOR_NOT_FROM_CONTENT"
+        ) from None
+    if rebuilt != descriptor:
+        raise PermitRejectedError(PermitReason.ACTION_MISMATCH, "DESCRIPTOR_NOT_FROM_CONTENT")
     policy = _policy(cur, str(descriptor.tenant_id))
     grant = _grant(cur, str(descriptor.run_id))
     if policy is None or grant is None:
@@ -1364,6 +1575,10 @@ def _record_decision(
             result.decision_ref(),
             int(result.approval_required),
         ),
+    )
+    cur.execute(
+        "UPDATE reservations SET action_kind = ? WHERE reservation_id = ?",
+        (descriptor.kind.value, str(descriptor.reservation_id)),
     )
     _audit(
         cur,
@@ -1471,6 +1686,19 @@ def _reservation_reasons(
         or row["cost_cap_micro"] is None
         or row["reserved_micro"] > row["cost_cap_micro"]
     ):
+        return [PermitReason.RESERVATION_INVALID]
+    # required <= reserved <= cost cap, with the required amount recomputed from the
+    # recorded descriptor (WP09-R01), at permit issue and at consumption.
+    found = cur.execute(
+        "SELECT descriptor FROM decisions WHERE attempt_id = ?", (str(attempt_id),)
+    ).fetchone()
+    if found is None:
+        return [PermitReason.DECISION_MISSING]
+    try:
+        required = required_of(cur, ActionDescriptor.model_validate_json(found[0]))
+    except CostBasisMissingError:
+        return [PermitReason.RESERVATION_INVALID]
+    if row["reserved_micro"] < required or row["hold_micro"] < required:
         return [PermitReason.RESERVATION_INVALID]
     return []
 
@@ -1984,3 +2212,63 @@ def read_approval_uses(cur: sqlite3.Cursor, approval_id: str) -> int | None:
 
 
 ALL_DDL: Final = LEDGER_DDL + AUTHORITY_DDL
+
+
+# ================================================================ runtime mirror (WP09-R02, R06)
+
+
+def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
+    """Copy the journaled runtime chain and limits into the ledger, in the same
+    transaction as the event: Task budget and caps, Run, Step and Attempt parents
+    and states. The ledger reads only these copies, never caller claims."""
+    payload = draft.payload
+    if not isinstance(payload, RuntimePayload):
+        return
+    tenant = str(draft.tenant_id)
+    for transition in payload.transitions:
+        if isinstance(transition, TaskTransition) and transition.before is None:
+            task = transition.after
+            cur.execute(
+                "INSERT INTO rt_tasks (task_id, tenant_id, budget_micro, caps, created_at_ms) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(task.task_id),
+                    tenant,
+                    task.budget_total.micro_units,
+                    dump_json(task.caps_total).decode(),
+                    now_ms,
+                ),
+            )
+        elif isinstance(transition, RunTransition):
+            run = transition.after
+            if transition.before is None:
+                cur.execute(
+                    "INSERT INTO rt_runs (run_id, task_id, tenant_id, status, cancel_requested, "
+                    "created_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(run.run_id),
+                        str(run.task_id),
+                        tenant,
+                        run.status.value,
+                        int(run.cancel_requested),
+                        now_ms,
+                    ),
+                )
+            else:
+                cur.execute(
+                    "UPDATE rt_runs SET status = ?, cancel_requested = ? WHERE run_id = ?",
+                    (run.status.value, int(run.cancel_requested), str(run.run_id)),
+                )
+        elif isinstance(transition, StepTransition) and transition.before is None:
+            step = transition.after
+            cur.execute(
+                "INSERT INTO rt_steps (step_id, run_id) VALUES (?, ?)",
+                (str(step.step_id), str(step.run_id)),
+            )
+        elif isinstance(transition, AttemptTransition):
+            attempt = transition.after
+            cur.execute(
+                "INSERT INTO rt_attempts (attempt_id, step_id, state) VALUES (?, ?, ?) "
+                "ON CONFLICT (attempt_id) DO UPDATE SET state = excluded.state",
+                (str(attempt.attempt_id), str(attempt.step_id), attempt.state.value),
+            )

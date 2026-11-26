@@ -19,6 +19,7 @@ from agent_core.types.safety import (
     ActionKind,
     DenyReason,
     HashScheme,
+    ModelCostBasis,
     ModelProviderKind,
     Policy,
     PolicyDecision,
@@ -26,6 +27,7 @@ from agent_core.types.safety import (
     SafetyContext,
     StopScopeType,
     StopStatus,
+    ToolCostBasis,
 )
 from agent_core.types.tools import (
     ApprovalCondition,
@@ -116,6 +118,10 @@ def _tool_reasons(
         reasons.append(DenyReason.SANDBOX_NOT_AVAILABLE)
     if descriptor.effect_class is not manifest.effect_class:
         reasons.append(DenyReason.DESCRIPTOR_MISMATCH)
+    basis = descriptor.cost_basis
+    if not isinstance(basis, ToolCostBasis) or basis.estimate != manifest.cost_estimate:
+        # The required amount is the trusted manifest's estimate (WP09-R01).
+        reasons.append(DenyReason.DESCRIPTOR_MISMATCH)
     for resource in descriptor.target_resources:
         declared = [s for s in manifest.resources if s.access is resource.access]
         if not any_match(tuple(s.path_pattern for s in declared), resource.path):
@@ -149,6 +155,13 @@ def _model_reasons(
         reasons.append(DenyReason.EFFECT_NOT_ALLOWED)
     if model.profile not in grant.model_profiles:
         reasons.append(DenyReason.MODEL_NOT_GRANTED)
+    basis = descriptor.cost_basis
+    if not isinstance(basis, ModelCostBasis) or (
+        basis.price_table_id,
+        basis.price_table_version,
+    ) != (policy.price_table_id, policy.price_table_version):
+        # Only the owner's price table named by the policy prices a call (WP09-R01).
+        reasons.append(DenyReason.COST_BASIS_UNTRUSTED)
     return reasons
 
 

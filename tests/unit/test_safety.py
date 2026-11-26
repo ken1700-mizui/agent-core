@@ -166,7 +166,6 @@ def test_resources_beyond_the_grant_or_on_the_deny_list_are_denied(
         at,
         registration=registration,
         canonical_input=canonical,
-        resources=(TargetResource(path=path, access=access),),
     )
     _denied(_decide(descriptor, at=at, registration=registration), reason)
 
@@ -373,9 +372,8 @@ def test_descriptor_needs_canonical_arguments(canonical: str) -> None:
 
 def test_descriptor_rejects_undeclared_resources() -> None:
     with pytest.raises(ActionDescriptorError):
-        s.read_descriptor(
-            s.ref(), resources=(TargetResource(path="elsewhere/a.txt", access=ResourceAccess.READ),)
-        )
+        # The target is derived from the argument; it is outside the manifest.
+        s.read_descriptor(s.ref(), canonical_input='{"path":"elsewhere/a.txt"}')
     for bad in ("../a.txt", "/etc/passwd", "workspace/../x", "workspace/*"):
         with pytest.raises(ValidationError):
             TargetResource(path=bad, access=ResourceAccess.READ)
@@ -394,8 +392,6 @@ def test_action_hash_covers_arguments_cost_reservation_and_expiry(change: dict[s
     at = s.ref()
     base = s.read_descriptor(at, reservation_id=b.new_id(ReservationId))
     values = {"reservation_id": base.reservation_id, **change}
-    if "canonical_input" in change:
-        values["resources"] = (TargetResource(path="workspace/b.txt", access=ResourceAccess.READ),)
     assert s.read_descriptor(at, **values).action_hash() != base.action_hash()
 
 
@@ -415,11 +411,17 @@ def test_action_hash_covers_the_attempt_and_the_executable() -> None:
 
 def test_model_call_request_hash_is_computed_from_the_record() -> None:
     at = s.ref()
-    first = s.model_descriptor(at, request_record=b'{"a":1}')
-    second = s.model_descriptor(at, request_record=b'{"a":2}', reservation_id=first.reservation_id)
+    record_a, rendered_a = s.model_request(max_output_tokens=100)
+    record_b, rendered_b = s.model_request(max_output_tokens=101)
+    first = s.model_descriptor(at, request_record=record_a, rendered_input=rendered_a)
+    second = s.model_descriptor(
+        at, request_record=record_b, rendered_input=rendered_b, reservation_id=first.reservation_id
+    )
     assert first.request_hash != second.request_hash
-    with pytest.raises(ActionDescriptorError):
-        s.model_descriptor(at, request_record=b"")
+    # The record must be a valid request record (WP09-R01): arbitrary bytes are refused.
+    for record in (b"", b'{"a":1}'):
+        with pytest.raises(ActionDescriptorError):
+            s.model_descriptor(at, request_record=record)
 
 
 def test_keyed_hashes_are_declared_but_refused_in_phase_1() -> None:
@@ -460,7 +462,6 @@ def test_owner_channel_approval_is_valid_for_its_action_only() -> None:
     other = s.write_descriptor(
         at,
         canonical_input='{"path":"workspace/out/x.txt"}',
-        resources=(TargetResource(path="workspace/out/x.txt", access=ResourceAccess.WRITE),),
     )
     assert ApprovalReason.WRONG_ACTION in _reasons(lambda: _check(signed, key, other.action_hash()))
 

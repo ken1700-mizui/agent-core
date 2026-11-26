@@ -98,9 +98,15 @@ class FieldSpec(FrozenModel):
     max_length: Annotated[int, Field(strict=True, ge=1, le=MAX_SCHEMA_BYTES)] | None = None
     minimum: Annotated[int, Field(strict=True, ge=-(2**63), le=2**63 - 1)] | None = None
     maximum: Annotated[int, Field(strict=True, ge=-(2**63), le=2**63 - 1)] | None = None
+    # WP09-R06: this argument names a resource the tool touches, with this access.
+    # The trusted descriptor builder derives the operation's targets from these
+    # arguments; a caller cannot state the targets itself.
+    resource: ResourceAccess | None = None
 
     @model_validator(mode="after")
     def _constraints_fit_type(self) -> Self:
+        if self.resource is not None and (self.type is not FieldType.STRING or not self.required):
+            raise ValueError("a resource argument is a required STRING field")
         if self.max_length is not None and self.type is not FieldType.STRING:
             raise ValueError("max_length applies to STRING fields only")
         if (self.minimum is not None or self.maximum is not None) and (
@@ -192,6 +198,11 @@ class ToolManifestBody(FrozenModel):
             raise ValueError("a READ_ONLY tool cannot declare writes")
         if (self.effect_class is ToolEffectClass.MODEL_CALL) != (self.kind is ToolKind.MODEL_CALL):
             raise ValueError("the MODEL_CALL effect belongs to MODEL_CALL tools only")
+        marked = {f.resource for f in self.input_schema.fields if f.resource is not None}
+        for access in {r.access for r in self.resources}:
+            if access not in marked:
+                # Without a resource argument the targets could not be derived (WP09-R06).
+                raise ValueError("each declared resource access needs a resource argument")
         return self
 
     @property

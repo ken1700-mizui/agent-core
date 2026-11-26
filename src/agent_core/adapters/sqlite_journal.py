@@ -26,10 +26,10 @@ Summary:
   event's runtime transitions (``sqlite_ledger.check_pairing``). Every append
   checks the pairing, so a transition that needs a ledger operation cannot be
   journaled without it, and vice versa. Ledger refusals roll everything back.
-- Schema version 3 adds the budget ledger (WP-09B) and the authority tables
-  (WP-09C: policy, grants, decisions, approvals, intents, permits, receipts,
-  stop state, epochs, deny list, mandatory audit). Older files are refused,
-  never migrated (Phase 1 files are synthetic test data).
+- Schema version 4 holds the budget ledger (WP-09B), the authority tables
+  (WP-09C) and, from the WP-09 limited fixes, the runtime mirror, price tables,
+  counter usage and split cost columns. Older files (versions 1-3) are refused,
+  never migrated or deleted (Phase 1 files are synthetic test data).
 - The database directory must be a trusted local directory (A 5.3).
 """
 
@@ -95,7 +95,7 @@ from agent_core.types.safety import (
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 3
+JOURNAL_SCHEMA_VERSION: Final = 4
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -313,6 +313,9 @@ class SqliteJournal:
         with self._write_transaction(conn) as cur:
             event, digest = self._position(cur, draft, expected)
             now = self._now()
+            # The runtime chain and Task limits first, so this event's own new
+            # entities are known to its ledger operations (WP09-R02, R06).
+            sqlite_ledger.mirror(cur, draft, now)
             for op in ops:
                 sqlite_ledger.apply_op(cur, op, now_ms=now, ctx=self._ledger_context())
             self._insert_event(cur, event, digest)

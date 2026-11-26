@@ -144,17 +144,20 @@ def test_activation_reserves_in_every_scope(st: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    ("amount", "cap", "required"),
-    [(99, 5_000, 100), (5_001, 5_000, 100)],
+    ("amount", "reason"),
+    [(299, "BELOW_REQUIRED"), (5_001, "ABOVE_COST_CAP")],
 )
 def test_amount_must_cover_the_required_and_stay_within_the_cost_cap(
-    st: Any, amount: int, cap: int, required: int
+    st: Any, amount: int, reason: str
 ) -> None:
-    _, _, attempt = _ready(st)
-    attempt = lw.allowed(st, attempt)
+    # The required amount is the costly tool's trusted manifest estimate (300).
+    step = lw.step_in(st)
+    scopes = lw.scopes_of(st.sm, step)
+    lw.caps(st, scopes)
+    attempt = lw.allowed(st, lw.fixed_attempt(st, step, scopes, costly=True))
     before = _head(st)
-    with pytest.raises(ReservationAmountError):
-        lw.reserve(st, attempt, amount, cap=cap, required=required)
+    with pytest.raises(ReservationAmountError, match=reason):
+        lw.reserve(st, attempt, amount)
     # Nothing stored: neither the journal event nor the ledger row changed.
     assert _head(st) == before
     assert st.sm.state.attempts[attempt.attempt_id].state is A.POLICY_ALLOWED
@@ -233,7 +236,7 @@ def test_reservation_ids_cannot_be_reused_or_moved(st: Any) -> None:
     other = st.sm.create_attempt(other_step)
     other = st.sm.advance_attempt(other, A.VALIDATED, w.evidence_for(other, A.VALIDATED))
     evidence = w.evidence_for(other, A.CONTENT_FIXED, reservation_id=attempt.reservation_id)
-    reuse = lw.allocate_op(other, lw.scopes_of(st.sm, other_step), lw.rsv(attempt))
+    reuse = lw.allocate_op(other, lw.rsv(attempt))
     # The runtime refuses it first (WP-04) ...
     with pytest.raises(TransitionPreconditionError):
         st.sm.advance_attempt(other, A.CONTENT_FIXED, evidence, ledger=(reuse,))
@@ -312,15 +315,12 @@ def test_bound_operations_need_their_transition(st: Any) -> None:
             other,
             A.VALIDATED,
             w.evidence_for(other, A.VALIDATED),
-            ledger=(
-                lw.allocate_op(other, lw.scopes_of(st.sm, other_step), b.new_id(ReservationId)),
-            ),
+            ledger=(lw.allocate_op(other, b.new_id(ReservationId)),),
         )
 
 
 def test_evidence_and_operation_must_name_the_same_reservation(st: Any) -> None:
     step = lw.step_in(st)
-    scopes = lw.scopes_of(st.sm, step)
     attempt = st.sm.create_attempt(step)
     attempt = st.sm.advance_attempt(attempt, A.VALIDATED, w.evidence_for(attempt, A.VALIDATED))
     evidence = w.evidence_for(attempt, A.CONTENT_FIXED, reservation_id=b.new_id(ReservationId))
@@ -329,7 +329,7 @@ def test_evidence_and_operation_must_name_the_same_reservation(st: Any) -> None:
             attempt,
             A.CONTENT_FIXED,
             evidence,
-            ledger=(lw.allocate_op(attempt, scopes, b.new_id(ReservationId)),),
+            ledger=(lw.allocate_op(attempt, b.new_id(ReservationId)),),
         )
 
 

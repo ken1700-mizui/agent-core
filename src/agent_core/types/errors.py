@@ -560,3 +560,10 @@ class PermitRejectedError(SafetyError):
     transaction is rolled back."""
 
     code = "PERMIT_REJECTED"
+
+
+class CostBasisMissingError(CostError):
+    """No trusted basis for the required amount (no installed price table, no
+    price for the model, or no recorded descriptor): nothing is reserved (WP09-R01)."""
+
+    code = "COST_BASIS_MISSING"

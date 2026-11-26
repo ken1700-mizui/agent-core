@@ -32,6 +32,7 @@ from agent_core.types.ledger import (
     ConfirmApproval,
     ConsumePermit,
     InstallPolicy,
+    InstallPriceTable,
     InstallRunGrant,
     IssuePermit,
     LedgerBatch,
@@ -44,7 +45,16 @@ from agent_core.types.ledger import (
     SetRunWindow,
 )
 from agent_core.types.records import Attempt, AttemptState, Run, Step
-from agent_core.types.safety import ActionDescriptor, ActionKind, Consumer, LedgerKeys, RunGrant
+from agent_core.types.safety import (
+    ActionContent,
+    ActionDescriptor,
+    Consumer,
+    LedgerKeys,
+    ModelContent,
+    RunGrant,
+    ToolContent,
+)
+from agent_core.types.tools import ToolRegistration
 from agent_core.types.transitions import ContentFixedEvidence, PolicyDecisionEvidence
 from agent_core.types.values import Budget, Currency
 from support import builders as b
@@ -90,13 +100,15 @@ class Setup:
     channel: OwnerApprovalChannel
     pep: PepInstanceId = field(default_factory=lambda: b.new_id(PepInstanceId))
     descriptors: dict[Any, ActionDescriptor] = field(default_factory=dict)
+    contents: dict[Any, ActionContent] = field(default_factory=dict)
+    registrations: dict[Any, ToolRegistration | None] = field(default_factory=dict)
     grants: dict[Any, RunGrant] = field(default_factory=dict)
 
     def owner(self, *ops: LedgerOp) -> None:
         batch = LedgerBatch(ops=ops)
         self.journal.apply_owner_ledger(batch, owner_mac=self.channel.sign_ledger(batch))
 
-    def reopen(self) -> Setup:
+    def reopen(self, *, verify: bool = True) -> Setup:
         """A restart: a new owner epoch and a new PEP instance."""
         if not self.journal.closed:
             self.journal.close()
@@ -109,21 +121,26 @@ class Setup:
             self.clock,
             self.channel,
             descriptors=self.descriptors,
+            contents=self.contents,
+            registrations=self.registrations,
             grants=self.grants,
         )
 
 
-def setup(tmp_path: Path, name: str = "journal.db") -> Setup:
+def setup(tmp_path: Path, name: str = "journal.db", *, price_table: bool = True) -> Setup:
     clock = ManualClock()
     keys = new_keys()
     path = tmp_path / name
     journal = open_journal(path, clock, keys)
     st = Setup(path, journal, w.machine(journal), keys, clock, OwnerApprovalChannel(keys.owner))
+    if price_table:
+        st.owner(InstallPriceTable(op="install_price_table", table=s.PRICE_TABLE))
     st.owner(InstallPolicy(op="install_policy", policy=s.policy()))
     return st
 
 
 def scopes_of(sm: RuntimeStateMachine, step: Step, experiment: Any = None) -> ReservationScopes:
+    """The scopes the ledger is expected to derive (the grant gets user, period, experiment)."""
     run = sm.state.runs[step.run_id]
     return ReservationScopes(
         tenant_id=b.TENANT,
@@ -136,8 +153,15 @@ def scopes_of(sm: RuntimeStateMachine, step: Step, experiment: Any = None) -> Re
     )
 
 
-def caps(st: Setup, scopes: ReservationScopes, micro: int = 10_000, **levels: int) -> None:
-    """Every budget level, the enforced counters and the run window (explicit values)."""
+def caps(
+    st: Setup,
+    scopes: ReservationScopes,
+    micro: int = 10_000,
+    **levels: int,
+) -> None:
+    """Every budget level, the enforced counters, the run window and the Run grant.
+    ``skip_task=True`` leaves the Task scope without an owner cap."""
+    skip_task = bool(levels.pop("skip_task", 0))
     ids = {
         BudgetScopeType.STEP: str(scopes.step_id),
         BudgetScopeType.RUN: str(scopes.run_id),
@@ -146,6 +170,8 @@ def caps(st: Setup, scopes: ReservationScopes, micro: int = 10_000, **levels: in
         BudgetScopeType.TENANT: str(scopes.tenant_id),
         BudgetScopeType.PERIOD: scopes.period_id,
     }
+    if skip_task:
+        del ids[BudgetScopeType.TASK]
     if scopes.experiment_id is not None:
         ids[BudgetScopeType.EXPERIMENT] = str(scopes.experiment_id)
     ops: list[LedgerOp] = [
@@ -157,16 +183,15 @@ def caps(st: Setup, scopes: ReservationScopes, micro: int = 10_000, **levels: in
         )
         for kind, scope_id in ids.items()
     ]
+    counter_scopes: list[tuple[CounterScope, str]] = [(BudgetScopeType.RUN, str(scopes.run_id))]
+    if not skip_task:
+        counter_scopes.append((BudgetScopeType.TASK, str(scopes.task_id)))
     for counter in (
         CounterKind.MODEL_CALLS,
         CounterKind.TOOL_CALLS,
         CounterKind.RETRIES,
         CounterKind.WORK_UNITS,
     ):
-        counter_scopes: tuple[tuple[CounterScope, str], ...] = (
-            (BudgetScopeType.RUN, str(scopes.run_id)),
-            (BudgetScopeType.TASK, str(scopes.task_id)),
-        )
         for kind, scope_id in counter_scopes:
             ops.append(
                 SetCounterCap(
@@ -186,7 +211,7 @@ def caps(st: Setup, scopes: ReservationScopes, micro: int = 10_000, **levels: in
             step_id=scopes.step_id,
             attempt_id=b.new_id(AttemptId),
         )
-        st.grants[scopes.run_id] = s.grant(at)
+        st.grants[scopes.run_id] = s.grant(at, experiment_id=scopes.experiment_id)
         ops.append(InstallRunGrant(op="install_run_grant", grant=st.grants[scopes.run_id]))
     st.owner(*ops)
 
@@ -196,16 +221,20 @@ def step_in(st: Setup, run: Run | None = None) -> Step:
     return w.step_in_progress(st.sm, run)
 
 
-def allocate_op(
-    attempt: Attempt, scopes: ReservationScopes, rsv: ReservationId
-) -> AllocateReservation:
+def run_for_task(st: Setup, *, budget: int = 5_000_000, caps: dict[str, int] | None = None) -> Run:
+    """A running Run of a new Task with the given Task budget and caps."""
+    task = st.sm.create_task(
+        goal_ref=b.digest("goal"),
+        done_criteria=(b.digest("criterion-0"),),
+        budget_total=xtu(budget),
+        caps_total=b.caps(**(caps or {})),
+    )
+    return w.running_run(st.sm, task)
+
+
+def allocate_op(attempt: Attempt, rsv: ReservationId) -> AllocateReservation:
     return AllocateReservation(
-        op="allocate",
-        reservation_id=rsv,
-        attempt_id=attempt.attempt_id,
-        scopes=scopes,
-        action_kind=ActionKind.TOOL_CALL,
-        ttl_ms=60_000,
+        op="allocate", reservation_id=rsv, attempt_id=attempt.attempt_id, ttl_ms=60_000
     )
 
 
@@ -222,34 +251,66 @@ def ref_of(st: Setup, attempt: Attempt) -> AttemptRef:
 
 
 def fixed_attempt(
-    st: Setup, step: Step, scopes: ReservationScopes, *, write: bool = False, **descriptor: Any
+    st: Setup,
+    step: Step,
+    scopes: ReservationScopes | None = None,
+    *,
+    write: bool = False,
+    costly: bool = False,
+    model: bool = False,
+    tamper: dict[str, Any] | None = None,
+    **descriptor: Any,
 ) -> Attempt:
     """PROPOSED -> VALIDATED -> CONTENT_FIXED: the reservation ID is allocated and the
-    ActionDescriptor (which contains it) is fixed (E 38.1)."""
+    ActionDescriptor (which contains it) is fixed (E 38.1). ``tamper`` changes the
+    fixed descriptor after it was built, keeping the original content."""
     attempt = st.sm.create_attempt(step)
     attempt = st.sm.advance_attempt(attempt, A.VALIDATED, w.evidence_for(attempt, A.VALIDATED))
     rsv = b.new_id(ReservationId)
-    build = s.write_descriptor if write else s.read_descriptor
     values: dict[str, Any] = {"reservation_id": rsv, "cost_cap": xtu(5_000)}
     values.update(descriptor)
-    fixed_descriptor = build(ref_of(st, attempt), **values)
-    st.descriptors[attempt.attempt_id] = fixed_descriptor
+    registration: ToolRegistration | None
+    content: ActionContent
+    if model:
+        built = s.model_descriptor(ref_of(st, attempt), **values)
+        record = values.get("request_record", s.MODEL_RECORD)
+        rendered = values.get("rendered_input", s.MODEL_RENDERED)
+        content = ModelContent(
+            kind="model", request_record=record.decode(), rendered_input=rendered.decode()
+        )
+        registration = None
+    else:
+        if write:
+            registration, default_input = s.WRITE_TOOL, '{"path":"workspace/out/r.txt"}'
+        elif costly:
+            registration, default_input = s.COSTLY_TOOL, '{"path":"workspace/a.txt"}'
+        else:
+            registration, default_input = s.READ_TOOL, '{"path":"workspace/a.txt"}'
+        values.setdefault("canonical_input", default_input)
+        values.setdefault("registration", registration)
+        built = s.read_descriptor(ref_of(st, attempt), **values)
+        content = ToolContent(kind="tool", canonical_input=values["canonical_input"])
+        registration = values["registration"]
+    if tamper:
+        built = built.model_copy(update=tamper)
+    st.descriptors[attempt.attempt_id] = built
+    st.contents[attempt.attempt_id] = content
+    st.registrations[attempt.attempt_id] = registration
     evidence = ContentFixedEvidence(
-        kind="content_fixed", action_hash=fixed_descriptor.action_hash(), reservation_id=rsv
+        kind="content_fixed", action_hash=built.action_hash(), reservation_id=rsv
     )
     return st.sm.advance_attempt(
-        attempt, A.CONTENT_FIXED, evidence, ledger=(allocate_op(attempt, scopes, rsv),)
+        attempt, A.CONTENT_FIXED, evidence, ledger=(allocate_op(attempt, rsv),)
     )
 
 
 def decision_op(st: Setup, attempt: Attempt, approval_required: bool) -> RecordDecision:
-    descriptor = st.descriptors[attempt.attempt_id]
-    registration = s.WRITE_TOOL if descriptor.tool == pin_of(s.WRITE_TOOL) else s.READ_TOOL
     return RecordDecision(
         op="record_decision",
         attempt_id=attempt.attempt_id,
-        descriptor=descriptor,
-        registration=registration,
+        descriptor=st.descriptors[attempt.attempt_id],
+        content=st.contents[attempt.attempt_id],
+        registration=st.registrations[attempt.attempt_id],
         approval_required=approval_required,
     )
 
@@ -459,15 +520,12 @@ def action_of(attempt: Attempt) -> str:
     return attempt.action_hash
 
 
-def activate_op(
-    attempt: Attempt, amount: int, cap: int = 5_000, required: int = 100
-) -> ActivateReservation:
+def activate_op(attempt: Attempt, amount: int, cap: int = 5_000) -> ActivateReservation:
     return ActivateReservation(
         op="activate",
         reservation_id=rsv(attempt),
         attempt_id=attempt.attempt_id,
         action_hash=action_of(attempt),
-        estimate=fixed(required),
         amount=xtu(amount),
         cost_cap=xtu(cap),
     )
@@ -484,3 +542,38 @@ def grant_only(st: Setup, scopes: ReservationScopes) -> None:
     )
     st.grants[scopes.run_id] = s.grant(at)
     st.owner(InstallRunGrant(op="install_run_grant", grant=st.grants[scopes.run_id]))
+
+
+def next_attempt(st: Setup, step: Step, previous: Attempt, **levels: int) -> Attempt:
+    """The next attempt of the same Run, in a new Step. The previous attempt ends
+    first (A.I4, WP04-R03) without releasing its reservation, so its hold stays."""
+    from agent_core.types.records import StepStatus
+
+    previous = st.sm.state.attempts[previous.attempt_id]
+    if previous.state is not A.ABORTED_BEFORE_DISPATCH:
+        abort(st, previous, release=False)
+    st.sm.set_step_status(st.sm.state.steps[step.step_id], StepStatus.CANCELLED)
+    other = step_in(st, st.sm.state.runs[step.run_id])
+    scopes = scopes_of(st.sm, other)
+    caps(st, scopes, **levels)
+    return fixed_attempt(st, other, scopes)
+
+
+_USAGE_EVENTS = iter(range(1, 1 << 30))
+
+
+def report(st: Setup, attempt: Attempt, usage: Any, *, final: bool = True) -> None:
+    from agent_core.types.ledger import ReportUsage
+
+    st.journal.apply_ledger(
+        (
+            ReportUsage(
+                op="report_usage",
+                reservation_id=rsv(attempt),
+                attempt_id=attempt.attempt_id,
+                usage_event_id=f"usage_{next(_USAGE_EVENTS)}",
+                usage=usage,
+                final=final,
+            ),
+        )
+    )

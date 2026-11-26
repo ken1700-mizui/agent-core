@@ -18,10 +18,12 @@ from agent_core.types.cost import (
     MICRO_PER_MTOK,
     FixedEstimate,
     ModelCallEstimate,
+    PriceTable,
     ReservationState,
 )
-from agent_core.types.errors import CostOverflowError, ReservationStateError
+from agent_core.types.errors import CostBasisMissingError, CostOverflowError, ReservationStateError
 from agent_core.types.model import CostStatus, Usage
+from agent_core.types.safety import ModelCostBasis, ToolCostBasis
 from agent_core.types.values import MAX_INT64
 
 R = ReservationState
@@ -102,3 +104,30 @@ def known_cost(usage: Usage) -> int | None:
 def check_transition(current: ReservationState, target: ReservationState) -> None:
     if target not in RESERVATION_TRANSITIONS[current]:
         raise ReservationStateError(f"{current.value}_TO_{target.value}")
+
+
+def required_for(basis: ToolCostBasis | ModelCostBasis, table: PriceTable | None) -> int:
+    """The trusted required amount of a descriptor's cost basis (WP09-R01).
+
+    A tool call: its manifest estimate. A model call: the owner's installed price
+    table (it must be the one the basis names) times the verified ceilings."""
+    if isinstance(basis, ToolCostBasis):
+        return _operand(basis.estimate.micro_units)
+    if not isinstance(basis, ModelCostBasis):
+        raise CostBasisMissingError("BASIS_INVALID")
+    if table is None or (table.price_table_id, table.version) != (
+        basis.price_table_id,
+        basis.price_table_version,
+    ):
+        raise CostBasisMissingError("PRICE_TABLE_MISSING")
+    item = table.item(basis.model_id)
+    if item is None:
+        raise CostBasisMissingError("MODEL_PRICE_MISSING")
+    return required_amount(
+        ModelCallEstimate(
+            kind="model",
+            price=item,
+            max_input_tokens=basis.max_input_tokens,
+            max_output_tokens=basis.max_output_tokens,
+        )
+    )

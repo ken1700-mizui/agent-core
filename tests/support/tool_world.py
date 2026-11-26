@@ -32,7 +32,13 @@ def body(**overrides: Any) -> ToolManifestBody:
         "kind": ToolKind.BUILTIN,
         "input_schema": ObjectSchema(
             fields=(
-                FieldSpec(name="path", type=FieldType.STRING, required=True, max_length=256),
+                FieldSpec(
+                    name="path",
+                    type=FieldType.STRING,
+                    required=True,
+                    max_length=256,
+                    resource=ResourceAccess.READ,
+                ),
                 FieldSpec(name="max_bytes", type=FieldType.INTEGER, required=False, maximum=65_536),
             ),
             max_bytes=1_024,
@@ -77,8 +83,22 @@ def catalog(*sealed: ToolManifest) -> TrustedToolCatalog:
     return TrustedToolCatalog(entries=tuple(entry(s) for s in sealed))
 
 
+def input_schema(access: ResourceAccess) -> ObjectSchema:
+    """The default input schema, its ``path`` argument naming a resource with ``access``."""
+    return ObjectSchema(
+        fields=(
+            FieldSpec(
+                name="path", type=FieldType.STRING, required=True, max_length=256, resource=access
+            ),
+            FieldSpec(name="max_bytes", type=FieldType.INTEGER, required=False, maximum=65_536),
+        ),
+        max_bytes=1_024,
+    )
+
+
 WRITE_BODY: dict[str, Any] = {
     "tool_id": "write_file",
+    "input_schema": input_schema(ResourceAccess.WRITE),
     "effect_class": ToolEffectClass.IRREVERSIBLE,
     "required_permissions": (ToolPermission.FILE_WRITE,),
     "resources": (ResourceSpec(path_pattern="workspace/**", access=ResourceAccess.WRITE),),

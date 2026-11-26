@@ -25,9 +25,11 @@ from typing import Annotated, Literal, Self
 from pydantic import Field, StringConstraints, model_validator
 
 from agent_core.types.base import FrozenModel
+from agent_core.types.cost import PeriodId
 from agent_core.types.ids import (
     ApprovalId,
     AttemptId,
+    ExperimentId,
     PepInstanceId,
     PermitId,
     ReceiptId,
@@ -39,14 +41,16 @@ from agent_core.types.ids import (
     TenantId,
     UserId,
 )
-from agent_core.types.model import ProfileRef, RequestHash
+from agent_core.types.model import ModelId, ProfileRef, RequestHash
 from agent_core.types.serialization import dump_json
 from agent_core.types.tools import ResourceAccess, ToolEffectClass, ToolId, ToolVersion
 from agent_core.types.values import (
     Budget,
     Digest,
     Epoch,
+    Identifier,
     PolicyVersion,
+    SemVer,
     TimestampMs,
     require_unique,
 )
@@ -188,6 +192,7 @@ class DenyReason(StrEnum):
     STOPPED = "STOPPED"
     STOP_STATE_INCONSISTENT = "STOP_STATE_INCONSISTENT"
     HASH_SCHEME_NOT_ALLOWED = "HASH_SCHEME_NOT_ALLOWED"
+    COST_BASIS_UNTRUSTED = "COST_BASIS_UNTRUSTED"
 
 
 class ApprovalReason(StrEnum):
@@ -243,6 +248,52 @@ class ModelTarget(FrozenModel):
     provider: ModelProviderKind
 
 
+class ToolCostBasis(FrozenModel):
+    """WP09-R01: a tool call's required amount is the trusted manifest's estimate."""
+
+    kind: Literal["tool"]
+    estimate: Budget
+
+
+class ModelCostBasis(FrozenModel):
+    """WP09-R01: a model call's required amount comes from the owner's installed
+    synthetic price table and ceilings verified from the request itself: the
+    rendered input's UTF-8 bytes (a conservative token ceiling; real token
+    counting is WP-14) and the request's ``max_output_tokens``."""
+
+    kind: Literal["model"]
+    price_table_id: Identifier
+    price_table_version: SemVer
+    model_id: ModelId
+    max_input_tokens: Annotated[int, Field(strict=True, ge=0, le=10_000_000)]
+    max_output_tokens: Annotated[int, Field(strict=True, ge=1, le=10_000_000)]
+
+
+CostBasis = Annotated[ToolCostBasis | ModelCostBasis, Field(discriminator="kind")]
+
+
+class ToolContent(FrozenModel):
+    """The actual tool arguments (canonical JSON) the descriptor was built from."""
+
+    kind: Literal["tool"]
+    canonical_input: Annotated[str, StringConstraints(strict=True, max_length=1_048_576)]
+
+
+class ModelContent(FrozenModel):
+    """The exact request record and rendered input (UTF-8 JSON) of a model call."""
+
+    kind: Literal["model"]
+    request_record: Annotated[
+        str, StringConstraints(strict=True, min_length=2, max_length=1_048_576)
+    ]
+    rendered_input: Annotated[
+        str, StringConstraints(strict=True, min_length=2, max_length=1_048_576)
+    ]
+
+
+ActionContent = Annotated[ToolContent | ModelContent, Field(discriminator="kind")]
+
+
 class Policy(FrozenModel):
     """The owner's static, versioned policy (C1 13: owner-edited file). No defaults:
     every limit is stated explicitly and is never an approved value by itself."""
@@ -256,6 +307,9 @@ class Policy(FrozenModel):
     model_providers: tuple[ModelProviderKind, ...]
     deny_resources: tuple[RelPath, ...]
     trusted_synthetic_workspaces: tuple[Digest, ...]
+    # The owner's installed synthetic price table every model call is priced with.
+    price_table_id: Identifier
+    price_table_version: SemVer
     max_permit_ttl_ms: Annotated[int, Field(strict=True, ge=1, le=600_000)]
     max_approval_ttl_ms: Annotated[int, Field(strict=True, ge=1, le=86_400_000)]
 
@@ -276,7 +330,10 @@ class RunGrant(FrozenModel):
 
     run_grant_id: RunGrantId
     tenant_id: TenantId
+    # Budget scopes come from the grant, never from the caller (WP09-R06).
     user_id: UserId
+    period_id: PeriodId
+    experiment_id: ExperimentId | None
     task_id: TaskId
     run_id: RunId
     tools: tuple[ToolPin, ...]
@@ -301,7 +358,8 @@ class RunGrant(FrozenModel):
 class ActionDescriptor(FrozenModel):
     """The normalized content of one operation (C1 7.1, E 38.1)."""
 
-    descriptor_version: Literal[1]
+    # Version 2 adds ``cost_basis`` (WP09-R01). Version 1 is not accepted.
+    descriptor_version: Literal[2]
     hash_scheme: HashScheme
     kind: ActionKind
     tenant_id: TenantId
@@ -321,6 +379,7 @@ class ActionDescriptor(FrozenModel):
     policy_version: PolicyVersion
     access_epoch: Epoch
     cost_cap: Budget
+    cost_basis: CostBasis
     reservation_id: ReservationId
     expires_at_ms: TimestampMs
 
@@ -331,11 +390,18 @@ class ActionDescriptor(FrozenModel):
                 raise ValueError("a tool call names a tool and no model request")
             if self.effect_class is ToolEffectClass.MODEL_CALL:
                 raise ValueError("a tool call is not a model call")
+            if not isinstance(self.cost_basis, ToolCostBasis):
+                raise ValueError("a tool call is priced by its manifest estimate")
         else:
             if self.model is None or self.tool is not None or self.request_hash is None:
                 raise ValueError("a model call names a model and its request hash")
             if self.effect_class is not ToolEffectClass.MODEL_CALL or self.target_resources:
                 raise ValueError("a model call has the MODEL_CALL effect and no resources")
+            if (
+                not isinstance(self.cost_basis, ModelCostBasis)
+                or self.cost_basis.model_id != self.model.profile.model_id
+            ):
+                raise ValueError("a model call is priced by the price table for its model")
         require_unique([(r.path, r.access) for r in self.target_resources], "target resources")
         return self
 
