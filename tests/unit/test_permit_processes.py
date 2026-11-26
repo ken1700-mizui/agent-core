@@ -106,3 +106,25 @@ def test_process_stop_inside_the_consumption_transaction(prepared: Any) -> None:
         assert st2.journal.verify_tenant(b.TENANT) is not None
     finally:
         st2.journal.close()
+
+
+def test_process_stop_right_after_the_start_is_an_unknown_outcome(prepared: Any) -> None:
+    st, attempt, _, _ = prepared
+    result = _run_child(st, "start-then-exit", attempt)
+    assert result.returncode == 0, result.stderr[-2000:]
+    assert "started" in result.stdout
+    st2 = st.reopen()
+    try:
+        started = st2.sm.state.attempts[attempt.attempt_id]
+        # The start is recorded; whether the operation ran is not known.
+        assert started.state is A.DISPATCH_STARTED
+        assert st2.journal.receipt_state(started.receipt_id) is ReceiptState.USED
+        assert st2.journal.reservation(attempt.reservation_id).state is R.ACTIVE
+        # It is never treated as not executed: no not-dispatched report, no release.
+        with pytest.raises(PermitRejectedError, match="ALREADY_STARTED"):
+            lw.gate(st2).not_dispatched_report(started)
+        st2.journal.apply_ledger((RecoverInFlight(op="recover_in_flight"),))
+        view = st2.journal.reservation(attempt.reservation_id)
+        assert (view.state, view.hold_micro) == (R.UNKNOWN, 1_000)
+    finally:
+        st2.journal.close()

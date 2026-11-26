@@ -1,0 +1,25 @@
+"""Ledger port (WP-09 limited fixes): what the runtime's execution gate needs
+from the budget and authority ledger. Implemented by the SQLite journal."""
+
+from __future__ import annotations
+
+from typing import Protocol, runtime_checkable
+
+from agent_core.types.ledger import LedgerBatch, LedgerOp
+from agent_core.types.safety import ActionDescriptor, Receipt, ReceiptState
+
+
+@runtime_checkable
+class LedgerPort(Protocol):
+    @property
+    def owner_epoch(self) -> int: ...
+
+    def receipt(self, receipt_id: str) -> Receipt | None: ...
+
+    def receipt_state(self, receipt_id: str) -> ReceiptState | None: ...
+
+    def recorded_descriptor(self, attempt_id: str) -> ActionDescriptor | None: ...
+
+    def apply_ledger(self, ledger: tuple[LedgerOp, ...]) -> None: ...
+
+    def apply_owner_ledger(self, batch: LedgerBatch, *, owner_mac: str) -> None: ...

@@ -41,11 +41,12 @@ from agent_core.types.ids import (
     RunId,
     TenantId,
 )
-from agent_core.types.model import Usage
 from agent_core.types.safety import (
     ActionContent,
     ActionDescriptor,
     Consumer,
+    ExecutionReport,
+    NotDispatchedReport,
     Permit,
     Policy,
     Receipt,
@@ -92,21 +93,24 @@ class ActivateReservation(FrozenModel):
 
 
 class MarkActive(FrozenModel):
-    """``DISPATCH_STARTED``: ``CONSUMED -> ACTIVE``."""
+    """``DISPATCH_STARTED``: the claimed receipt becomes USED once and the
+    reservation ``CONSUMED -> ACTIVE`` (WP09-R03). All live checks run again."""
 
     op: Literal["mark_active"]
     reservation_id: ReservationId
     attempt_id: AttemptId
+    receipt_id: ReceiptId
+    pep_instance_id: PepInstanceId
 
 
 class ReleaseReservation(FrozenModel):
-    """``ABORTED_BEFORE_DISPATCH``. From ``CONSUMED`` only with a live PEP's
-    not-dispatched report (E.Z6)."""
+    """``ABORTED_BEFORE_DISPATCH``. From ``CONSUMED`` only with the live gate's
+    MAC-signed, bound, unused not-dispatched report (E.Z6, WP09-R04)."""
 
     op: Literal["release"]
     reservation_id: ReservationId
     attempt_id: AttemptId
-    not_dispatched_ref: Digest | None
+    report: NotDispatchedReport | None
 
 
 class RecordDecision(FrozenModel):
@@ -165,27 +169,30 @@ class ConsumePermit(FrozenModel):
 
 
 class ClaimReceipt(FrozenModel):
-    """``DISPATCH_AUTHORIZED``: the receipt goes ``ISSUED -> CLAIMED`` once (E 3.2)."""
+    """``DISPATCH_AUTHORIZED``: the receipt goes ``ISSUED -> CLAIMED`` once (E 3.2).
+    ``content`` is the actual operation; the ledger rebuilds its descriptor and
+    compares it with the recorded one (arguments, targets, executable)."""
 
     op: Literal["claim_receipt"]
     receipt: Receipt
     pep_instance_id: PepInstanceId
-    actual_action_hash: Digest
+    content: ActionContent
+    registration: ToolRegistration | None
 
 
 # ---------------------------------------------------------------- standalone
 
 
 class ReportUsage(FrozenModel):
-    """This call's usage (never a replay's source usage). Deduplicated by
-    ``(reservation, usage_event_id)``."""
+    """The live gate's MAC-signed execution report of this call (never a replay's
+    source usage). Deduplicated by ``(reservation, usage_event_id)``. The ledger
+    derives the cost from the trusted basis (WP09-R04)."""
 
     op: Literal["report_usage"]
     reservation_id: ReservationId
     attempt_id: AttemptId
     usage_event_id: Identifier
-    usage: Usage
-    final: bool
+    report: ExecutionReport
 
 
 class MarkUnknown(FrozenModel):
@@ -387,6 +394,11 @@ LedgerOp = Annotated[
 
 
 class LedgerBatch(FrozenModel):
-    """Operations applied together (one transaction). Used for MACs and records."""
+    """Operations applied together (one transaction). Used for MACs and records.
 
+    ``owner_seq`` numbers owner batches: the ledger accepts only a number above the
+    last one it applied, so a signed batch can never be applied again (WP09-R05).
+    It is ignored for batches that are not owner batches."""
+
+    owner_seq: Annotated[int, Field(strict=True, ge=0, le=MAX_INT64)] = 0
     ops: Annotated[tuple[LedgerOp, ...], Field(min_length=1, max_length=64)]

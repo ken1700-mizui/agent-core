@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from agent_core.adapters.sqlite_journal import SqliteJournal
 from agent_core.adapters.system import OsRandomSource
+from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.safety.approval import OwnerApprovalChannel
 from agent_core.safety.descriptor import AttemptRef, pin_of
@@ -103,10 +104,17 @@ class Setup:
     contents: dict[Any, ActionContent] = field(default_factory=dict)
     registrations: dict[Any, ToolRegistration | None] = field(default_factory=dict)
     grants: dict[Any, RunGrant] = field(default_factory=dict)
+    # The owner's batch counter; shared across restarts like the owner's own record.
+    owner_seq: list[int] = field(default_factory=lambda: [0])
+
+    def signed(self, *ops: LedgerOp) -> tuple[LedgerBatch, str]:
+        self.owner_seq[0] += 1
+        batch = LedgerBatch(owner_seq=self.owner_seq[0], ops=ops)
+        return batch, self.channel.sign_ledger(batch)
 
     def owner(self, *ops: LedgerOp) -> None:
-        batch = LedgerBatch(ops=ops)
-        self.journal.apply_owner_ledger(batch, owner_mac=self.channel.sign_ledger(batch))
+        batch, mac = self.signed(*ops)
+        self.journal.apply_owner_ledger(batch, owner_mac=mac)
 
     def reopen(self, *, verify: bool = True) -> Setup:
         """A restart: a new owner epoch and a new PEP instance."""
@@ -124,17 +132,27 @@ class Setup:
             contents=self.contents,
             registrations=self.registrations,
             grants=self.grants,
+            owner_seq=self.owner_seq,
         )
 
 
-def setup(tmp_path: Path, name: str = "journal.db", *, price_table: bool = True) -> Setup:
+def setup(
+    tmp_path: Path,
+    name: str = "journal.db",
+    *,
+    price_table: bool = True,
+    final_usage_is_complete: bool = True,
+) -> Setup:
     clock = ManualClock()
     keys = new_keys()
     path = tmp_path / name
     journal = open_journal(path, clock, keys)
     st = Setup(path, journal, w.machine(journal), keys, clock, OwnerApprovalChannel(keys.owner))
     if price_table:
-        st.owner(InstallPriceTable(op="install_price_table", table=s.PRICE_TABLE))
+        table = s.PRICE_TABLE.model_copy(
+            update={"final_usage_is_complete": final_usage_is_complete}
+        )
+        st.owner(InstallPriceTable(op="install_price_table", table=table))
     st.owner(InstallPolicy(op="install_policy", policy=s.policy()))
     return st
 
@@ -368,24 +386,6 @@ def reserve(st: Setup, attempt: Attempt, amount: int = 1_000, **kw: Any) -> Atte
     )
 
 
-def abort(st: Setup, attempt: Attempt, *, release: bool) -> Attempt:
-    """ABORTED_BEFORE_DISPATCH, releasing the reservation only when asked."""
-    from agent_core.types.ledger import ReleaseReservation
-
-    ops: tuple[LedgerOp, ...] = ()
-    if release and attempt.reservation_id is not None:
-        ops = (
-            ReleaseReservation(
-                op="release",
-                reservation_id=attempt.reservation_id,
-                attempt_id=attempt.attempt_id,
-                not_dispatched_ref=None,
-            ),
-        )
-    evidence = w.evidence_for(attempt, A.ABORTED_BEFORE_DISPATCH, not_dispatched_ref=None)
-    return st.sm.advance_attempt(attempt, A.ABORTED_BEFORE_DISPATCH, evidence, ledger=ops)
-
-
 def end_run(st: Setup, run: Run) -> Run:
     """Finish a Run as FAILED (synthetic termination) after its attempts are final."""
     from agent_core.types.records import RunStatus, StepStatus
@@ -453,61 +453,12 @@ def consume(
     return st.sm.advance_attempt(attempt, A.PERMIT_CONSUMED, evidence, ledger=(op,))
 
 
-def claim_op(st: Setup, attempt: Attempt, **overrides: Any) -> ClaimReceipt:
-    assert attempt.receipt_id is not None
-    receipt = st.journal.receipt(attempt.receipt_id)
-    assert receipt is not None
-    values: dict[str, Any] = {
-        "op": "claim_receipt",
-        "receipt": receipt,
-        "pep_instance_id": st.pep,
-        "actual_action_hash": action_of(attempt),
-    }
-    values.update(overrides)
-    return ClaimReceipt(**values)
-
-
-def claim(st: Setup, attempt: Attempt, op: ClaimReceipt | None = None) -> Attempt:
-    op = op if op is not None else claim_op(st, attempt)
-    evidence = w.evidence_for(attempt, A.DISPATCH_AUTHORIZED)
-    return st.sm.advance_attempt(attempt, A.DISPATCH_AUTHORIZED, evidence, ledger=(op,))
-
-
-def start(st: Setup, attempt: Attempt) -> Attempt:
-    from agent_core.types.ledger import MarkActive
-
-    op = MarkActive(op="mark_active", reservation_id=rsv(attempt), attempt_id=attempt.attempt_id)
-    evidence = w.evidence_for(attempt, A.DISPATCH_STARTED)
-    return st.sm.advance_attempt(attempt, A.DISPATCH_STARTED, evidence, ledger=(op,))
-
-
-def issued(st: Setup, step: Step, *, write: bool = False) -> Attempt:
+def issued(st: Setup, step: Step, *, write: bool = False, costly: bool = False) -> Attempt:
     """A fresh attempt up to PERMIT_ISSUED through the real path."""
     scopes = scopes_of(st.sm, step)
     caps(st, scopes)
-    attempt = reserve(st, fixed_attempt(st, step, scopes, write=write), 1_000)
+    attempt = reserve(st, fixed_attempt(st, step, scopes, write=write, costly=costly), 1_000)
     return issue(st, intent(st, attempt))
-
-
-def dispatched(st: Setup, step: Step) -> Attempt:
-    """A dispatched attempt through the real ledger path (WP-09B/C)."""
-    return start(st, claim(st, consume(st, issued(st, step))))
-
-
-def completed_scenario(st: Setup) -> Any:
-    """A Task with one completed Run (synthetic), touching every entity kind."""
-    from agent_core.types.records import RunStatus, StepStatus, TaskStatus
-
-    the_task = w.task(st.sm)
-    run = w.running_run(st.sm, the_task)
-    step = w.step_in_progress(st.sm, run)
-    attempt = dispatched(st, step)
-    st.sm.advance_attempt(attempt, A.COMPLETED, w.evidence_for(attempt, A.COMPLETED))
-    st.sm.set_step_status(st.sm.state.steps[step.step_id], StepStatus.COMMITTED)
-    verifying = st.sm.set_run_status(st.sm.state.runs[run.run_id], RunStatus.VERIFYING)
-    st.sm.set_run_status(verifying, RunStatus.COMPLETED, w.passing_verification(the_task))
-    st.sm.set_task_status(st.sm.state.tasks[the_task.task_id], TaskStatus.COMPLETED)
-    return the_task
 
 
 def rsv(attempt: Attempt) -> ReservationId:
@@ -550,7 +501,7 @@ def next_attempt(st: Setup, step: Step, previous: Attempt, **levels: int) -> Att
     from agent_core.types.records import StepStatus
 
     previous = st.sm.state.attempts[previous.attempt_id]
-    if previous.state is not A.ABORTED_BEFORE_DISPATCH:
+    if previous.state not in (A.ABORTED_BEFORE_DISPATCH, A.COMPLETED, A.FAILED_DEFINITE):
         abort(st, previous, release=False)
     st.sm.set_step_status(st.sm.state.steps[step.step_id], StepStatus.CANCELLED)
     other = step_in(st, st.sm.state.runs[step.run_id])
@@ -562,7 +513,124 @@ def next_attempt(st: Setup, step: Step, previous: Attempt, **levels: int) -> Att
 _USAGE_EVENTS = iter(range(1, 1 << 30))
 
 
-def report(st: Setup, attempt: Attempt, usage: Any, *, final: bool = True) -> None:
+def gate(st: Setup) -> SyntheticExecutionGate:
+    return SyntheticExecutionGate(
+        runtime=st.sm, ledger=st.journal, keys=st.keys, pep_instance_id=st.pep, clock=st.clock
+    )
+
+
+def actual(st: Setup, attempt: Attempt) -> dict[str, Any]:
+    """The actual operation of an attempt, as the gate needs it."""
+    return {
+        "content": st.contents[attempt.attempt_id],
+        "registration": st.registrations[attempt.attempt_id],
+    }
+
+
+def claim_op(st: Setup, attempt: Attempt, **overrides: Any) -> ClaimReceipt:
+    assert attempt.receipt_id is not None
+    receipt = st.journal.receipt(attempt.receipt_id)
+    assert receipt is not None
+    values: dict[str, Any] = {
+        "op": "claim_receipt",
+        "receipt": receipt,
+        "pep_instance_id": st.pep,
+        **actual(st, attempt),
+    }
+    values.update(overrides)
+    return ClaimReceipt(**values)
+
+
+def claim(st: Setup, attempt: Attempt, op: ClaimReceipt | None = None) -> Attempt:
+    """A claim through the runtime directly (the ledger checks it the same way)."""
+    op = op if op is not None else claim_op(st, attempt)
+    evidence = w.evidence_for(attempt, A.DISPATCH_AUTHORIZED)
+    return st.sm.advance_attempt(attempt, A.DISPATCH_AUTHORIZED, evidence, ledger=(op,))
+
+
+def start(st: Setup, attempt: Attempt) -> Attempt:
+    return gate(st).start(attempt)[0]
+
+
+def dispatched(st: Setup, step: Step) -> Attempt:
+    """A dispatched attempt through the real ledger path and the gate."""
+    attempt = consume(st, issued(st, step))
+    g = gate(st)
+    return g.start(g.claim(attempt, **actual(st, attempt)))[0]
+
+
+def zero_usage() -> Any:
+    from agent_core.types.model import CostStatus, Usage, UsageStatus
+
+    return Usage(
+        status=UsageStatus.FINAL,
+        input_tokens=0,
+        output_tokens=0,
+        total_tokens=0,
+        cost=None,
+        cost_status=CostStatus.UNKNOWN,
+        synthetic=True,
+    )
+
+
+def completed_scenario(st: Setup) -> Any:
+    """A Task with one completed Run (synthetic), touching every entity kind."""
+    from agent_core.types.records import RunStatus, StepStatus, TaskStatus
+
+    the_task = w.task(st.sm)
+    run = w.running_run(st.sm, the_task)
+    step = w.step_in_progress(st.sm, run)
+    attempt = dispatched(st, step)
+    gate(st).finish(attempt, SyntheticResult(outcome="COMPLETED", usage=zero_usage(), final=True))
+    st.sm.set_step_status(st.sm.state.steps[step.step_id], StepStatus.COMMITTED)
+    verifying = st.sm.set_run_status(st.sm.state.runs[run.run_id], RunStatus.VERIFYING)
+    st.sm.set_run_status(verifying, RunStatus.COMPLETED, w.passing_verification(the_task))
+    st.sm.set_task_status(st.sm.state.tasks[the_task.task_id], TaskStatus.COMPLETED)
+    return the_task
+
+
+def abort(st: Setup, attempt: Attempt, *, release: bool) -> Attempt:
+    """ABORTED_BEFORE_DISPATCH before consumption, releasing only when asked."""
+    from agent_core.types.ledger import ReleaseReservation
+
+    ops: tuple[LedgerOp, ...] = ()
+    if release and attempt.reservation_id is not None:
+        ops = (
+            ReleaseReservation(
+                op="release",
+                reservation_id=attempt.reservation_id,
+                attempt_id=attempt.attempt_id,
+                report=None,
+            ),
+        )
+    evidence = w.evidence_for(attempt, A.ABORTED_BEFORE_DISPATCH, not_dispatched_ref=None)
+    return st.sm.advance_attempt(attempt, A.ABORTED_BEFORE_DISPATCH, evidence, ledger=ops)
+
+
+def abort_with(st: Setup, attempt: Attempt, report: Any) -> Attempt:
+    """ABORTED_BEFORE_DISPATCH with a given not-dispatched report."""
+    from agent_core.safety.reports import report_ref
+    from agent_core.types.ledger import ReleaseReservation
+    from agent_core.types.transitions import AbortEvidence, AbortReason
+
+    op = ReleaseReservation(
+        op="release", reservation_id=rsv(attempt), attempt_id=attempt.attempt_id, report=report
+    )
+    evidence = AbortEvidence(
+        kind="abort", reason=AbortReason.STOPPED, not_dispatched_ref=report_ref(report)
+    )
+    return st.sm.advance_attempt(attempt, A.ABORTED_BEFORE_DISPATCH, evidence, ledger=(op,))
+
+
+def report(st: Setup, attempt: Attempt, usage: Any, *, final: bool = True) -> Attempt:
+    """The gate's outcome of a started attempt, with this call's usage."""
+    return gate(st).finish(attempt, SyntheticResult(outcome="COMPLETED", usage=usage, final=final))
+
+
+_USAGE_EVENTS = iter(range(1, 1 << 30))
+
+
+def report_with(st: Setup, attempt: Attempt, execution_report: Any) -> None:
     from agent_core.types.ledger import ReportUsage
 
     st.journal.apply_ledger(
@@ -572,8 +640,36 @@ def report(st: Setup, attempt: Attempt, usage: Any, *, final: bool = True) -> No
                 reservation_id=rsv(attempt),
                 attempt_id=attempt.attempt_id,
                 usage_event_id=f"usage_{next(_USAGE_EVENTS)}",
-                usage=usage,
-                final=final,
+                report=execution_report,
             ),
         )
     )
+
+
+def stop_op(kind: Any, scope_id: str) -> Any:
+    from agent_core.types.ledger import StopScope
+
+    return StopScope(op="stop_scope", scope_type=kind, scope_id=scope_id)
+
+
+def raw_apply(st: Setup, op: Any) -> None:
+    """Apply one operation at the ledger level only (no pairing, no runtime), in a
+    rolled-back transaction on a second connection: shows the ledger's own check."""
+    import sqlite3
+
+    from agent_core.adapters import sqlite_ledger
+
+    conn = sqlite3.connect(st.path, isolation_level=None)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            sqlite_ledger.apply_op(
+                conn.cursor(),
+                op,
+                now_ms=st.clock.now,
+                ctx=sqlite_ledger.LedgerContext(keys=st.keys, owner_epoch=st.journal.owner_epoch),
+            )
+        finally:
+            conn.execute("ROLLBACK")
+    finally:
+        conn.close()

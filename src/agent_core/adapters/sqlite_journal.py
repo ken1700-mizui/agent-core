@@ -26,10 +26,13 @@ Summary:
   event's runtime transitions (``sqlite_ledger.check_pairing``). Every append
   checks the pairing, so a transition that needs a ledger operation cannot be
   journaled without it, and vice versa. Ledger refusals roll everything back.
-- Schema version 4 holds the budget ledger (WP-09B), the authority tables
+- Schema version 5 holds the budget ledger (WP-09B), the authority tables
   (WP-09C) and, from the WP-09 limited fixes, the runtime mirror, price tables,
-  counter usage and split cost columns. Older files (versions 1-3) are refused,
-  never migrated or deleted (Phase 1 files are synthetic test data).
+  counter usage, split cost columns, used not-dispatched reports, the ledger
+  clock high-water mark and the owner batch sequence. Older files (versions
+  1-4) are refused, never migrated or deleted (Phase 1 files are synthetic).
+- Every write transaction uses the ledger's effective time: never earlier than
+  a time it already used, so a wall clock moving back extends nothing.
 - The database directory must be a trusted local directory (A 5.3).
 """
 
@@ -83,8 +86,8 @@ from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import RunId, TenantId
 from agent_core.types.ledger import LedgerBatch, LedgerOp
 from agent_core.types.safety import (
+    ActionDescriptor,
     AuditView,
-    DispatchAuthorization,
     LedgerKeys,
     Permit,
     PermitState,
@@ -95,7 +98,7 @@ from agent_core.types.safety import (
 from agent_core.types.serialization import dump_json, load_json
 from agent_core.types.values import MAX_INT64
 
-JOURNAL_SCHEMA_VERSION: Final = 4
+JOURNAL_SCHEMA_VERSION: Final = 5
 # "ACJ1" in ASCII: marks the file as an Agent Core journal (PRAGMA application_id).
 APPLICATION_ID: Final = 0x41434A31
 # Only P1 writes (OS lock), so waits come only from short external readers.
@@ -312,7 +315,7 @@ class SqliteJournal:
         sqlite_ledger.check_pairing(draft, ops)
         with self._write_transaction(conn) as cur:
             event, digest = self._position(cur, draft, expected)
-            now = self._now()
+            now = sqlite_ledger.effective_now(cur, self._now())
             # The runtime chain and Task limits first, so this event's own new
             # entities are known to its ledger operations (WP09-R02, R06).
             sqlite_ledger.mirror(cur, draft, now)
@@ -352,7 +355,7 @@ class SqliteJournal:
             raise JournalArgumentError("no ledger operations")
         sqlite_ledger.check_standalone(ops)
         with self._write_transaction(conn) as cur:
-            now = self._now()
+            now = sqlite_ledger.effective_now(cur, self._now())
             for op in ops:
                 sqlite_ledger.apply_op(cur, op, now_ms=now, ctx=self._ledger_context())
 
@@ -367,7 +370,8 @@ class SqliteJournal:
             raise OwnerAuthorizationError("OWNER_MAC")
         sqlite_ledger.check_owner_ops(batch.ops)
         with self._write_transaction(conn) as cur:
-            now = self._now()
+            sqlite_ledger.check_owner_seq(cur, batch.owner_seq)
+            now = sqlite_ledger.effective_now(cur, self._now())
             for op in batch.ops:
                 sqlite_ledger.apply_op(cur, op, now_ms=now, ctx=self._ledger_context())
 
@@ -423,20 +427,10 @@ class SqliteJournal:
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.read_approval_uses(cur, str(approval_id))
 
-    def verify_dispatch(
-        self, receipt_id: str, *, pep_instance_id: str, action_hash: str
-    ) -> DispatchAuthorization:
-        """For a PEP right before it acts (WP-08): the claimed receipt must still
-        match the trusted record, the stop state and the revocation generation."""
+    def recorded_descriptor(self, attempt_id: str) -> ActionDescriptor | None:
+        """The descriptor the ledger recorded for an attempt (its trusted content)."""
         with self._read_transaction(self._require_open()) as cur:
-            return sqlite_ledger.verify_dispatch(
-                cur,
-                str(receipt_id),
-                pep_instance_id=str(pep_instance_id),
-                action_hash=str(action_hash),
-                now_ms=self._now(),
-                ctx=self._ledger_context(),
-            )
+            return sqlite_ledger.read_descriptor(cur, str(attempt_id))
 
     @contextmanager
     def _write_transaction(self, conn: sqlite3.Connection) -> Iterator[sqlite3.Cursor]:

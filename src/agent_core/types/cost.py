@@ -89,6 +89,9 @@ class PriceTable(FrozenModel):
     version: SemVer
     status: Literal["test"]
     items: tuple[tuple[ModelId, PriceItem], ...]
+    # The synthetic BillingScheme (E 4.2): whether a final usage report means no
+    # further charge. Without it the hold stays until reconciled (WP09-R04).
+    final_usage_is_complete: bool
 
     def item(self, model_id: str) -> PriceItem | None:
         for name, item in self.items:

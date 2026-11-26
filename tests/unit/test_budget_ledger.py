@@ -12,6 +12,7 @@ import pytest
 
 from agent_core.adapters import sqlite_ledger
 from agent_core.adapters.replay_model import REPLAY_USAGE
+from agent_core.runtime.execution_gate import SyntheticResult
 from agent_core.types.cost import (
     BudgetScopeType,
     CounterKind,
@@ -28,6 +29,7 @@ from agent_core.types.errors import (
     LedgerKeyMissingError,
     LedgerPairingError,
     OwnerAuthorizationError,
+    PermitRejectedError,
     ReservationAmountError,
     ReservationExpiredError,
     ReservationMismatchError,
@@ -38,14 +40,11 @@ from agent_core.types.errors import (
 from agent_core.types.ids import (
     AttemptId,
     ExperimentId,
-    PermitId,
-    ReceiptId,
     ReservationId,
     RunGrantId,
 )
 from agent_core.types.ledger import (
     LedgerBatch,
-    MarkActive,
     MarkUnknown,
     Reconcile,
     RecoverInFlight,
@@ -100,12 +99,17 @@ def _head(st: Any) -> Any:
     return st.journal.head(b.TENANT)
 
 
-def _usage(micro: int | None, *, status: UsageStatus = UsageStatus.FINAL) -> Usage:
+def _usage(
+    micro: int | None,
+    *,
+    status: UsageStatus = UsageStatus.FINAL,
+    tokens: tuple[int, int] = (10, 5),
+) -> Usage:
     return Usage(
         status=status,
-        input_tokens=10 if status is not UsageStatus.UNKNOWN else None,
-        output_tokens=5 if status is not UsageStatus.UNKNOWN else None,
-        total_tokens=15 if status is UsageStatus.FINAL else None,
+        input_tokens=tokens[0] if status is not UsageStatus.UNKNOWN else None,
+        output_tokens=tokens[1] if status is not UsageStatus.UNKNOWN else None,
+        total_tokens=sum(tokens) if status is UsageStatus.FINAL else None,
         cost=None if micro is None else lw.xtu(micro),
         cost_status=CostStatus.UNKNOWN if micro is None else CostStatus.FINAL,
         synthetic=True,
@@ -447,167 +451,104 @@ class _Raw:
     def view(self, rsv: Any) -> Any:
         return sqlite_ledger.read_reservation(self.conn.cursor(), rsv)
 
-    def consume(self, attempt: Any) -> None:
-        self.tx(
-            lambda cur: sqlite_ledger.consume_reservation(
-                cur,
-                reservation_id=attempt.reservation_id,
-                attempt_id=attempt.attempt_id,
-                action_hash=attempt.action_hash,
-                permit_id=b.new_id(PermitId),
-                receipt_id=b.new_id(ReceiptId),
-            )
-        )
+
+# ---------------------------------------------------------------- after consumption (trusted path)
+# Usage and releases come only from the gate's MAC-signed reports (WP09-R04), so
+# these tests drive the journal and the gate instead of raw ledger rows.
 
 
-@pytest.fixture
-def consumed(st: Any) -> Any:
-    _step, scopes, attempt = _ready(st)
-    attempt = lw.reserve(st, attempt, 1_000)
-    st.journal.close()
-    raw = _Raw(st.path)
-    raw.consume(attempt)
-    yield raw, attempt, scopes
-    raw.conn.close()
+def _started(st: Any, *, model: bool = False, costly: bool = False, amount: int = 1_000) -> Any:
+    step = lw.step_in(st)
+    scopes = lw.scopes_of(st.sm, step)
+    lw.caps(st, scopes, micro=100_000)
+    attempt = lw.fixed_attempt(st, step, scopes, model=model, costly=costly)
+    attempt = lw.consume(st, lw.issue(st, lw.intent(st, lw.reserve(st, attempt, amount))))
+    gate = lw.gate(st)
+    started, _ = gate.start(gate.claim(attempt, **lw.actual(st, attempt)))
+    return gate, started, scopes
 
 
-def _ops(attempt: Any) -> dict[str, Any]:
-    ids = {"reservation_id": attempt.reservation_id, "attempt_id": attempt.attempt_id}
-    return {
-        "active": MarkActive(op="mark_active", **ids),
-        "unknown": MarkUnknown(op="mark_unknown", **ids),
-        "release": ReleaseReservation(op="release", not_dispatched_ref=None, **ids),
-    }
+def _result(usage: Usage, final: bool = True) -> SyntheticResult:
+    return SyntheticResult(outcome="COMPLETED", usage=usage, final=final)
 
 
-def test_final_known_usage_releases_the_rest_and_keeps_the_spent_cost(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["active"])
-    raw.op(
-        ReportUsage(
-            op="report_usage",
-            reservation_id=attempt.reservation_id,
-            attempt_id=attempt.attempt_id,
-            usage_event_id="u1",
-            usage=_usage(300),
-            final=True,
-        )
-    )
-    view = raw.view(attempt.reservation_id)
+def test_final_known_usage_releases_the_rest_and_keeps_the_spent_cost(st: Any) -> None:
+    gate, attempt, _ = _started(st, costly=True)
+    gate.finish(attempt, _result(_usage(300)))
+    view = st.journal.reservation(attempt.reservation_id)
     assert view.state is R.USAGE_REPORTED
     assert (view.hold_micro, view.spent_micro) == (0, 300)
 
 
-@pytest.mark.parametrize("usage", [_usage(None), _usage(300, status=UsageStatus.PARTIAL)])
-def test_unknown_or_partial_usage_keeps_the_hold(consumed: Any, usage: Usage) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["active"])
-    raw.op(
-        ReportUsage(
-            op="report_usage",
-            reservation_id=attempt.reservation_id,
-            attempt_id=attempt.attempt_id,
-            usage_event_id="u1",
-            usage=usage,
-            final=True,
-        )
-    )
-    view = raw.view(attempt.reservation_id)
+@pytest.mark.parametrize("status", [UsageStatus.UNKNOWN, UsageStatus.PARTIAL])
+def test_unknown_or_partial_usage_keeps_the_hold(st: Any, status: UsageStatus) -> None:
+    gate, attempt, _ = _started(st, model=True, amount=5_000)
+    gate.finish(attempt, _result(_usage(None, status=status)))
+    view = st.journal.reservation(attempt.reservation_id)
     assert view.state is R.UNKNOWN
-    assert view.hold_micro == 1_000
+    assert view.hold_micro == 5_000
     assert view.spent_known is False
 
 
-def test_not_final_usage_is_not_a_final_cost(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["active"])
-    raw.op(
-        ReportUsage(
-            op="report_usage",
-            reservation_id=attempt.reservation_id,
-            attempt_id=attempt.attempt_id,
-            usage_event_id="u1",
-            usage=_usage(300),
-            final=False,
-        )
-    )
-    view = raw.view(attempt.reservation_id)
+def test_not_final_usage_is_not_a_final_cost(st: Any) -> None:
+    gate, attempt, _ = _started(st, costly=True)
+    gate.finish(attempt, _result(_usage(300), final=False))
+    view = st.journal.reservation(attempt.reservation_id)
     assert view.state is R.UNKNOWN
     assert view.hold_micro == 1_000
     assert view.spent_lower_micro == 300
 
 
-def test_duplicate_usage_reports_are_refused(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["active"])
-    report = ReportUsage(
+def test_duplicate_usage_reports_are_refused(st: Any) -> None:
+    gate, attempt, _ = _started(st, costly=True)
+    report = gate.execution_report(attempt, _result(_usage(300)))
+    op = ReportUsage(
         op="report_usage",
         reservation_id=attempt.reservation_id,
         attempt_id=attempt.attempt_id,
         usage_event_id="u1",
-        usage=_usage(300),
-        final=True,
+        report=report,
     )
-    raw.op(report)
+    st.journal.apply_ledger((op,))
     with pytest.raises((DuplicateUsageReportError, ReservationStateError)):
-        raw.op(report)
-    assert raw.view(attempt.reservation_id).spent_micro == 300
+        st.journal.apply_ledger((op,))
+    assert st.journal.reservation(attempt.reservation_id).spent_micro == 300
 
 
-def test_replayed_calls_report_this_calls_zero_usage(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["active"])
-    raw.op(
-        ReportUsage(
-            op="report_usage",
-            reservation_id=attempt.reservation_id,
-            attempt_id=attempt.attempt_id,
-            usage_event_id="u1",
-            usage=REPLAY_USAGE,
-            final=True,
-        )
-    )
-    view = raw.view(attempt.reservation_id)
+def test_replayed_calls_report_this_calls_zero_usage(st: Any) -> None:
+    gate, attempt, _ = _started(st, model=True, amount=5_000)
+    gate.finish(attempt, _result(REPLAY_USAGE))
+    view = st.journal.reservation(attempt.reservation_id)
     assert (view.state, view.hold_micro, view.spent_micro) == (R.USAGE_REPORTED, 0, 0)
     assert "source_usage" not in ReportUsage.model_fields
 
 
-def test_overrun_is_recorded_in_full_and_stops_new_reservations(consumed: Any, st: Any) -> None:
-    raw, attempt, scopes = consumed
-    raw.op(_ops(attempt)["active"])
-    raw.op(
-        ReportUsage(
-            op="report_usage",
-            reservation_id=attempt.reservation_id,
-            attempt_id=attempt.attempt_id,
-            usage_event_id="u1",
-            usage=_usage(1_700),
-            final=True,
+def test_overrun_is_recorded_in_full_and_stops_new_reservations(st: Any) -> None:
+    gate, attempt, scopes = _started(st, model=True, amount=5_000)
+    # 2,000 input and 1,000 output tokens at the test prices: 2,000 + 4,000 = 6,000.
+    gate.finish(attempt, _result(_usage(None, tokens=(2_000, 1_000))))
+    view = st.journal.reservation(attempt.reservation_id)
+    assert view.spent_micro == 6_000  # the actual amount, beyond the reservation
+    kinds = [e.kind for e in st.journal.ledger_entries(attempt.reservation_id)]
+    assert "OVERRUN" in kinds
+    another = lw.next_attempt(st, st.sm.state.steps[scopes.step_id], attempt, micro=100_000)
+    with pytest.raises(BudgetBlockedError):
+        lw.reserve(st, another, 100)
+
+
+def test_unknown_outcome_holds_until_reconciled(st: Any) -> None:
+    _, attempt, _ = _started(st)
+    st.journal.apply_ledger(
+        (
+            MarkUnknown(
+                op="mark_unknown",
+                reservation_id=attempt.reservation_id,
+                attempt_id=attempt.attempt_id,
+            ),
         )
     )
-    view = raw.view(attempt.reservation_id)
-    assert view.spent_micro == 1_700  # the actual amount, beyond the reservation
-    kinds = [e.kind for e in sqlite_ledger.read_entries(raw.conn.cursor(), attempt.reservation_id)]
-    assert "OVERRUN" in kinds
-    raw.conn.close()
-    st2 = st.reopen()
-    try:
-        step = st2.sm.state.steps[scopes.step_id]
-        another = _next_step_attempt(st2, step, attempt)
-        with pytest.raises(BudgetBlockedError):
-            lw.reserve(st2, another, 100)
-    finally:
-        st2.journal.close()
-    raw.conn = sqlite3.connect(st.path, isolation_level=None)
-
-
-def test_unknown_outcome_holds_until_reconciled(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["unknown"])
-    assert raw.view(attempt.reservation_id).hold_micro == 1_000
-    with pytest.raises(ReservationStateError):
-        raw.op(_ops(attempt)["release"])
-    raw.op(
+    assert st.journal.reservation(attempt.reservation_id).hold_micro == 1_000
+    st.owner(
         Reconcile(
             op="reconcile",
             reservation_id=attempt.reservation_id,
@@ -615,36 +556,29 @@ def test_unknown_outcome_holds_until_reconciled(consumed: Any) -> None:
             evidence_ref=b.digest("synthetic-reconciliation"),
         )
     )
-    view = raw.view(attempt.reservation_id)
+    view = st.journal.reservation(attempt.reservation_id)
     assert (view.state, view.hold_micro, view.spent_micro) == (R.RECONCILED, 0, 250)
 
 
-def test_consumed_is_released_only_with_a_not_dispatched_report(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    with pytest.raises(ReservationStateError):
-        raw.op(_ops(attempt)["release"])
-    proof = _ops(attempt)["release"].model_copy(
-        update={"not_dispatched_ref": b.digest("pep-not-sent")}
-    )
-    raw.op(proof)
-    view = raw.view(attempt.reservation_id)
+def test_consumed_is_released_only_with_a_not_dispatched_report(st: Any) -> None:
+    attempt = lw.consume(st, lw.issued(st, lw.step_in(st)))
+    gate = lw.gate(st)
+    aborted = gate.abort_not_dispatched(attempt)
+    view = st.journal.reservation(attempt.reservation_id)
+    assert aborted.state is A.ABORTED_BEFORE_DISPATCH
     assert (view.state, view.hold_micro, view.spent_micro) == (R.RELEASED, 0, 0)
-    with pytest.raises(ReservationStateError):
-        raw.op(proof)  # no double release
 
 
-def test_dispatched_reservations_are_never_released(consumed: Any) -> None:
-    raw, attempt, _ = consumed
-    raw.op(_ops(attempt)["active"])
-    proof = _ops(attempt)["release"].model_copy(update={"not_dispatched_ref": b.digest("x")})
-    with pytest.raises(ReservationStateError):
-        raw.op(proof)
-    assert raw.view(attempt.reservation_id).hold_micro == 1_000
+def test_dispatched_reservations_are_never_released(st: Any) -> None:
+    gate, attempt, _ = _started(st)
+    with pytest.raises(PermitRejectedError, match="ALREADY_STARTED"):
+        gate.not_dispatched_report(attempt)
+    assert st.journal.reservation(attempt.reservation_id).hold_micro == 1_000
 
 
-def test_unexplained_differences_block_new_spending(consumed: Any) -> None:
-    raw, attempt, scopes = consumed
-    raw.op(
+def test_unexplained_differences_block_new_spending(st: Any) -> None:
+    _, attempt, scopes = _started(st)
+    st.owner(
         Unexplained(
             op="unexplained",
             reservation_id=attempt.reservation_id,
@@ -652,41 +586,35 @@ def test_unexplained_differences_block_new_spending(consumed: Any) -> None:
             evidence_ref=b.digest("diff"),
         )
     )
-    usage = sqlite_ledger.scope_usage(raw.conn.cursor(), BudgetScopeType.RUN, str(scopes.run_id))
+    usage = st.journal.scope_usage(BudgetScopeType.RUN, str(scopes.run_id))
     assert usage.blocked
     assert usage.spent_micro == 5
 
 
-def test_restart_keeps_holds_and_recovers_in_flight_as_unknown(consumed: Any, st: Any) -> None:
-    raw, attempt, scopes = consumed
-    raw.conn.close()
+def test_restart_keeps_holds_and_recovers_in_flight_as_unknown(st: Any) -> None:
+    attempt = lw.consume(st, lw.issued(st, lw.step_in(st)))
+    scopes_task = st.sm.state.runs[st.sm.state.steps[attempt.step_id].run_id].task_id
     st2 = st.reopen()
     try:
         assert st2.journal.reservation(attempt.reservation_id).state is R.CONSUMED
         st2.journal.apply_ledger((RecoverInFlight(op="recover_in_flight"),))
         view = st2.journal.reservation(attempt.reservation_id)
         assert (view.state, view.hold_micro) == (R.UNKNOWN, 1_000)
-        assert (
-            st2.journal.scope_usage(BudgetScopeType.TASK, str(scopes.task_id)).hold_micro == 1_000
-        )
+        assert st2.journal.scope_usage(BudgetScopeType.TASK, str(scopes_task)).hold_micro == 1_000
     finally:
         st2.journal.close()
-    raw.conn = sqlite3.connect(st.path, isolation_level=None)
 
 
 def test_released_reservation_keeps_spent_and_is_not_released_twice(st: Any) -> None:
     _, _, attempt = _ready(st)
     attempt = lw.reserve(st, attempt, 1_000)
-    release = ReleaseReservation(
-        op="release",
-        reservation_id=lw.rsv(attempt),
-        attempt_id=attempt.attempt_id,
-        not_dispatched_ref=None,
-    )
-    abort = w.evidence_for(attempt, A.ABORTED_BEFORE_DISPATCH, not_dispatched_ref=None)
-    st.sm.advance_attempt(attempt, A.ABORTED_BEFORE_DISPATCH, abort, ledger=(release,))
+    released = lw.abort(st, attempt, release=True)
     view = st.journal.reservation(attempt.reservation_id)
+    assert released.state is A.ABORTED_BEFORE_DISPATCH
     assert (view.state, view.hold_micro, view.spent_micro) == (R.RELEASED, 0, 0)
+    release = ReleaseReservation(
+        op="release", reservation_id=lw.rsv(attempt), attempt_id=attempt.attempt_id, report=None
+    )
     with pytest.raises(LedgerPairingError):
         st.journal.apply_ledger((release,))
 

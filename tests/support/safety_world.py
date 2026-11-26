@@ -65,6 +65,7 @@ PRICE_TABLE = PriceTable(
             PriceItem(input_micro_per_mtok=1_000_000, output_micro_per_mtok=4_000_000),
         ),
     ),
+    final_usage_is_complete=True,
 )
 
 

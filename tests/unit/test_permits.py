@@ -98,12 +98,11 @@ def test_issue_consume_claim_and_start(st: Any) -> None:
     receipt = st.journal.receipt(attempt.receipt_id)
     assert (receipt.permit_id, receipt.pep_instance_id) == (attempt.permit_id, st.pep)
     assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.ISSUED
-    attempt = lw.claim(st, attempt)
-    authorization = st.journal.verify_dispatch(
-        attempt.receipt_id, pep_instance_id=st.pep, action_hash=attempt.action_hash
-    )
+    gate = lw.gate(st)
+    attempt = gate.claim(attempt, **lw.actual(st, attempt))
+    # The start is committed by the gate; the authorization it returns is information.
+    attempt, authorization = gate.start(attempt)
     assert authorization.descriptor.action_hash() == attempt.action_hash
-    attempt = lw.start(st, attempt)
     assert attempt.state is A.DISPATCH_STARTED
     assert st.journal.receipt_state(attempt.receipt_id) is ReceiptState.USED
     assert st.journal.reservation(attempt.reservation_id).state is R.ACTIVE
@@ -478,7 +477,7 @@ def test_restart_invalidates_old_permits_and_receipts_and_keeps_holds(st: Any) -
                         op="release",
                         reservation_id=lw.rsv(consumed),
                         attempt_id=consumed.attempt_id,
-                        not_dispatched_ref=b.digest("x"),
+                        report=None,
                     ),
                 )
             )

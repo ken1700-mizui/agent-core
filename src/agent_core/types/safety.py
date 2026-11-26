@@ -41,7 +41,7 @@ from agent_core.types.ids import (
     TenantId,
     UserId,
 )
-from agent_core.types.model import ModelId, ProfileRef, RequestHash
+from agent_core.types.model import ModelId, ProfileRef, RequestHash, Usage
 from agent_core.types.serialization import dump_json
 from agent_core.types.tools import ResourceAccess, ToolEffectClass, ToolId, ToolVersion
 from agent_core.types.values import (
@@ -503,6 +503,8 @@ class ReceiptState(StrEnum):
     CLAIMED = "CLAIMED"
     USED = "USED"
     REVOKED = "REVOKED"
+    # A live gate reported that the operation was not started (WP09-R04).
+    NOT_DISPATCHED = "NOT_DISPATCHED"
 
 
 class PermitReason(StrEnum):
@@ -535,6 +537,15 @@ class PermitReason(StrEnum):
     RECEIPT_NOT_ISSUED = "RECEIPT_NOT_ISSUED"
     RECEIPT_NOT_CLAIMED = "RECEIPT_NOT_CLAIMED"
     PEP_MISMATCH = "PEP_MISMATCH"
+    REPORT_MAC_INVALID = "REPORT_MAC_INVALID"
+    REPORT_MISMATCH = "REPORT_MISMATCH"
+    REPORT_USED = "REPORT_USED"
+    ALREADY_STARTED = "ALREADY_STARTED"
+    USAGE_COST_MISMATCH = "USAGE_COST_MISMATCH"
+    GATE_BUSY = "GATE_BUSY"
+    RUN_CANCELLED = "RUN_CANCELLED"
+    ELAPSED_MS = "ELAPSED_MS"
+    GRANT_EXPIRED = "GRANT_EXPIRED"
 
 
 class PermitBody(FrozenModel):
@@ -575,14 +586,16 @@ class Receipt(FrozenModel):
     reservation_id: ReservationId
     consumer: Consumer
     pep_instance_id: PepInstanceId
+    # The owner epoch of the consumption: a receipt never outlives a restart (WP09-R03).
+    owner_epoch: Epoch
     revocation_gen: Epoch
     expires_at_ms: TimestampMs
 
 
 class DispatchAuthorization(FrozenModel):
-    """What a PEP (WP-08 file broker) receives after claiming a receipt. It is not
-    authority by itself: right before acting, the PEP asks the ledger to confirm it
-    (``verify_dispatch``), and only the trusted record counts."""
+    """What the gate's callback receives after the start was committed (WP09-R03).
+    It is information, not authority: nothing accepts it back, and starting again
+    needs the receipt, which is already used."""
 
     receipt: Receipt
     action_hash: Digest
@@ -598,3 +611,43 @@ class AuditView(FrozenModel):
     reason: str | None
     prev_hash: str | None
     record_hash: str
+
+
+# ---------------------------------------------------------------- gate reports (WP09-R04)
+
+NOT_DISPATCHED_DOMAIN = b"agent-core/pep-not-dispatched/v1\x00"
+EXECUTION_REPORT_DOMAIN = b"agent-core/pep-execution-report/v1\x00"
+MacHex = Annotated[str, StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$")]
+
+
+class NotDispatchedReport(FrozenModel):
+    """A live gate's statement that a consumed permit's operation was not started.
+    MAC with the P1 key; bound to receipt, permit, attempt, reservation, owner
+    epoch and gate instance; used once."""
+
+    report_version: Literal[1]
+    receipt_id: ReceiptId
+    permit_id: PermitId
+    attempt_id: AttemptId
+    reservation_id: ReservationId
+    owner_epoch: Epoch
+    pep_instance_id: PepInstanceId
+    reported_at_ms: TimestampMs
+    mac: MacHex
+
+
+class ExecutionReport(FrozenModel):
+    """A live gate's result of a started operation: the outcome and this call's
+    usage. The ledger derives the cost itself (synthetic billing) and refuses a
+    stated cost that differs."""
+
+    report_version: Literal[1]
+    receipt_id: ReceiptId
+    attempt_id: AttemptId
+    reservation_id: ReservationId
+    owner_epoch: Epoch
+    pep_instance_id: PepInstanceId
+    outcome: Literal["COMPLETED", "FAILED_DEFINITE"]
+    usage: Usage
+    final: bool
+    mac: MacHex

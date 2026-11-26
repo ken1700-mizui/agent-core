@@ -31,17 +31,21 @@ import threading
 from typing import Any, Final
 
 from agent_core.cost.rules import (
+    ceil_div,
     check_transition,
     checked_add,
+    checked_mul,
     checked_sum,
     known_cost,
     required_for,
 )
+from agent_core.safety import reports
 from agent_core.safety.approval import check_approval, verify_signature
 from agent_core.safety.descriptor import rebuild
 from agent_core.safety.paths import any_match
 from agent_core.safety.pdp import decide, require_allowed
 from agent_core.types.cost import (
+    MICRO_PER_MTOK,
     BudgetScopeType,
     CounterKind,
     CounterView,
@@ -63,6 +67,7 @@ from agent_core.types.errors import (
     DuplicateUsageReportError,
     LedgerKeyMissingError,
     LedgerPairingError,
+    OwnerAuthorizationError,
     PermitRejectedError,
     ReservationAmountError,
     ReservationExpiredError,
@@ -105,7 +110,7 @@ from agent_core.types.ledger import (
     Unexplained,
     VoidAllocation,
 )
-from agent_core.types.model import UsageStatus
+from agent_core.types.model import Usage, UsageStatus
 from agent_core.types.records import AttemptState
 from agent_core.types.safety import (
     AUDIT_HASH_DOMAIN,
@@ -115,7 +120,6 @@ from agent_core.types.safety import (
     ApprovalReason,
     AuditView,
     Consumer,
-    DispatchAuthorization,
     ExactApproval,
     LedgerKeys,
     ModelCostBasis,
@@ -133,6 +137,7 @@ from agent_core.types.safety import (
     StopEntry,
     StopScopeType,
     StopStatus,
+    ToolCostBasis,
 )
 from agent_core.types.serialization import dump_json
 from agent_core.types.tools import ToolRegistration
@@ -282,6 +287,16 @@ _OVERRUN_SCOPES: Final = (
     BudgetScopeType.PERIOD,
 )
 _UNEXPLAINED_SCOPES: Final = (BudgetScopeType.RUN, BudgetScopeType.TASK, BudgetScopeType.EXPERIMENT)
+# A Run in one of these states runs nothing new; cancelling also stops it (K1, WP09-R05).
+_CLOSED_RUN_STATUSES: Final = frozenset(
+    {"CANCELLING", "CANCELLED", "COMPLETED", "FAILED", "ABORTED_SAFETY"}
+)
+_UNSETTLED_STATES: Final = (
+    R.RESERVED.value,
+    R.CONSUMED.value,
+    R.ACTIVE.value,
+    R.UNKNOWN.value,
+)
 
 
 # ---------------------------------------------------------------- rows and entries
@@ -693,8 +708,35 @@ def consume_reservation(
     _move(cur, row, R.CONSUMED, now_ms, permit_id=str(permit_id), receipt_id=str(receipt_id))
 
 
-def _report_usage(cur: sqlite3.Cursor, op: ReportUsage, now_ms: int) -> None:
+def _report_usage(
+    cur: sqlite3.Cursor, op: ReportUsage, now_ms: int, ctx: LedgerContext | None
+) -> None:
+    """A trusted execution report (WP09-R04): the gate's MAC, bound to this
+    reservation, its used receipt and the live owner. The cost is derived from the
+    recorded cost basis (synthetic billing); a stated cost that differs is refused.
+    The hold is released only when the report is final and the billing scheme says
+    a final report is complete; otherwise it stays (UNKNOWN)."""
+    keys = _keys(ctx)
+    assert ctx is not None  # noqa: S101 (checked by _keys)
     row = _bound_row(cur, op.reservation_id, op.attempt_id)
+    report = op.report
+    if not reports.verify(keys.permit, report):
+        raise PermitRejectedError(PermitReason.REPORT_MAC_INVALID)
+    if (str(report.reservation_id), str(report.attempt_id), str(report.receipt_id)) != (
+        row["reservation_id"],
+        row["attempt_id"],
+        row["receipt_id"],
+    ):
+        raise PermitRejectedError(PermitReason.REPORT_MISMATCH)
+    stored = _stored_receipt(cur, str(report.receipt_id))
+    if stored is None or stored[1] is not ReceiptState.USED:
+        raise PermitRejectedError(PermitReason.REPORT_MISMATCH, "RECEIPT_NOT_USED")
+    receipt = stored[0]
+    if (str(receipt.pep_instance_id), receipt.owner_epoch) != (
+        str(report.pep_instance_id),
+        report.owner_epoch,
+    ) or report.owner_epoch != ctx.owner_epoch:
+        raise PermitRejectedError(PermitReason.REPORT_MISMATCH, PermitReason.STALE_OWNER)
     seen = cur.execute(
         "SELECT 1 FROM ledger_entries WHERE reservation_id = ? AND usage_event_id = ?",
         (row["reservation_id"], op.usage_event_id),
@@ -703,15 +745,18 @@ def _report_usage(cur: sqlite3.Cursor, op: ReportUsage, now_ms: int) -> None:
         raise DuplicateUsageReportError("USAGE_EVENT_SEEN")
     if row["state"] != R.ACTIVE.value:
         raise ReservationStateError("NOT_ACTIVE")
-    cost = known_cost(op.usage)
-    final = op.final and op.usage.status is UsageStatus.FINAL and cost is not None
-    if final:
+    cost, complete = _billed_cost(cur, row["attempt_id"], report.usage)
+    stated = known_cost(report.usage)
+    if stated is not None and cost is not None and stated != cost:
+        raise PermitRejectedError(PermitReason.USAGE_COST_MISMATCH)
+    final = report.final and report.usage.status is UsageStatus.FINAL and cost is not None
+    if final and complete:
         assert cost is not None  # noqa: S101 (checked by final)
         row = _record_cost(cur, row, R.USAGE_REPORTED, cost, now_ms)
     else:
-        # Unknown or partial: keep the whole hold; a known partial cost is a lower
-        # bound, never a total, and unknown is never zero (E 3.4, D 10.2).
-        lower = max(row["spent_lower_micro"], cost or 0)
+        # Not final, cost unknown or the billing scheme not complete: keep the whole
+        # hold; a known cost is a lower bound only, and unknown is never zero.
+        lower = max(row["spent_lower_micro"], cost or 0, stated or 0)
         row = _move(
             cur,
             row,
@@ -724,23 +769,141 @@ def _report_usage(cur: sqlite3.Cursor, op: ReportUsage, now_ms: int) -> None:
     _entry(cur, row, "USAGE", now_ms, usage_event_id=op.usage_event_id)
 
 
+def _billed_cost(cur: sqlite3.Cursor, attempt_id: str, usage: Usage) -> tuple[int | None, bool]:
+    """(cost, complete) from the synthetic billing scheme (WP09-R04).
+
+    A tool call costs its manifest estimate. A model call costs its known tokens
+    times the owner's price table (rounded up); unknown tokens give no cost."""
+    found = cur.execute(
+        "SELECT descriptor FROM decisions WHERE attempt_id = ?", (attempt_id,)
+    ).fetchone()
+    if found is None:
+        raise PermitRejectedError(PermitReason.DECISION_MISSING)
+    basis = ActionDescriptor.model_validate_json(found[0]).cost_basis
+    if isinstance(basis, ToolCostBasis):
+        return basis.estimate.micro_units, True
+    table = _price_table(cur, basis.price_table_id, basis.price_table_version)
+    item = None if table is None else table.item(basis.model_id)
+    if table is None or item is None:
+        raise CostBasisMissingError("PRICE_TABLE_MISSING")
+    if usage.input_tokens is None or usage.output_tokens is None:
+        return None, table.final_usage_is_complete
+    cost = checked_add(
+        ceil_div(checked_mul(usage.input_tokens, item.input_micro_per_mtok), MICRO_PER_MTOK),
+        ceil_div(checked_mul(usage.output_tokens, item.output_micro_per_mtok), MICRO_PER_MTOK),
+    )
+    return cost, table.final_usage_is_complete
+
+
 def _mark_unknown(cur: sqlite3.Cursor, op: MarkUnknown, now_ms: int) -> None:
     row = _bound_row(cur, op.reservation_id, op.attempt_id)
     _move(cur, row, R.UNKNOWN, now_ms, hold_micro=row["reserved_micro"], spent_known=0)
 
 
-def _mark_active(cur: sqlite3.Cursor, op: MarkActive, now_ms: int) -> None:
+def _mark_active(
+    cur: sqlite3.Cursor, op: MarkActive, now_ms: int, ctx: LedgerContext | None
+) -> None:
+    """``DISPATCH_STARTED`` (WP09-R03): the start is committed here, once. The
+    receipt must exist, be CLAIMED by this gate under the live owner, and every
+    live check (stop, revocation, expiry, elapsed time, approval) must hold."""
     row = _bound_row(cur, op.reservation_id, op.attempt_id)
-    _use_receipt(cur, row)
+    if row["receipt_id"] is None or row["receipt_id"] != str(op.receipt_id):
+        raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
+    stored = _stored_receipt(cur, str(op.receipt_id))
+    if stored is None:
+        raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
+    decision = _decision(cur, row["attempt_id"])
+    reasons = _receipt_reasons(
+        cur,
+        stored[0],
+        str(op.pep_instance_id),
+        decision["action_hash"],
+        now_ms,
+        ctx,
+        wanted=ReceiptState.CLAIMED,
+    )
+    if reasons:
+        raise PermitRejectedError(*dict.fromkeys(reasons))
+    cur.execute(
+        "UPDATE receipts SET state = 'USED' WHERE receipt_id = ? AND state = 'CLAIMED'",
+        (str(op.receipt_id),),
+    )
     _move(cur, row, R.ACTIVE, now_ms)
+    _audit(
+        cur,
+        now_ms,
+        "DISPATCH_STARTED",
+        {"attempt": row["attempt_id"], "receipt": str(op.receipt_id)},
+        "ALLOW",
+        None,
+        None,
+        None,
+    )
 
 
-def _release(cur: sqlite3.Cursor, op: ReleaseReservation, now_ms: int) -> None:
+def _release(
+    cur: sqlite3.Cursor, op: ReleaseReservation, now_ms: int, ctx: LedgerContext | None
+) -> None:
+    """Release a hold. After consumption only with the live gate's report that the
+    operation was not started (E.Z6, WP09-R04): MAC, bindings to receipt, permit,
+    attempt and reservation, the live owner epoch and gate instance, a receipt that
+    was never used, and a report never used before."""
     row = _bound_row(cur, op.reservation_id, op.attempt_id)
-    if row["state"] == R.CONSUMED.value and op.not_dispatched_ref is None:
-        # After consumption, only a live PEP's not-dispatched report releases (E.Z6).
-        raise ReservationStateError("NOT_DISPATCHED_REPORT_REQUIRED")
+    report = op.report
+    if report is None:
+        if row["state"] == R.CONSUMED.value:
+            raise ReservationStateError("NOT_DISPATCHED_REPORT_REQUIRED")
+        _move(cur, row, R.RELEASED, now_ms, hold_micro=0)
+        return
+    if row["state"] != R.CONSUMED.value:
+        raise ReservationStateError("REPORT_FOR_UNCONSUMED")
+    keys = _keys(ctx)
+    assert ctx is not None  # noqa: S101 (checked by _keys)
+    if not reports.verify(keys.permit, report):
+        raise PermitRejectedError(PermitReason.REPORT_MAC_INVALID)
+    bound = (
+        str(report.reservation_id),
+        str(report.attempt_id),
+        str(report.receipt_id),
+        str(report.permit_id),
+    )
+    if bound != (row["reservation_id"], row["attempt_id"], row["receipt_id"], row["permit_id"]):
+        raise PermitRejectedError(PermitReason.REPORT_MISMATCH)
+    stored = _stored_receipt(cur, str(report.receipt_id))
+    if stored is None:
+        raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
+    receipt, state, _run = stored
+    if state is ReceiptState.USED:
+        raise PermitRejectedError(PermitReason.ALREADY_STARTED)
+    if state is ReceiptState.NOT_DISPATCHED:
+        raise PermitRejectedError(PermitReason.REPORT_USED)
+    if str(receipt.pep_instance_id) != str(report.pep_instance_id):
+        raise PermitRejectedError(PermitReason.PEP_MISMATCH)
+    if not receipt.owner_epoch == report.owner_epoch == ctx.owner_epoch:
+        raise PermitRejectedError(PermitReason.STALE_OWNER)
+    if cur.execute(
+        "SELECT 1 FROM not_dispatched WHERE receipt_id = ?", (str(report.receipt_id),)
+    ).fetchone():
+        raise PermitRejectedError(PermitReason.REPORT_USED)
+    cur.execute(
+        "INSERT INTO not_dispatched (receipt_id, report_ref, recorded_at_ms) VALUES (?, ?, ?)",
+        (str(report.receipt_id), reports.report_ref(report), now_ms),
+    )
+    cur.execute(
+        "UPDATE receipts SET state = 'NOT_DISPATCHED' WHERE receipt_id = ?",
+        (str(report.receipt_id),),
+    )
     _move(cur, row, R.RELEASED, now_ms, hold_micro=0)
+    _audit(
+        cur,
+        now_ms,
+        "NOT_DISPATCHED",
+        {"attempt": row["attempt_id"], "receipt": str(report.receipt_id)},
+        "RELEASE",
+        None,
+        None,
+        None,
+    )
 
 
 def _reconcile(cur: sqlite3.Cursor, op: Reconcile, now_ms: int) -> None:
@@ -804,12 +967,24 @@ def _owner(
     now_ms: int,
 ) -> None:
     if isinstance(op, SetBudgetCap):
+        old = cur.execute(
+            "SELECT cap_micro FROM budget_caps WHERE scope_type = ? AND scope_id = ?",
+            (op.scope_type.value, op.scope_id),
+        ).fetchone()
+        if old is not None and op.cap.micro_units < int(old[0]):
+            _revoke_in_scope(cur, op.scope_type, op.scope_id, now_ms)
         cur.execute(
             "INSERT INTO budget_caps (scope_type, scope_id, cap_micro) VALUES (?, ?, ?) "
             "ON CONFLICT (scope_type, scope_id) DO UPDATE SET cap_micro = excluded.cap_micro",
             (op.scope_type.value, op.scope_id, op.cap.micro_units),
         )
     elif isinstance(op, SetCounterCap):
+        old = cur.execute(
+            "SELECT cap FROM counter_caps WHERE scope_type = ? AND scope_id = ? AND counter = ?",
+            (op.scope_type.value, op.scope_id, op.counter.value),
+        ).fetchone()
+        if old is not None and op.cap < int(old[0]):
+            _revoke_in_scope(cur, op.scope_type, op.scope_id, now_ms)
         cur.execute(
             "INSERT INTO counter_caps (scope_type, scope_id, counter, cap) VALUES (?, ?, ?, ?) "
             "ON CONFLICT (scope_type, scope_id, counter) DO UPDATE SET cap = excluded.cap",
@@ -817,6 +992,11 @@ def _owner(
         )
     elif isinstance(op, SetRunWindow):
         # Only the limit changes; elapsed time counts from the Run's creation.
+        old = cur.execute(
+            "SELECT max_elapsed_ms FROM run_windows WHERE run_id = ?", (str(op.run_id),)
+        ).fetchone()
+        if old is not None and op.max_elapsed_ms < int(old[0]):
+            _revoke_in_scope(cur, BudgetScopeType.RUN, str(op.run_id), now_ms)
         cur.execute(
             "INSERT INTO run_windows (run_id, max_elapsed_ms) VALUES (?, ?) "
             "ON CONFLICT (run_id) DO UPDATE SET max_elapsed_ms = excluded.max_elapsed_ms",
@@ -850,11 +1030,11 @@ def apply_op(
     elif isinstance(op, ActivateReservation):
         _activate(cur, op, now_ms)
     elif isinstance(op, MarkActive):
-        _mark_active(cur, op, now_ms)
+        _mark_active(cur, op, now_ms, ctx)
     elif isinstance(op, ReleaseReservation):
-        _release(cur, op, now_ms)
+        _release(cur, op, now_ms, ctx)
     elif isinstance(op, ReportUsage):
-        _report_usage(cur, op, now_ms)
+        _report_usage(cur, op, now_ms, ctx)
     elif isinstance(op, MarkUnknown):
         _mark_unknown(cur, op, now_ms)
     elif isinstance(op, Reconcile):
@@ -1021,9 +1201,9 @@ def check_pairing(draft: EventDraft, ops: tuple[LedgerOp, ...]) -> None:
         # Allocation scopes are derived inside the transaction (WP09-R06).
         if isinstance(op, ActivateReservation) and op.action_hash != after.action_hash:
             raise LedgerPairingError("ACTION_HASH_DIFFERS")
-        if isinstance(op, ReleaseReservation):
+        if isinstance(op, ReleaseReservation) and op.report is not None:
             proof = evidence.not_dispatched_ref if isinstance(evidence, AbortEvidence) else None
-            if op.not_dispatched_ref != proof:
+            if proof != reports.report_ref(op.report):
                 raise LedgerPairingError("NOT_DISPATCHED_REPORT_DIFFERS")
 
 
@@ -1050,7 +1230,9 @@ def _check_bound(op: LedgerOp, after: Any, evidence: Any) -> None:
         op.permit.body.permit_id != after.permit_id or op.receipt_id != after.receipt_id
     ):
         raise LedgerPairingError("PERMIT_OR_RECEIPT_DIFFERS")
-    elif isinstance(op, ClaimReceipt) and op.receipt.receipt_id != after.receipt_id:
+    elif (isinstance(op, ClaimReceipt) and op.receipt.receipt_id != after.receipt_id) or (
+        isinstance(op, MarkActive) and op.receipt_id != after.receipt_id
+    ):
         raise LedgerPairingError("RECEIPT_DIFFERS")
 
 
@@ -1159,10 +1341,25 @@ AUTHORITY_DDL: Final = (
     prev_hash TEXT,
     record_hash TEXT NOT NULL
 ) STRICT""",
+    """CREATE TABLE not_dispatched (
+    receipt_id TEXT PRIMARY KEY,
+    report_ref TEXT NOT NULL,
+    recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0)
+) STRICT""",
+    """CREATE TABLE ledger_clock (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    high_water_ms INTEGER NOT NULL CHECK (high_water_ms >= 0)
+) STRICT""",
+    """CREATE TABLE owner_sequence (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    last_seq INTEGER NOT NULL CHECK (last_seq >= 0)
+) STRICT""",
 )
 # Rows every new database starts with: revocation generation 0, global RUNNING.
 LEDGER_INIT: Final = (
     "INSERT INTO revocation (singleton, revocation_gen) VALUES (1, 0)",
+    "INSERT INTO ledger_clock (singleton, high_water_ms) VALUES (1, 0)",
+    "INSERT INTO owner_sequence (singleton, last_seq) VALUES (1, 0)",
     "INSERT INTO stop_state (scope_type, scope_id, stop_seq, status) "
     "VALUES ('GLOBAL', 'global', 0, 'RUNNING')",
 )
@@ -1725,6 +1922,9 @@ def _issue_permit(
         cur, op.attempt_id, decision["action_hash"], decision["reservation_id"]
     )
     reasons += _intent_reasons(cur, op.attempt_id, decision["action_hash"])
+    reasons += _live_reasons(
+        cur, decision["tenant_id"], decision["run_id"], now_ms, descriptor.expires_at_ms
+    )
     if op.consumer is not Consumer.BROKER:
         # Phase 1 has no Egress Gateway: every permit is consumed by the broker.
         reasons.append(PermitReason.CONSUMER_MISMATCH)
@@ -1791,6 +1991,8 @@ def _stored_permit(cur: sqlite3.Cursor, permit_id: str) -> tuple[Permit, PermitS
 def _live_reasons(
     cur: sqlite3.Cursor, tenant_id: str, run_id: str, now_ms: int, expires_at_ms: int
 ) -> list[str]:
+    """Checks that hold at issue, consumption, claim and start (WP09-R05): expiry,
+    stop state, a cancelled or ended Run, the Run grant's expiry and elapsed time."""
     reasons: list[str] = []
     if now_ms >= expires_at_ms:
         reasons.append(PermitReason.EXPIRED)
@@ -1800,6 +2002,19 @@ def _live_reasons(
         e.status is not StopStatus.RUNNING for e in stops
     ):
         reasons.append(PermitReason.STOPPED)
+    run = cur.execute(
+        "SELECT task_id, status, cancel_requested FROM rt_runs WHERE run_id = ?", (run_id,)
+    ).fetchone()
+    if run is None or run[2] or run[1] in _CLOSED_RUN_STATUSES:
+        reasons.append(PermitReason.RUN_CANCELLED)
+    grant = _grant(cur, run_id)
+    if grant is None or now_ms >= grant.expires_at_ms:
+        reasons.append(PermitReason.GRANT_EXPIRED)
+    if run is not None:
+        try:
+            reasons += _elapsed_reasons(cur, run_id, run[0], now_ms)
+        except BudgetCapMissingError:
+            reasons.append(PermitReason.ELAPSED_MS)
     return reasons
 
 
@@ -1879,6 +2094,7 @@ def _consume_permit(
         reservation_id=body.reservation_id,
         consumer=body.consumer,
         pep_instance_id=op.pep_instance_id,
+        owner_epoch=ctx.owner_epoch,
         revocation_gen=body.revocation_gen,
         expires_at_ms=min(checked_add(now_ms, op.receipt_ttl_ms), body.expires_at_ms),
     )
@@ -1947,6 +2163,9 @@ def _receipt_reasons(
         )
     if str(pep_instance_id) != str(trusted.pep_instance_id):
         reasons.append(PermitReason.PEP_MISMATCH)
+    if ctx is None or trusted.owner_epoch != ctx.owner_epoch:
+        # A receipt never outlives a restart, even with its old gate ID (WP09-R03).
+        reasons.append(PermitReason.STALE_OWNER)
     if trusted.revocation_gen != _revocation_gen(cur):
         reasons.append(PermitReason.STALE_REVOCATION)
     reasons += _live_reasons(cur, str(trusted.tenant_id), run_id, now_ms, trusted.expires_at_ms)
@@ -1965,16 +2184,30 @@ def _receipt_reasons(
 def _claim_receipt(
     cur: sqlite3.Cursor, op: ClaimReceipt, now_ms: int, ctx: LedgerContext | None
 ) -> None:
-    """``ISSUED -> CLAIMED`` once (E 3.2 step 1) after all gate checks."""
+    """``ISSUED -> CLAIMED`` once (E 3.2 step 1) after all gate checks. The actual
+    operation (arguments, targets, executable) must build the recorded descriptor."""
+    stored = _stored_receipt(cur, op.receipt.receipt_id)
+    if stored is None:
+        raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
+    decision = _decision(cur, stored[0].attempt_id)
+    recorded = ActionDescriptor.model_validate_json(decision["descriptor"])
+    try:
+        actual = rebuild(recorded, op.content, op.registration)
+    except ActionDescriptorError:
+        actual = None
+    if actual != recorded:
+        raise PermitRejectedError(PermitReason.ACTION_MISMATCH, "DESCRIPTOR_NOT_FROM_CONTENT")
     reasons = _receipt_reasons(
         cur,
         op.receipt,
         op.pep_instance_id,
-        op.actual_action_hash,
+        decision["action_hash"],
         now_ms,
         ctx,
         wanted=ReceiptState.ISSUED,
     )
+    if str(op.receipt.reservation_id) != decision["reservation_id"]:
+        reasons.append(PermitReason.RECEIPT_DIFFERS)
     if reasons:
         raise PermitRejectedError(*dict.fromkeys(reasons))
     cur.execute(
@@ -1993,45 +2226,11 @@ def _claim_receipt(
     )
 
 
-def _use_receipt(cur: sqlite3.Cursor, reservation: dict[str, Any]) -> None:
-    """``DISPATCH_STARTED``: the claimed receipt is used (never reusable)."""
-    if reservation["receipt_id"] is None:
-        return
-    found = _stored_receipt(cur, reservation["receipt_id"])
-    if found is None:
-        return
-    if found[1] is not ReceiptState.CLAIMED:
-        raise PermitRejectedError(PermitReason.RECEIPT_NOT_CLAIMED)
-    cur.execute(
-        "UPDATE receipts SET state = 'USED' WHERE receipt_id = ?", (reservation["receipt_id"],)
-    )
-
-
-def verify_dispatch(
-    cur: sqlite3.Cursor,
-    receipt_id: str,
-    *,
-    pep_instance_id: str,
-    action_hash: str,
-    now_ms: int,
-    ctx: LedgerContext | None,
-) -> DispatchAuthorization:
-    """Right before acting, a PEP confirms its claimed receipt against the trusted record."""
-    stored = _stored_receipt(cur, receipt_id)
-    if stored is None:
-        raise PermitRejectedError(PermitReason.UNKNOWN_RECEIPT)
-    receipt = stored[0]
-    reasons = _receipt_reasons(
-        cur, receipt, pep_instance_id, action_hash, now_ms, ctx, wanted=ReceiptState.CLAIMED
-    )
-    if reasons:
-        raise PermitRejectedError(*dict.fromkeys(reasons))
-    decision = _decision(cur, receipt.attempt_id)
-    return DispatchAuthorization(
-        receipt=receipt,
-        action_hash=decision["action_hash"],
-        descriptor=ActionDescriptor.model_validate_json(decision["descriptor"]),
-    )
+def read_descriptor(cur: sqlite3.Cursor, attempt_id: str) -> ActionDescriptor | None:
+    found = cur.execute(
+        "SELECT descriptor FROM decisions WHERE attempt_id = ?", (str(attempt_id),)
+    ).fetchone()
+    return None if found is None else ActionDescriptor.model_validate_json(found[0])
 
 
 def _stop_scope(cur: sqlite3.Cursor, op: StopScope, now_ms: int) -> None:
@@ -2074,6 +2273,13 @@ def _resume_scope(cur: sqlite3.Cursor, op: ResumeScope, now_ms: int) -> None:
     ).fetchone()
     if row is None or row[1] != StopStatus.STOPPED.value or int(row[0]) != op.stop_seq:
         raise PermitRejectedError(PermitReason.STOPPED, "STOP_SEQ_MISMATCH")
+    if op.scope_type is StopScopeType.RUN:
+        run = cur.execute(
+            "SELECT status, cancel_requested FROM rt_runs WHERE run_id = ?", (op.scope_id,)
+        ).fetchone()
+        if run is not None and (run[1] or run[0] in _CLOSED_RUN_STATUSES):
+            # Cancelled or ended: no resume can make the Run run again (WP09-R05).
+            raise PermitRejectedError(PermitReason.RUN_CANCELLED)
     cur.execute(
         "UPDATE stop_state SET status = ? WHERE scope_type = ? AND scope_id = ?",
         (StopStatus.RUNNING.value, op.scope_type.value, op.scope_id),
@@ -2226,7 +2432,10 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
         return
     tenant = str(draft.tenant_id)
     for transition in payload.transitions:
-        if isinstance(transition, TaskTransition) and transition.before is None:
+        if isinstance(transition, TaskTransition) and transition.before is not None:
+            if transition.after.status.value == "COMPLETED":
+                _unsettled(cur, "task_id", str(transition.after.task_id))
+        elif isinstance(transition, TaskTransition):
             task = transition.after
             cur.execute(
                 "INSERT INTO rt_tasks (task_id, tenant_id, budget_micro, caps, created_at_ms) "
@@ -2255,10 +2464,14 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
                     ),
                 )
             else:
+                if run.status.value == "COMPLETED":
+                    _unsettled(cur, "run_id", str(run.run_id))
                 cur.execute(
                     "UPDATE rt_runs SET status = ?, cancel_requested = ? WHERE run_id = ?",
                     (run.status.value, int(run.cancel_requested), str(run.run_id)),
                 )
+            if run.cancel_requested or run.status.value in _CLOSED_RUN_STATUSES:
+                _stop_run(cur, str(run.run_id), now_ms)
         elif isinstance(transition, StepTransition) and transition.before is None:
             step = transition.after
             cur.execute(
@@ -2272,3 +2485,80 @@ def mirror(cur: sqlite3.Cursor, draft: EventDraft, now_ms: int) -> None:
                 "ON CONFLICT (attempt_id) DO UPDATE SET state = excluded.state",
                 (str(attempt.attempt_id), str(attempt.step_id), attempt.state.value),
             )
+
+
+# ================================================================ time and owner order (WP09-R05)
+
+
+def effective_now(cur: sqlite3.Cursor, wall_ms: int) -> int:
+    """The ledger's time: never earlier than any time it already used. A wall clock
+    that moves back cannot extend an expiry or reset elapsed time."""
+    row = cur.execute("SELECT high_water_ms FROM ledger_clock WHERE singleton = 1").fetchone()
+    if row is None:
+        raise ReservationStateError("CLOCK_STATE_MISSING")
+    now = max(int(row[0]), wall_ms)
+    if now != int(row[0]):
+        cur.execute("UPDATE ledger_clock SET high_water_ms = ? WHERE singleton = 1", (now,))
+    return now
+
+
+def check_owner_seq(cur: sqlite3.Cursor, owner_seq: int) -> None:
+    """Owner batches apply in increasing order, each once: a replayed signed batch
+    cannot restore an old policy, cap or grant (WP09-R05)."""
+    row = cur.execute("SELECT last_seq FROM owner_sequence WHERE singleton = 1").fetchone()
+    if row is None or owner_seq <= int(row[0]):
+        raise OwnerAuthorizationError("REPLAYED")
+    cur.execute("UPDATE owner_sequence SET last_seq = ? WHERE singleton = 1", (owner_seq,))
+
+
+def _revoke_in_scope(
+    cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str, now_ms: int
+) -> None:
+    """A lowered limit revokes the scope's outstanding permits and receipts (WP09-R05)."""
+    column = _SCOPE_COLUMNS[kind]
+    inner = f"SELECT attempt_id FROM reservations WHERE {column} = ?"  # noqa: S608 (constant)
+    cur.execute(
+        f"UPDATE permits SET state = 'REVOKED' WHERE state = 'ISSUED' AND attempt_id IN ({inner})",  # noqa: S608
+        (scope_id,),
+    )
+    cur.execute(
+        "UPDATE receipts SET state = 'REVOKED' WHERE state IN ('ISSUED', 'CLAIMED') "  # noqa: S608
+        f"AND attempt_id IN ({inner})",
+        (scope_id,),
+    )
+    _bump(cur, tenants=())
+    _audit(
+        cur,
+        now_ms,
+        "LIMIT_LOWERED",
+        {"scope": f"{kind.value}:{scope_id}"},
+        "REVOKE",
+        None,
+        None,
+        None,
+    )
+
+
+def _unsettled(cur: sqlite3.Cursor, column: str, scope_id: str) -> None:
+    """No normal completion while a cost is not settled (WP09-R04)."""
+    placeholders = ", ".join("?" * len(_UNSETTLED_STATES))
+    found = cur.execute(
+        f"SELECT 1 FROM reservations WHERE {column} = ? AND "  # noqa: S608 (constant column)
+        f"(state IN ({placeholders}) OR hold_micro > 0) LIMIT 1",
+        (scope_id, *_UNSETTLED_STATES),
+    ).fetchone()
+    if found is not None:
+        raise ReservationStateError("UNSETTLED_COST")
+
+
+def _stop_run(cur: sqlite3.Cursor, run_id: str, now_ms: int) -> None:
+    """K1 for a cancelled or ended Run, in the same transaction as its transition."""
+    row = cur.execute(
+        "SELECT stop_seq, status FROM stop_state WHERE scope_type = 'RUN' AND scope_id = ?",
+        (run_id,),
+    ).fetchone()
+    if row is not None and row[1] == StopStatus.STOPPED.value:
+        return
+    _stop_scope(
+        cur, StopScope(op="stop_scope", scope_type=StopScopeType.RUN, scope_id=run_id), now_ms
+    )
