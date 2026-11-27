@@ -601,6 +601,11 @@ class SqliteJournal:
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.read_grant(cur, str(run_id))
 
+    def committed_writes(self, run_id: str) -> dict[str, str | None]:
+        """QR-04: the Run's last committed write of each path, by the journal."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_committed_writes(cur, str(run_id))
+
     def recorded_descriptor(self, attempt_id: str) -> ActionDescriptor | None:
         """The descriptor the ledger recorded for an attempt (its trusted content)."""
         with self._read_transaction(self._require_open()) as cur:

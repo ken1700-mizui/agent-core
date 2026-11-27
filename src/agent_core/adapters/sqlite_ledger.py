@@ -29,6 +29,7 @@ import json
 import re
 import sqlite3
 import threading
+from dataclasses import dataclass
 from typing import Any, Final
 
 from agent_core.cost.rules import (
@@ -2786,7 +2787,10 @@ def _completion_basis(
       access epoch, its cost final, and the live gate recorded that read's bytes
       with that digest (a free digest is not evidence); each read proves one
       criterion only;
-    - the latest committed write of this Run to that path wrote that content;
+    - the latest committed write of this Run to that path wrote that content, by
+      the journal's order (QR-04): it ended before the read started, no write of
+      that path started after the read or overlaps it, none is unknown or still
+      running; an order the journal does not prove is refused;
 
     and under the current policy, Run grant (not expired) and access epoch, with
     no stop of the Run, the tenant or everything."""
@@ -2815,28 +2819,128 @@ def _completion_basis(
             reasons.append("POLICY_CHANGED")
         if grant.access_epoch_at_grant != epoch:
             reasons.append("ACCESS_REVOKED")
-    writes = _latest_writes(cur, run_id)
+    writes = _run_writes(cur, run_id)
+    spans = _run_spans(cur, run_id)
     used: set[str] = set()
     for check in checks:
-        reasons.extend(_check_reasons(cur, check, run_id, policy, epoch, writes, used))
+        reasons.extend(_check_reasons(cur, check, run_id, policy, epoch, (writes, spans), used))
     if reasons:
         raise CompletionRefusedError(*dict.fromkeys(reasons))
 
 
-def _latest_writes(cur: sqlite3.Cursor, run_id: str) -> dict[str, str]:
-    """The content digest of this Run's latest committed write of each path."""
-    latest: dict[str, str] = {}
+@dataclass(frozen=True)
+class _Span:
+    """QR-04: an Attempt's positions in its Run's journal (``run_seq``): ``started``
+    (DISPATCH_STARTED, committed before the operation runs), ``ended`` (COMPLETED
+    or FAILED_DEFINITE, committed after it returned), and whether its outcome was
+    ever unknown (then its effect's time is not bounded by the journal)."""
+
+    state: str
+    started: int | None
+    ended: int | None
+    unknown: bool
+
+
+_NEVER: Final = _Span(state="", started=None, ended=None, unknown=False)
+
+
+def _run_spans(cur: sqlite3.Cursor, run_id: str) -> dict[str, _Span]:
+    marks: dict[str, dict[str, int]] = {}
+    states: dict[str, str] = {}
     rows = cur.execute(
-        "SELECT d.descriptor FROM decisions d JOIN rt_attempts a ON a.attempt_id = d.attempt_id "
-        "JOIN rt_steps s ON s.step_id = a.step_id WHERE s.run_id = ? AND a.state = 'COMPLETED' "
-        "ORDER BY d.rowid",
+        "SELECT run_seq, body FROM events WHERE run_id = ? ORDER BY run_seq", (run_id,)
+    ).fetchall()
+    for seq, body in rows:
+        event = Event.model_validate_json(body)
+        if not isinstance(event.payload, RuntimePayload):
+            continue
+        for t in event.payload.transitions:
+            if isinstance(t, AttemptTransition):
+                key = str(t.after.attempt_id)
+                marks.setdefault(key, {}).setdefault(t.after.state.value, int(seq))
+                states[key] = t.after.state.value
+    return {
+        key: _Span(
+            state=states[key],
+            started=m.get(AttemptState.DISPATCH_STARTED.value),
+            ended=m.get(AttemptState.COMPLETED.value, m.get(AttemptState.FAILED_DEFINITE.value)),
+            unknown=AttemptState.OUTCOME_UNKNOWN.value in m,
+        )
+        for key, m in marks.items()
+    }
+
+
+def _run_writes(cur: sqlite3.Cursor, run_id: str) -> dict[str, list[tuple[str, str]]]:
+    """Every write decided in this Run, by path: (attempt, content digest). The
+    decisions' order is not used (QR-04)."""
+    found: dict[str, list[tuple[str, str]]] = {}
+    rows = cur.execute(
+        "SELECT d.attempt_id, d.descriptor FROM decisions d "
+        "JOIN rt_attempts a ON a.attempt_id = d.attempt_id "
+        "JOIN rt_steps s ON s.step_id = a.step_id WHERE s.run_id = ?",
         (run_id,),
     ).fetchall()
-    for (body,) in rows:
-        descriptor = ActionDescriptor.model_validate_json(body)
-        if descriptor.apply_change is not None:
-            latest[descriptor.apply_change.path] = descriptor.apply_change.content_digest
-    return latest
+    for attempt_id, body in rows:
+        change = ActionDescriptor.model_validate_json(body).apply_change
+        if change is not None:
+            found.setdefault(change.path, []).append((attempt_id, change.content_digest))
+    return found
+
+
+def _write_order_reasons(
+    writes: list[tuple[str, _Span]], read: _Span | None
+) -> tuple[list[str], str | None]:
+    """QR-04: the writes of one path against the verification read of it, by the
+    journal's positions only. Returns the reasons the order is not proven (or the
+    read is stale) and the content digest of the provably last write before the
+    read (None: no write before it). A write is before the read when it ended
+    before the read started, after it when it started after the read ended;
+    anything else, an unknown outcome or a write still running is not ordered."""
+    if read is None or read.started is None or read.ended is None or read.unknown:
+        return ["READ_ORDER_UNPROVEN"], None
+    reasons: list[str] = []
+    before: list[tuple[str, int, int]] = []
+    for digest, span in writes:
+        if span.started is None:
+            continue  # never started; the completion stops the Run's permits
+        if span.unknown:
+            reasons.append("WRITE_ORDER_UNPROVEN")
+        elif span.ended is None:
+            reasons.append("WRITE_IN_FLIGHT")
+        elif span.state != AttemptState.COMPLETED.value:
+            continue  # a definite failure wrote nothing
+        elif span.ended < read.started:
+            before.append((digest, span.started, span.ended))
+        elif span.started > read.ended:
+            reasons.append("WRITE_AFTER_VERIFICATION")
+        else:
+            reasons.append("WRITE_ORDER_UNPROVEN")
+    latest = None
+    if before:
+        last = max(range(len(before)), key=lambda i: before[i][2])
+        if any(i != last and w[2] >= before[last][1] for i, w in enumerate(before)):
+            reasons.append("WRITE_ORDER_UNPROVEN")  # two writes overlap: no last one
+        latest = before[last][0]
+    return list(dict.fromkeys(reasons)), latest
+
+
+_AFTER_ALL: Final = _Span(state="COMPLETED", started=MAX_INT64, ended=MAX_INT64, unknown=False)
+
+
+def read_committed_writes(cur: sqlite3.Cursor, run_id: str) -> dict[str, str | None]:
+    """The provably last committed write of each path of this Run, by the journal's
+    order (QR-04); None where the order is not proven."""
+    spans = _run_spans(cur, run_id)
+    result: dict[str, str | None] = {}
+    for path, writes in _run_writes(cur, run_id).items():
+        reasons, latest = _write_order_reasons(
+            [(d, spans.get(a, _NEVER)) for a, d in writes], _AFTER_ALL
+        )
+        if reasons:
+            result[path] = None
+        elif latest is not None:
+            result[path] = latest
+    return result
 
 
 def _check_reasons(
@@ -2845,7 +2949,7 @@ def _check_reasons(
     run_id: str,
     policy: Policy | None,
     epoch: int,
-    writes: dict[str, str],
+    order: tuple[dict[str, list[tuple[str, str]]], dict[str, _Span]],
     used: set[str],
 ) -> list[str]:
     reasons: list[str] = []
@@ -2892,7 +2996,12 @@ def _check_reasons(
     ).fetchone()
     if result is None or result[0] != check.observed_digest:
         reasons.append("READ_RESULT_NOT_RECORDED")
-    if check.path in writes and writes[check.path] != check.observed_digest:
+    # QR-04: the writes of that path against this read, by the journal's order.
+    writes, spans = order
+    path_writes = [(d, spans.get(a, _NEVER)) for a, d in writes.get(check.path, [])]
+    unproven, latest = _write_order_reasons(path_writes, spans.get(attempt_id))
+    reasons.extend(unproven)
+    if latest is not None and latest != check.observed_digest:
         reasons.append("WRITE_DIFFERS_FROM_VERIFIED")
     return reasons
 

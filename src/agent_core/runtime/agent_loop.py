@@ -1099,17 +1099,12 @@ class AgentLoop:
             reads.append(new[-1] if data is not None and new else None)
         return found, reads
 
-    def _committed_writes(self, run_id: RunId) -> dict[str, str]:
-        """The content digest of the latest committed write of each path."""
-        latest: dict[str, str] = {}
-        for attempt in self._attempts(run_id):
-            if attempt.state is not A.COMPLETED:
-                continue
-            descriptor = self._deps.ledger.recorded_descriptor(str(attempt.attempt_id))
-            if descriptor is not None and descriptor.apply_change is not None:
-                change = descriptor.apply_change
-                latest[change.path] = change.content_digest
-        return latest
+    def _committed_writes(self, run_id: RunId) -> dict[str, str | None]:
+        """The content digest of the latest committed write of each path, by the
+        journal's order, never by the order of the decisions; None where the
+        journal does not prove which write was last (QR-04). Advisory: the
+        completion transaction checks the order again against the reads."""
+        return self._deps.ledger.committed_writes(str(run_id))
 
     def _verification_evidence(
         self,
