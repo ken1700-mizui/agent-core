@@ -24,6 +24,7 @@ from agent_core.identity.generator import IdGenerator
 from agent_core.ports.clock import Clock
 from agent_core.ports.evidence import EvidenceVerifier
 from agent_core.ports.journal import HeadExpectation, JournalHead, JournalPort
+from agent_core.runtime.capacity import CapacityGate
 from agent_core.runtime.state_machine import (
     RuntimeState,
     apply_event,
@@ -40,6 +41,7 @@ from agent_core.runtime.state_machine import (
     plan_task_status,
     rebuild_with_head,
 )
+from agent_core.types.capacity import NewWork
 from agent_core.types.errors import (
     CostError,
     JournalArgumentError,
@@ -167,8 +169,11 @@ class RuntimeStateMachine:
         policy_version: str,
         state: RuntimeState,
         head: HeadExpectation,
+        capacity: CapacityGate | None = None,
     ) -> None:
         self._journal = journal
+        # P-2: the admission of new work (None: no limit, as before P-2).
+        self._capacity = capacity
         self._ids = ids
         self._clock = clock
         self._verifier = verifier
@@ -195,6 +200,7 @@ class RuntimeStateMachine:
         engine: EngineVersion,
         policy_version: str,
         profile: str,
+        capacity: CapacityGate | None = None,
     ) -> RuntimeStateMachine:
         """Rebuild the state from the Journal (the source of truth).
 
@@ -229,7 +235,18 @@ class RuntimeStateMachine:
             policy_version=policy_version,
             state=state,
             head=expected,
+            capacity=capacity,
         )
+
+    @property
+    def capacity(self) -> CapacityGate | None:
+        return self._capacity
+
+    def _admit(self, work: NewWork) -> None:
+        """P-2: new work is admitted by the journal's capacity, in the command's
+        lock, before anything is planned or written."""
+        if self._capacity is not None:
+            self._capacity.admit(work)
 
     @property
     def tenant_id(self) -> TenantId:
@@ -255,6 +272,7 @@ class RuntimeStateMachine:
         budget_total: Budget,
         caps_total: NonMonetaryCaps,
     ) -> Task:
+        self._admit(NewWork.TASK)
         task = Task(
             task_id=self._ids.new(TaskId),
             goal_ref=goal_ref,
@@ -277,6 +295,7 @@ class RuntimeStateMachine:
     @_exclusive
     def start_run(self, task: Task, *, run_grant_ref: RunGrantId) -> Run:
         """Create the next Run of ``task``; the Task's budget and caps carry over unchanged."""
+        self._admit(NewWork.RUN)
         transitions: list[Transition] = []
         state = self._state
         if task.status is TaskStatus.CREATED:
@@ -310,6 +329,7 @@ class RuntimeStateMachine:
 
     @_exclusive
     def create_step(self, run: Run, kind: StepKind) -> Step:
+        self._admit(NewWork.STEP)
         step = Step(
             step_id=self._ids.new(StepId),
             run_id=run.run_id,

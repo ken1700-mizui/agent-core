@@ -15,6 +15,7 @@ from typing import Any, Final
 from agent_core.runtime.agent_loop import LoopOutcome
 from agent_core.runtime.file_execution import recovery_receipts
 from agent_core.runtime.recovery import assess
+from agent_core.types.capacity import capacity_level
 from agent_core.types.cost import BudgetScopeType, CounterKind, ReservationState
 from agent_core.types.ids import RunId
 from agent_core.types.records import Attempt, AttemptState, RunStatus, TaskStatus
@@ -138,7 +139,27 @@ def status(session: View) -> dict[str, Any]:
                 "runs": runs,
             }
         )
-    return {"tasks": tasks, "unit": UNIT, "real_api_cost": REAL_API_COST}
+    return {
+        "tasks": tasks,
+        "unit": UNIT,
+        "real_api_cost": REAL_API_COST,
+        "capacity": capacity(session),
+    }
+
+
+def capacity(session: View) -> dict[str, Any]:
+    """P-2: the journal's level, its usage, the configured limits and the last
+    start-up time of this process (None for a read-only view)."""
+    gate = session.sm.capacity
+    limits = None if gate is None else gate.limits
+    usage = session.journal.capacity_usage()
+    return {
+        "level": capacity_level(limits, usage).value,
+        "events": usage.events,
+        "bytes": usage.bytes,
+        "limits": None if limits is None else limits.model_dump(mode="json"),
+        "startup_ms": session.startup_ms,
+    }
 
 
 def _attempts(session: View, run_id: RunId) -> list[tuple[Any, Attempt]]:

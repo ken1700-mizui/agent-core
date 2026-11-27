@@ -33,6 +33,7 @@ from agent_core.adapters.system import SystemClock
 from agent_core.ports.clock import Clock
 from agent_core.runtime.recovery import RecoveryError
 from agent_core.types.errors import (
+    CapacityLimitedError,
     JournalError,
     RuntimeLockHeldError,
     StoredFormatUnsupportedError,
@@ -192,6 +193,9 @@ def _refused(stderr: TextIO, exc: BaseException) -> int:
     if isinstance(exc, CliError):
         stderr.write(f"error: {exc.code}\n")
         return EXIT_FAILURE
+    if isinstance(exc, CapacityLimitedError):
+        stderr.write(f"error: {exc.code} ({exc.work})\n")
+        return EXIT_FAILURE
     if isinstance(exc, StoredFormatUnsupportedError):
         stderr.write(f"error: {exc.code}: {FORMAT_GUIDANCE}\n")
         return EXIT_FAILURE
@@ -297,6 +301,10 @@ class _Shell:
         except StoredFormatUnsupportedError as refused:
             # P-6 compatibility: refused, nothing changed; the shell goes on.
             self._printer.event("error", code=refused.code, detail=FORMAT_GUIDANCE)
+            return None
+        except CapacityLimitedError as refused:
+            # P-2: new work refused at the limit, nothing written; the shell goes on.
+            self._printer.event("error", code=refused.code, detail=refused.work)
             return None
         except KeyboardInterrupt:
             raise

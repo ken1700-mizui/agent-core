@@ -293,6 +293,18 @@ class StateIndexError(AgentCoreError):
     fatal = True
 
 
+class CapacityLimitedError(AgentCoreError):
+    """P-2: the journal is at its configured limit, so new work (a Task, a Run, a
+    Step) is refused before anything is written. ``work`` names the kind. Existing
+    work can still finish, stop, be reconciled and recovered."""
+
+    code = "CAPACITY_LIMITED"
+
+    def __init__(self, work: str) -> None:
+        super().__init__(work)
+        self.work = work
+
+
 class RuntimeReloadRequiredError(AgentCoreError):
     """The runtime's state may no longer match the Journal (stale head, unknown write
     outcome or divergence). It refuses every command until it is reloaded."""

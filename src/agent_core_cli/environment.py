@@ -49,6 +49,7 @@ from agent_core.ports.clock import Clock
 from agent_core.ports.files import FileOperationPort
 from agent_core.ports.model import ModelPort
 from agent_core.runtime.agent_loop import AgentLoop, LoopConfig, LoopDeps, LoopOutcome, TaskProfile
+from agent_core.runtime.capacity import CapacityGate
 from agent_core.runtime.context_assembly import RuleCatalog
 from agent_core.runtime.execution_gate import SyntheticExecutionGate
 from agent_core.runtime.recovery import (
@@ -68,9 +69,11 @@ from agent_core.safety.approval import OwnerApprovalChannel
 from agent_core.safety.workspace import manifest_digest, manifest_key
 from agent_core.tool.registry import ToolRegistry
 from agent_core.types.base import FrozenModel
+from agent_core.types.capacity import CapacityLevel, CapacityLimits, NewWork
 from agent_core.types.context import SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind
 from agent_core.types.errors import (
+    CapacityLimitedError,
     RuntimeProfileError,
     StoredFormatUnsupportedError,
     WorkspaceRejectedError,
@@ -126,6 +129,12 @@ AREA_DIR: Final = "area"
 ENGINE: Final = EngineVersion(engine=EngineName.RUNTIME, version="0.1.0")
 _FILE_FLAGS: Final = os.O_NOFOLLOW | os.O_CLOEXEC
 
+
+# P-2: the events a start writes before its loop runs (the Task, the Run and its
+# attachment, QUEUED, RUNNING); admitted together with the reserve.
+START_EVENTS = 4
+# P-2: owner operations that set up new work (a Run's grant and its limits).
+NEW_WORK_OWNER_OPS = (InstallRunGrant, SetBudgetCap, SetCounterCap, SetRunWindow, SetStepCapDefault)
 
 # P-6 compatibility: the fixed guidance for a stored format this version does not
 # support (no automatic migration; status, stop and recovery stay available).
@@ -240,6 +249,9 @@ class _ConfigFile(FrozenModel):
     # P-6 (F07-1): the start profile. Missing reads as None and is refused (no
     # default); a value of another type is a malformed file (HOME_UNSAFE).
     profile: Annotated[str, StringConstraints(strict=True, max_length=64)] | None = None
+    # P-2: the journal's operating limits. Missing: no limit (only the usage is
+    # shown); malformed or out of order: a malformed file (HOME_UNSAFE).
+    limits: CapacityLimits | None = None
 
 
 def _load_keys(home: Home) -> LedgerKeys:
@@ -259,6 +271,7 @@ class HomeConfig:
     owner_id: UserId
     workspace_ref: str
     profile: str = PHASE1_SYNTHETIC
+    limits: CapacityLimits | None = None
 
     @classmethod
     def load(cls, home: Home) -> HomeConfig:
@@ -272,6 +285,7 @@ class HomeConfig:
                 owner_id=UserId(data.owner_id),
                 workspace_ref=data.workspace_ref,
                 profile=data.profile if data.profile is not None else "",
+                limits=data.limits,
             )
         except (ValueError, TypeError, UnicodeDecodeError):
             raise CliError("HOME_UNSAFE") from None
@@ -486,6 +500,8 @@ class Session:
     runs: dict[RunId, _RunEntry] = field(default_factory=dict)
     current: RunId | None = None
     closed: bool = False
+    # P-2: how long opening the journal and the Rebuild took in this process.
+    startup_ms: int | None = None
 
     # -------------------------------------------------------- lifecycle
 
@@ -504,6 +520,12 @@ class Session:
     # -------------------------------------------------------- owner operations
 
     def _owner_ops(self, *ops: LedgerOp) -> None:
+        # P-2: owner operations that set up new work are refused at the limit;
+        # stops, recovery, reconciliation, approvals and management are not.
+        if any(isinstance(op, NEW_WORK_OWNER_OPS) for op in ops) and (
+            self.sm.capacity is not None and self.sm.capacity.level() is CapacityLevel.LIMITED
+        ):
+            raise CapacityLimitedError(NewWork.RUN.value)
         # Under the gate lock, like a stop (C1 11.1).
         self.gate.stop(self.owner.sign(*ops))
 
@@ -634,6 +656,9 @@ class Session:
         criterion = task_demo.criterion
         # A grant refusal that can be seen now is refused before anything is created.
         self._check_authority(name)
+        # P-2: the whole start (Task, Run and its first statuses) is admitted at once.
+        if self.sm.capacity is not None:
+            self.sm.capacity.admit(NewWork.RUN, extra_events=START_EVENTS)
         task = self.sm.create_task(
             goal_ref=sha256_digest(task_demo.goal.encode()),
             done_criteria=(criterion.ref(),),
@@ -859,6 +884,8 @@ class Snapshot:
     journal: SqliteJournal
     sm: RuntimeStateMachine
     config: HomeConfig
+    # P-2: a read-only view records no start-up time.
+    startup_ms: int | None = None
 
     def continues(self, run_id: RunId) -> bool:
         return False
@@ -898,6 +925,7 @@ def _load_state(
         engine=ENGINE,
         policy_version=demo.POLICY_VERSION,
         profile=config.profile,
+        capacity=CapacityGate(config.limits, journal),
     )
     return ids, sm
 
@@ -926,6 +954,7 @@ def open_session(
 ) -> Session:
     """Open the home's Runtime: the journal takes the OS lock and a new owner epoch."""
     h, keys, config = _checked_home(home)
+    opened_at = monotonic()
     try:
         journal = SqliteJournal.open(
             home / JOURNAL_FILE, clock=clock, random=OsRandomSource(), keys=keys
@@ -936,6 +965,7 @@ def open_session(
     try:
         sequence = OwnerSequence(h, journal.last_owner_seq())
         ids, sm = _load_state(journal, clock, config)
+        startup_ms = monotonic() - opened_at
         gate = SyntheticExecutionGate(
             runtime=sm,
             ledger=journal,
@@ -966,6 +996,7 @@ def open_session(
             home_dir=h,
             report_key=keys.permit,
             broker=broker,
+            startup_ms=startup_ms,
         )
         if session.hooks.files_wrapper is not None:
             session.files = session.hooks.files_wrapper(broker, session)

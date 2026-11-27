@@ -91,6 +91,7 @@ from agent_core.types.cost import BudgetScopeType, CounterKind, PriceTable, Rese
 from agent_core.types.criteria import CriterionCheck
 from agent_core.types.errors import (
     AgentCoreError,
+    CapacityLimitedError,
     CompletionRefusedError,
     ContextBudgetExceededError,
     ContextError,
@@ -625,8 +626,13 @@ class AgentLoop:
             over = over or session.tool_calls >= limits.max_tool_calls
         return over
 
-    def _new_step(self, run_id: RunId, kind: StepKind) -> Step:
-        step = self._deps.sm.create_step(self._deps.sm.state.runs[run_id], kind)
+    def _new_step(self, run_id: RunId, session: _Session, kind: StepKind) -> Step:
+        try:
+            step = self._deps.sm.create_step(self._deps.sm.state.runs[run_id], kind)
+        except CapacityLimitedError:
+            # P-2: the journal is at its limit. Nothing was written; the Run waits
+            # as it is (the owner can stop it, or go on once the limit allows).
+            raise _Stop(self._outcome(session, run_id, "CAPACITY_LIMITED")) from None
         return self._deps.sm.set_step_status(step, StepStatus.IN_PROGRESS)
 
     def _end_step(self, step: Step, attempt: Attempt) -> None:
@@ -763,7 +769,7 @@ class AgentLoop:
             )
         except ContextError as exc:
             raise self._unsafe(session, run_id, "CONTEXT_INVALID", _name(exc)) from None
-        step = self._new_step(run_id, StepKind.MODEL_CALL)
+        step = self._new_step(run_id, session, StepKind.MODEL_CALL)
         attempt = self._pipeline.start(step, sha256_digest(b"model-request-v1"))
         try:
             result = build_context(
@@ -906,7 +912,7 @@ class AgentLoop:
             self._refuse_tool(session, pair_id, "TOOL_NOT_AVAILABLE", "runtime:tool")
             return
         run = deps.sm.state.runs[run_id]
-        step = self._new_step(run_id, StepKind.TOOL_CALL)
+        step = self._new_step(run_id, session, StepKind.TOOL_CALL)
         attempt = self._pipeline.start(step, registration.manifest.manifest_hash)
         try:
             proposal = deps.registry.propose(
@@ -1040,7 +1046,7 @@ class AgentLoop:
         if registration is None:
             return None
         run = deps.sm.state.runs[run_id]
-        step = self._new_step(run_id, StepKind.VERIFICATION)
+        step = self._new_step(run_id, session, StepKind.VERIFICATION)
         attempt = self._pipeline.start(step, registration.manifest.manifest_hash)
         canonical = canonical_json({"path": path}).decode()
         try:

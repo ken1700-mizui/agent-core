@@ -38,6 +38,7 @@ Summary:
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sqlite3
 import stat
@@ -52,6 +53,7 @@ from agent_core.ports.clock import Clock
 from agent_core.ports.journal import HeadExpectation, JournalHead
 from agent_core.ports.randomness import RandomSource
 from agent_core.safety.approval import verify_ledger_mac
+from agent_core.types.capacity import CapacityUsage
 from agent_core.types.cost import (
     BudgetScopeType,
     CounterKind,
@@ -834,6 +836,18 @@ class SqliteJournal:
             if head is None:
                 return None
             return JournalHead(tenant_id=tenant, tenant_seq=head[0], head_hash=head[1])
+
+    def capacity_usage(self) -> CapacityUsage:
+        """P-2: the events of every tenant and the bytes of the database file
+        plus its write-ahead log (read only)."""
+        conn = self._require_open()
+        with self._read_transaction(conn) as cur:
+            row = cur.execute("SELECT COALESCE(SUM(tenant_seq), 0) FROM tenant_head").fetchone()
+        size = os.stat(self._path).st_size
+        # No write-ahead log at the moment is zero bytes of it; any other error is raised.
+        with contextlib.suppress(FileNotFoundError):
+            size += os.stat(f"{self._path}-wal").st_size
+        return CapacityUsage(events=int(row[0]), bytes=size)
 
     def verify_tenant(self, tenant_id: TenantId) -> JournalHead | None:
         """Re-verify one tenant completely (plus SQLite's own checks)."""

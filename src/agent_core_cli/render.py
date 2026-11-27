@@ -161,6 +161,13 @@ def _pending(data: dict[str, Any]) -> str:
 
 def _status(data: dict[str, Any]) -> str:
     lines = ["[status]", f"  cost unit: {data['unit']}; real API cost: {data['real_api_cost']}"]
+    capacity = data.get("capacity")
+    if capacity is not None:
+        configured = "configured" if capacity["limits"] is not None else "not configured"
+        lines.append(
+            f"  journal: {capacity['level']} ({capacity['events']} events, "
+            f"{capacity['bytes']} bytes; limits {configured})"
+        )
     if not data["tasks"]:
         lines.append("  no task")
     for task in data["tasks"]:
