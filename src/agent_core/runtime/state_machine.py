@@ -26,6 +26,7 @@ from agent_core.types.errors import (
     DuplicateEntityError,
     IllegalTransitionError,
     StaleStateError,
+    StateIndexError,
     StateRebuildError,
     StateTransitionError,
     TransitionPreconditionError,
@@ -211,6 +212,10 @@ class RuntimeState:
     )
     # Last journal run_seq per run (positions come from the Journal, never from IDs).
     run_seqs: Mapping[RunId, int] = field(default_factory=lambda: _frozen({}))
+    # P-7 M1, derived (never a source of truth): per Run, the number of its
+    # Attempts outside FINAL_ATTEMPT_STATES; a Run with none has no entry. Kept
+    # by ``_install`` and checked against the Attempts by ``check_indexes``.
+    unresolved_attempts: Mapping[RunId, int] = field(default_factory=lambda: _frozen({}))
 
     @classmethod
     def empty(cls) -> RuntimeState:
@@ -238,6 +243,34 @@ class RuntimeState:
         items[key] = value
         return self._replace(**{name: _frozen(items)})
 
+    def _counted(self, run_id: RunId, delta: int) -> RuntimeState:
+        count = self.unresolved_attempts.get(run_id, 0) + delta
+        if count < 0:
+            raise StateIndexError("the unresolved attempt count of a run is below zero")
+        items = dict(self.unresolved_attempts)
+        if count:
+            items[run_id] = count
+        else:
+            items.pop(run_id, None)
+        return self._replace(unresolved_attempts=_frozen(items))
+
+    def run_settled(self, run_id: RunId) -> bool:
+        """No Attempt of the Run is unresolved (answered by the M1 index)."""
+        return run_id not in self.unresolved_attempts
+
+
+def check_indexes(state: RuntimeState) -> None:
+    """Fail closed unless every derived index equals a count over the entities."""
+    counts: dict[RunId, int] = {}
+    for attempt in state.attempts.values():
+        if attempt.state not in FINAL_ATTEMPT_STATES:
+            step = state.steps.get(attempt.step_id)
+            if step is None:
+                raise StateIndexError("an attempt has no step")
+            counts[step.run_id] = counts.get(step.run_id, 0) + 1
+    if dict(state.unresolved_attempts) != counts:
+        raise StateIndexError("the unresolved attempt index does not match the attempts")
+
 
 def _current[K, V](items: Mapping[K, V], key: K, before: V, what: str) -> V:
     if key not in items:
@@ -257,7 +290,7 @@ def _task_settled(state: RuntimeState, task: Task) -> bool:
     A terminal run does not settle its attempts: an OUTCOME_UNKNOWN or an
     in-flight attempt (reservation held, permit consumed) stays unresolved.
     """
-    return all(_all_final(state.attempts_of_run(r)) for r in task.runs)
+    return all(state.run_settled(r) for r in task.runs)
 
 
 # ---------------------------------------------------------------- tasks
@@ -333,10 +366,18 @@ def plan_run_status(
     _current(state.runs, before.run_id, before, "run")
     check_edge(RUN_TRANSITIONS, before.status, target, "run")
     task = state.tasks[before.task_id]
-    attempts = state.attempts_of_run(before.run_id)
-    steps = state.steps_of_run(before.run_id)
-    settled = _all_final(attempts) and all(s.status in TERMINAL_STEP_STATUSES for s in steps)
-    unknown = any(a.state is A.OUTCOME_UNKNOWN for a in attempts)
+    run_id = before.run_id
+
+    def settled() -> bool:
+        return state.run_settled(run_id) and all(
+            s.status in TERMINAL_STEP_STATUSES for s in state.steps_of_run(run_id)
+        )
+
+    def unknown() -> bool:
+        if state.run_settled(run_id):
+            return False  # an OUTCOME_UNKNOWN attempt is never final
+        return any(a.state is A.OUTCOME_UNKNOWN for a in state.attempts_of_run(run_id))
+
     source = before.status
 
     if target in (R.FAILED, R.ABORTED_SAFETY):
@@ -349,14 +390,14 @@ def plan_run_status(
             len(set(refs)) == len(refs) and set(refs) == set(task.done_criteria),
             "verification must cover exactly the task's done criteria",
         )
-        _require(settled, "unsettled attempts, reservations or steps remain (A.I16)")
+        _require(settled(), "unsettled attempts, reservations or steps remain (A.I16)")
     elif target is R.VERIFYING:
         _no_evidence(evidence)
-        _require(settled, "attempts and steps must be settled before verification")
+        _require(settled(), "attempts and steps must be settled before verification")
     elif target is R.RECONCILIATION_REQUIRED:
         trigger = _evidence(evidence, ReconciliationTrigger)
         if trigger.reason is ReconciliationTriggerReason.OUTCOME_UNKNOWN:
-            _require(unknown, "no attempt has an unknown outcome")
+            _require(unknown(), "no attempt has an unknown outcome")
     elif target is R.CANCELLED:
         if source is R.RECONCILIATION_REQUIRED:
             _require(
@@ -366,7 +407,7 @@ def plan_run_status(
             )
         else:
             _no_evidence(evidence)
-        _require(settled, "unsettled attempts or steps remain (A.I16)")
+        _require(settled(), "unsettled attempts or steps remain (A.I16)")
     elif target is R.RUNNING and source is R.VERIFYING:
         _require(
             isinstance(evidence, VerificationEvidence) and not evidence.passed,
@@ -378,11 +419,11 @@ def plan_run_status(
             and evidence.decision is ResolutionDecision.RESUME,
             "a RESUME resolution is required",
         )
-        _require(not unknown, "unknown outcomes must be reconciled first")
+        _require(not unknown(), "unknown outcomes must be reconciled first")
         _require(not before.cancel_requested, "a cancel request cannot be resumed (WP04-R04)")
     elif target is R.QUEUED and source is R.RECOVERING:
         _no_evidence(evidence)
-        _require(not unknown, "unknown outcomes need reconciliation, not a restart")
+        _require(not unknown(), "unknown outcomes need reconciliation, not a restart")
     else:
         _no_evidence(evidence)
     if target in (R.QUEUED, R.RUNNING):
@@ -405,7 +446,7 @@ def plan_step_create(state: RuntimeState, step: Step) -> StepTransition:
         raise UnknownEntityError("unknown run")
     _require(run.status is R.RUNNING, "steps are created only while the run is RUNNING")
     _require(
-        _all_final(state.attempts_of_run(step.run_id)),
+        state.run_settled(step.run_id),
         "an attempt of the run is unresolved; a new step could repeat it (WP04-R03)",
     )
     _require(step.status is S.PLANNED, "a new step starts PLANNED")
@@ -610,6 +651,11 @@ def _install(state: RuntimeState, transition: Transition) -> RuntimeState:
             state = state._with("run_steps", step.run_id, ordered)
         return state
     attempt = transition.after
+    previous = state.attempts.get(attempt.attempt_id)
+    was_open = previous is not None and previous.state not in FINAL_ATTEMPT_STATES
+    now_open = attempt.state not in FINAL_ATTEMPT_STATES
+    if was_open != now_open:
+        state = state._counted(state.steps[attempt.step_id].run_id, 1 if now_open else -1)
     state = state._with("attempts", attempt.attempt_id, attempt)
     if transition.action is EntityAction.CREATE:
         ordered_attempts = (*state.step_attempts.get(attempt.step_id, ()), attempt.attempt_id)
@@ -753,4 +799,5 @@ def rebuild_with_head(events: Iterable[Event]) -> tuple[RuntimeState, Event | No
         state = apply_event(state, event)
         previous, previous_hash = event, event_hash(event)
         expected_seq += 1
+    check_indexes(state)
     return state, previous, previous_hash

@@ -53,6 +53,7 @@ from agent_core.types.errors import (
     StaleEventEpochError,
     StaleStateError,
     StateDivergenceError,
+    StateIndexError,
     StateRebuildError,
 )
 from agent_core.types.event_hash import event_hash
@@ -352,7 +353,12 @@ class RuntimeStateMachine:
         base_state, expected = self._base
         payload = RuntimePayload(transitions=transitions)
         # Dry run of the whole payload on the planning state (no I/O, no change).
-        _, run_id = apply_payload(base_state, payload)
+        try:
+            _, run_id = apply_payload(base_state, payload)
+        except StateIndexError:
+            # A derived index does not match the entities (P-7 M1): never go on.
+            self._reload_required = True
+            raise
         self._verify_evidence(transitions)
         if self._state is not base_state or self._head is not expected:
             # Something changed the runtime while evidence was being checked.

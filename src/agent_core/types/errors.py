@@ -284,6 +284,15 @@ class StateRebuildError(AgentCoreError):
     fatal = True
 
 
+class StateIndexError(AgentCoreError):
+    """P-7 M1: a derived index of the runtime state does not match the entities it
+    is derived from. The state is not used; the runtime must be rebuilt from the
+    Journal. Never treated as a normal state."""
+
+    code = "STATE_INDEX_INCONSISTENT"
+    fatal = True
+
+
 class RuntimeReloadRequiredError(AgentCoreError):
     """The runtime's state may no longer match the Journal (stale head, unknown write
     outcome or divergence). It refuses every command until it is reloaded."""
