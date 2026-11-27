@@ -3094,27 +3094,37 @@ def _journal_view(cur: sqlite3.Cursor) -> dict[str, dict[str, Any]]:
         "tenants": {},
         "completions": {},
     }
-    bodies = cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq").fetchall()
-    for (body,) in bodies:
-        event = Event.model_validate_json(body)
-        if not isinstance(event.payload, RuntimePayload):
-            continue
-        tenant = str(event.tenant_id)
-        for t in event.payload.transitions:
-            if isinstance(t, TaskTransition):
-                key, table = str(t.after.task_id), "tasks"
-            elif isinstance(t, RunTransition):
-                key, table = str(t.after.run_id), "runs"
-                if t.after.status.value == "COMPLETED":
-                    view["completions"][key] = t.evidence
-            elif isinstance(t, StepTransition):
-                key, table = str(t.after.step_id), "steps"
-            else:  # the transitions are of these four kinds only
-                key, table = str(t.after.attempt_id), "attempts"
-            view[table][key] = t.after
-            if view["tenants"].setdefault(key, tenant) != tenant:
-                raise _inconsistent("TENANT_MISMATCH")
+    # P-7: read from a cursor of the same connection (the same read transaction),
+    # one event at a time; the view keeps each entity's last snapshot only.
+    bodies = cur.connection.cursor()
+    try:
+        bodies.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq")
+        for (body,) in bodies:
+            _view_event(view, Event.model_validate_json(body))
+    finally:
+        bodies.close()
     return view
+
+
+def _view_event(view: dict[str, dict[str, Any]], event: Event) -> None:
+    """Add one event's runtime transitions to ``view`` (``_journal_view``)."""
+    if not isinstance(event.payload, RuntimePayload):
+        return
+    tenant = str(event.tenant_id)
+    for t in event.payload.transitions:
+        if isinstance(t, TaskTransition):
+            key, table = str(t.after.task_id), "tasks"
+        elif isinstance(t, RunTransition):
+            key, table = str(t.after.run_id), "runs"
+            if t.after.status.value == "COMPLETED":
+                view["completions"][key] = t.evidence
+        elif isinstance(t, StepTransition):
+            key, table = str(t.after.step_id), "steps"
+        else:  # the transitions are of these four kinds only
+            key, table = str(t.after.attempt_id), "attempts"
+        view[table][key] = t.after
+        if view["tenants"].setdefault(key, tenant) != tenant:
+            raise _inconsistent("TENANT_MISMATCH")
 
 
 def _check_chain(view: dict[str, dict[str, Any]]) -> None:

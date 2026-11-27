@@ -42,7 +42,7 @@ import contextlib
 import os
 import sqlite3
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
@@ -1107,19 +1107,28 @@ def _load_row(row: tuple[Any, ...]) -> Verified:
     return event, digest
 
 
-def _verify_consecutive(rows: list[tuple[Any, ...]], *, expected_first: int) -> list[Verified]:
-    """Rows that must be consecutive from ``expected_first`` and linked by ``prev_hash``."""
-    verified: list[Verified] = []
+def _iter_consecutive(
+    rows: Iterable[tuple[Any, ...]], *, expected_first: int
+) -> Iterator[Verified]:
+    """Each row verified (``_load_row``), consecutive from ``expected_first`` and
+    linked by ``prev_hash`` to the one before; yielded one at a time (P-7: the
+    open-time check holds no list of every event)."""
     expected = expected_first
+    previous: str | None = None
     for row in rows:
         event, digest = _load_row(row)
         if event.tenant_seq != expected:
             raise JournalCorruptionError("tenant_seq gap or reorder", expected)
-        if verified and event.prev_hash != verified[-1][1]:
+        if previous is not None and event.prev_hash != previous:
             raise JournalCorruptionError("hash chain broken", event.tenant_seq)
-        verified.append((event, digest))
+        yield event, digest
+        previous = digest
         expected += 1
-    return verified
+
+
+def _verify_consecutive(rows: list[tuple[Any, ...]], *, expected_first: int) -> list[Verified]:
+    """Rows that must be consecutive from ``expected_first`` and linked by ``prev_hash``."""
+    return list(_iter_consecutive(rows, expected_first=expected_first))
 
 
 def _head_row(cur: sqlite3.Cursor, tenant: str) -> tuple[int, str] | None:
@@ -1203,17 +1212,23 @@ def _check_chain_neighbours(cur: sqlite3.Cursor, event: Event, digest: str) -> N
 
 
 def _verify_tenant(cur: sqlite3.Cursor, tenant: TenantId) -> JournalHead | None:
-    rows = cur.execute(
-        _SELECT + "WHERE tenant_id = ? ORDER BY tenant_seq", (str(tenant),)
-    ).fetchall()
-    events = _verify_consecutive(rows, expected_first=1)
+    # P-7: the rows are read from a cursor of the same connection (the same read
+    # transaction as every other check here) and checked one at a time; only the
+    # last verified event and each run's last run_seq are kept.
+    rows = cur.connection.cursor()
+    rows.execute(_SELECT + "WHERE tenant_id = ? ORDER BY tenant_seq", (str(tenant),))
+    last: Verified | None = None
     run_seqs: dict[str, int] = {}
-    for event, _ in events:
-        if event.run_id is not None:
-            key = str(event.run_id)
-            if event.run_seq != run_seqs.get(key, 0) + 1:
-                raise JournalCorruptionError("run_seq gap or reorder", event.tenant_seq)
-            run_seqs[key] = event.run_seq
+    try:
+        for event, digest in _iter_consecutive(rows, expected_first=1):
+            if event.run_id is not None:
+                key = str(event.run_id)
+                if event.run_seq != run_seqs.get(key, 0) + 1:
+                    raise JournalCorruptionError("run_seq gap or reorder", event.tenant_seq)
+                run_seqs[key] = event.run_seq
+            last = (event, digest)
+    finally:
+        rows.close()
     run_heads = dict(
         cur.execute(
             "SELECT run_id, run_seq FROM run_head WHERE tenant_id = ?", (str(tenant),)
@@ -1228,8 +1243,8 @@ def _verify_tenant(cur: sqlite3.Cursor, tenant: TenantId) -> JournalHead | None:
     ).fetchone()[0]
     if foreign:
         raise JournalCorruptionError("a run of this tenant has events in another tenant")
-    _check_head_matches(cur, str(tenant), events[-1] if events else None)
-    if not events:
+    _check_head_matches(cur, str(tenant), last)
+    if last is None:
         return None
-    last_event, last_hash = events[-1]
+    last_event, last_hash = last
     return JournalHead(tenant_id=tenant, tenant_seq=last_event.tenant_seq, head_hash=last_hash)
