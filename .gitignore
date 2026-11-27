@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.import_linter_cache/
+.coverage
+
+# Local data (Phase 1 uses synthetic data only; never commit databases)
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Secrets must never be committed (AGENTS.md 3.6)
+.env
+.env.*
+*.pem
+*.key
