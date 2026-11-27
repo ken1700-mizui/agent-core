@@ -2,8 +2,7 @@
 #
 # Trigger: manual dispatch ONLY. Pushes and pull requests do not start this
 # workflow, so opening a PR cannot consume Actions minutes by accident. Do not
-# add automatic triggers until the owner has confirmed the GitHub Actions free
-# tier and the conditions that prevent charges (docs/STATUS.md).
+# add automatic triggers without the owner's approval.
 #
 # Network: the only network use is installing uv and the locked dependencies.
 # Every later step runs `uv run --locked --offline`, so uv neither re-resolves
@@ -20,9 +19,12 @@
 # runners use passwordless sudo.
 #
 # Dispatch: GitHub's documentation says that to trigger workflow_dispatch the
-# workflow must be in the default branch. The default branch (main) is an empty
-# commit, so this workflow cannot be dispatched until the owner decides how
-# (main is not changed without the owner's approval).
+# workflow must be in the default branch. The owner-approved copy of this
+# definition is on the default branch (main, d0b8635), so a manual dispatch
+# against this branch is possible. Each run needs the owner's separate approval.
+# State as of 2026-11-27: the first run (run 46031933145) checked 71208ad and
+# passed all 2138 tests; later commits (2340 tests at aae033a) are not yet
+# checked by CI (docs/reviews/PHASE_1_ACCEPTANCE.md, sections 8 and 11).
 #
 # Supply chain (WP01-R03): the actions are GitHub's own, pinned to full commit
 # SHAs read on 2026-11-27 from the official repositories (git ls-remote of the
