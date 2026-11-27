@@ -34,7 +34,15 @@ from agent_core.types.errors import (
 )
 from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event
-from agent_core.types.ids import AttemptId, RunId, StepId, TaskId
+from agent_core.types.ids import (
+    AttemptId,
+    PermitId,
+    ReceiptId,
+    ReservationId,
+    RunId,
+    StepId,
+    TaskId,
+)
 from agent_core.types.records import (
     TERMINAL_RUN_STATUSES,
     Attempt,
@@ -216,6 +224,15 @@ class RuntimeState:
     # Attempts outside FINAL_ATTEMPT_STATES; a Run with none has no entry. Kept
     # by ``_install`` and checked against the Attempts by ``check_indexes``.
     unresolved_attempts: Mapping[RunId, int] = field(default_factory=lambda: _frozen({}))
+    # P-7 2nd stage, derived (never a source of truth): per kind, each ID an
+    # Attempt holds and that Attempt. An ID once used is never used again, by any
+    # Attempt in any state (``_unused``). Kept by ``_install``, checked by
+    # ``check_indexes``.
+    used_reservation_ids: Mapping[ReservationId, AttemptId] = field(
+        default_factory=lambda: _frozen({})
+    )
+    used_permit_ids: Mapping[PermitId, AttemptId] = field(default_factory=lambda: _frozen({}))
+    used_receipt_ids: Mapping[ReceiptId, AttemptId] = field(default_factory=lambda: _frozen({}))
 
     @classmethod
     def empty(cls) -> RuntimeState:
@@ -243,22 +260,45 @@ class RuntimeState:
         items[key] = value
         return self._replace(**{name: _frozen(items)})
 
+    def used_ids(self, kind: str) -> Mapping[Any, AttemptId]:
+        """The used IDs of one kind (``reservation_id``, ``permit_id``, ``receipt_id``)."""
+        table: Mapping[Any, AttemptId] = getattr(self, USED_ID_TABLES[kind])
+        return table
+
     def run_settled(self, run_id: RunId) -> bool:
         """No Attempt of the Run is unresolved (answered by the M1 index)."""
         return run_id not in self.unresolved_attempts
 
 
+# The Attempt fields whose values are never used twice, and their index tables.
+USED_ID_TABLES: dict[str, str] = {
+    "reservation_id": "used_reservation_ids",
+    "permit_id": "used_permit_ids",
+    "receipt_id": "used_receipt_ids",
+}
+
+
 def check_indexes(state: RuntimeState) -> None:
-    """Fail closed unless every derived index equals a count over the entities."""
+    """Fail closed unless every derived index equals what the entities give."""
     counts: dict[RunId, int] = {}
+    used: dict[str, dict[Any, AttemptId]] = {kind: {} for kind in USED_ID_TABLES}
     for attempt in state.attempts.values():
         if attempt.state not in FINAL_ATTEMPT_STATES:
             step = state.steps.get(attempt.step_id)
             if step is None:
                 raise StateIndexError("an attempt has no step")
             counts[step.run_id] = counts.get(step.run_id, 0) + 1
+        for kind, ids in used.items():
+            value = getattr(attempt, kind)
+            if value is not None:
+                if value in ids:
+                    raise StateIndexError(f"two attempts hold the same {kind}")
+                ids[value] = attempt.attempt_id
     if dict(state.unresolved_attempts) != counts:
         raise StateIndexError("the unresolved attempt index does not match the attempts")
+    for kind, ids in used.items():
+        if dict(state.used_ids(kind)) != ids:
+            raise StateIndexError(f"the used {kind} index does not match the attempts")
 
 
 def _current[K, V](items: Mapping[K, V], key: K, before: V, what: str) -> V:
@@ -521,10 +561,9 @@ def _evidence[E](evidence: object, kind: type[E]) -> E:
 
 
 def _unused(state: RuntimeState, name: str, value: object) -> None:
-    _require(
-        all(getattr(a, name) != value for a in state.attempts.values()),
-        f"{name} is already used by another attempt",
-    )
+    # The same rule as a scan of every Attempt, answered by the derived index
+    # (``value`` is never None here: the evidence types require it).
+    _require(value not in state.used_ids(name), f"{name} is already used by another attempt")
 
 
 def plan_attempt_status(
@@ -731,6 +770,20 @@ def _count(writer: _Writer, run_id: RunId, delta: int) -> None:
         writer.drop("unresolved_attempts", run_id)
 
 
+def _use_id(writer: _Writer, kind: str, value: Any, attempt_id: AttemptId) -> None:
+    table = USED_ID_TABLES[kind]
+    if value in writer.current(table):
+        raise StateIndexError(f"the {kind} is already in the index")
+    writer.put(table, value, attempt_id)
+
+
+def _release_id(writer: _Writer, kind: str, value: Any, attempt_id: AttemptId) -> None:
+    table = USED_ID_TABLES[kind]
+    if writer.current(table).get(value) != attempt_id:
+        raise StateIndexError(f"the {kind} index does not name this attempt")
+    writer.drop(table, value)
+
+
 def _install(writer: _Writer, transition: Transition) -> None:
     if isinstance(transition, TaskTransition):
         writer.put("tasks", transition.after.task_id, transition.after)
@@ -751,6 +804,14 @@ def _install(writer: _Writer, transition: Transition) -> None:
     if was_open != now_open:
         run_id = writer.current("steps")[attempt.step_id].run_id
         _count(writer, run_id, 1 if now_open else -1)
+    for kind in USED_ID_TABLES:
+        held = None if previous is None else getattr(previous, kind)
+        value = getattr(attempt, kind)
+        if held != value:
+            if held is not None:
+                _release_id(writer, kind, held, attempt.attempt_id)
+            if value is not None:
+                _use_id(writer, kind, value, attempt.attempt_id)
     writer.put("attempts", attempt.attempt_id, attempt)
     if transition.action is EntityAction.CREATE:
         writer.append("step_attempts", attempt.step_id, attempt.attempt_id)
