@@ -175,6 +175,8 @@
 
 ## 5. WP-01 の CI の残っている課題（2026-11-27 に更新）
 
+> 公式の資料の確認（Action の SHA、`workflow_dispatch`、`sudo`、uv のハッシュ、無料の枠）の結果と出典は `docs/reviews/PHASE_1_ACCEPTANCE.md` の3章。下の表の「未確認」は、そこで確認したものを更新した。
+
 GitHub Actions は実行していない。CI が未実行のまま、Phase 1 の正式な完了は宣言しない。
 
 | 項目 | 今の状態 | 残っていること |
@@ -182,21 +184,21 @@ GitHub Actions は実行していない。CI が未実行のまま、Phase 1 の
 | 起動 | `workflow_dispatch` だけ。権限は `contents: read`、`persist-credentials: false`。`ubuntu-24.04`、15分 | — |
 | 8種類の検査 | 手元と同じ順序：秘密情報（標準ライブラリだけ、依存の取得の前）、`uv lock --check`、`uv sync --locked`、`uv sync --locked --offline --check`、ruff check、ruff format --check、mypy、import-linter、pytest | — |
 | 一般ユーザーで動く試験 | `pytest -m "not privileged"` を runner の利用者で実行（9章） | 実際の runner で通るかは未確認 |
-| 特権の要る試験 | 別の手順で、root として `-m privileged`（`sudo` と `.venv` の Python）。1件も選ばれなければ pytest が 5 で終わり、手順は失敗する | **runner の `sudo` がパスワードなしで使えるかは未確認**（GitHub の一般的な説明の理解。この環境では確かめていない） |
-| uv.lock との一致 | `uv lock --check`、`uv sync --locked`、`--offline --check`。uv 自体は `pip install uv==0.11.32`（ハッシュの固定なし） | uv の導入の取得物のハッシュの固定（供給網の課題） |
-| Action の SHA の固定 | `actions/checkout@v4`、`actions/setup-python@v5` をタグで参照 | **正式な SHA は外部で確かめていない。推測で書かない。** 確認の後に完全な SHA に固定する |
-| `workflow_dispatch` と既定のブランチ | 既定のブランチは `main`（空の初期コミットだけ。ワークフローの定義がない） | **以前の版の「実装ブランチを選んで実行できる」は不正確だった可能性がある。** `workflow_dispatch` のワークフローは、定義が既定のブランチにあるときだけ起動できる、というのが GitHub の一般的な説明の理解（未確認）。そうなら、今の構成では CI を起動できない。`main` と既定のブランチは、オーナーの承認なしに変えない |
-| 無料の利用枠と課金の防止 | 未確認 | リポジトリの公開・非公開、アカウントの種類、月の Linux の分数の残りと倍率、ストレージ、支払いの上限（spending limit）の設定 |
+| 特権の要る試験 | 別の手順で、root として `-m privileged`（`sudo` と `.venv` の Python）。1件も選ばれなければ pytest が 5 で終わり、手順は失敗する | 公式の資料で確認：Linux の runner はパスワードなしの sudo（実際の runner での動作は、CI を実行するまで未確認） |
+| uv.lock との一致 | `uv lock --check`、`uv sync --locked`、`--offline --check`。uv 自体は `pip install uv==0.11.32`（ハッシュの固定なし） | 解決（`89f8584`）：`tools/ci/uv-requirements.txt` のハッシュで、wheel だけを導入する |
+| Action の SHA の固定 | `actions/checkout@v4`、`actions/setup-python@v5` をタグで参照 | 解決（`89f8584`）：公式のリポジトリで確かめた v6 の完全な SHA に固定（Node 20 の廃止のため v6 に上げた） |
+| `workflow_dispatch` と既定のブランチ | 既定のブランチは `main`（空の初期コミットだけ。ワークフローの定義がない） | 公式の資料で確認：`workflow_dispatch` はワークフローが既定のブランチにあるときだけ起動できる。以前の版の「実装ブランチを選んで実行できる」は不正確だった。今の構成では起動できない。方法の比較は受入の文書の 3.1。`main` と既定のブランチは、オーナーの承認なしに変えない |
+| 無料の利用枠と課金の防止 | 公式の資料で確認：このリポジトリは公開で、標準の runner は無料。予算の「上限で利用を止める」で追加の課金を防げる | リポジトリの公開・非公開、アカウントの種類、月の Linux の分数の残りと倍率、ストレージ、支払いの上限（spending limit）の設定 |
 | ネットワーク | 依存の取得（uv、`uv sync --locked`）だけが外部に接続する。以降は `--offline`、試験の中は Python の `socket` を遮断 | OS のレベルの遮断（`unshare -n` など）は CI に入れていない（runner で使えるか未確認） |
 | 環境と対象の SHA の記録 | 新しい手順で、コミット（`git rev-parse HEAD`、`GITHUB_SHA`、`GITHUB_REF`）、runner の OS とイメージ、カーネル、利用者、Python と uv の版を、ジョブの要約（`GITHUB_STEP_SUMMARY`）に書く | 実行の後に、その記録を STATUS.md に写す |
 
 **外部の確認とオーナーの承認が要る事項：**
 
-1. Action の正式な SHA（外部の照会の許可が要る）。
-2. `workflow_dispatch` と既定のブランチの関係の確認（GitHub の公式の説明）。
+1. ~~Action の正式な SHA~~：2026-11-27 に公式のリポジトリで確認し固定した（`89f8584`）。
+2. ~~`workflow_dispatch` と既定のブランチの関係~~：公式の資料で確認した（既定のブランチに定義が要る）。
 3. 2 が正しければ、CI をどう起動するかのオーナーの決定（`main` へのワークフローの追加、既定のブランチの変更などは、いずれもオーナーの承認が要る。今回は行わない）。
 4. 無料の利用枠と支払いの上限の確認（オーナーのアカウントの設定）。
-5. runner の `sudo` の確認（特権の試験の手順）。
+5. ~~runner の `sudo`~~：公式の資料で確認した（パスワードなしの sudo）。実際の動作は CI の実行で確かめる。
 6. 初回の CI の実行の許可。
 
 ## 6. 未検証の事項
