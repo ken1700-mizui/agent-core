@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -59,7 +58,8 @@ def test_the_built_state_is_immutable_and_has_no_lists(events: list[Event]) -> N
     built = rebuild_with_head(events)[0]
     for name in built.__dataclass_fields__:
         table = getattr(built, name)
-        assert isinstance(table, MappingProxyType), name
+        # Immutable state tables (P-7 M4: the layered mapping; no item assignment).
+        assert isinstance(table, smod._Layered), name
         with pytest.raises(TypeError):
             table["x"] = 1  # type: ignore[index]
     for ordered in (*built.run_steps.values(), *built.step_attempts.values()):

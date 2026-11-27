@@ -17,7 +17,8 @@ it is genuine is the ``EvidenceVerifier`` port's job (runtime/service.py).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import math
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -199,8 +200,90 @@ def _require(condition: bool, message: str) -> None:
         raise TransitionPreconditionError(message)
 
 
+class _Layered[K, V](Mapping[K, V]):
+    """An immutable mapping (P-7 M4): a frozen base dictionary plus a small
+    overlay of later changes, so a change copies the overlay, not the table.
+
+    It behaves exactly as an immutable ``dict`` with the same items in the same
+    order (a changed key keeps its place, a new key goes last). Neither dictionary
+    is ever changed after it is made, so an earlier mapping keeps its contents.
+    The overlay is merged into a new base once it passes about the square root of
+    the base (amortized). A deletion merges at once, so the order stays a dict's.
+    """
+
+    __slots__ = ("_base", "_len", "_over")
+
+    def __init__(self, base: dict[K, V], over: dict[K, V], length: int) -> None:
+        self._base = base
+        self._over = over
+        self._len = length
+
+    @classmethod
+    def of(cls, items: Mapping[K, V]) -> _Layered[K, V]:
+        return cls(dict(items), {}, len(items))
+
+    @classmethod
+    def adopt(cls, items: dict[K, V]) -> _Layered[K, V]:
+        """Take ``items`` as the base without copying it; the caller never uses it again."""
+        return cls(items, {}, len(items))
+
+    def __getitem__(self, key: K) -> V:
+        over = self._over
+        if key in over:
+            return over[key]
+        return self._base[key]
+
+    def get(self, key: K, default: Any = None) -> Any:
+        over = self._over
+        if key in over:
+            return over[key]
+        return self._base.get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._over or key in self._base
+
+    def __iter__(self) -> Iterator[K]:
+        yield from self._base
+        base = self._base
+        for key in self._over:
+            if key not in base:
+                yield key
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, _Layered) and other._base is self._base and other._over == self._over:
+            return True
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return len(self) == len(other) and dict(self.items()) == dict(other.items())
+
+    __hash__ = None  # type: ignore[assignment]
+
+    def __repr__(self) -> str:
+        return f"_Layered({dict(self.items())!r})"
+
+    def set(self, key: K, value: V) -> _Layered[K, V]:
+        added = 0 if key in self else 1
+        over = {**self._over, key: value}
+        if len(over) > 64 + math.isqrt(len(self._base)):
+            merged = dict(self._base)
+            merged.update(over)
+            return _Layered(merged, {}, self._len + added)
+        return _Layered(self._base, over, self._len + added)
+
+    def delete(self, key: K) -> _Layered[K, V]:
+        if key not in self:
+            return self
+        merged = dict(self._base)
+        merged.update(self._over)
+        del merged[key]
+        return _Layered(merged, {}, self._len - 1)
+
+
 def _frozen[K, V](items: dict[K, V]) -> Mapping[K, V]:
-    return MappingProxyType(items)
+    return _Layered.of(items)
 
 
 # ---------------------------------------------------------------- state
@@ -256,9 +339,8 @@ class RuntimeState:
         return RuntimeState(**values)
 
     def _with(self, name: str, key: Any, value: Any) -> RuntimeState:
-        items = dict(getattr(self, name))
-        items[key] = value
-        return self._replace(**{name: _frozen(items)})
+        table: _Layered[Any, Any] = getattr(self, name)
+        return self._replace(**{name: table.set(key, value)})
 
     def used_ids(self, kind: str) -> Mapping[Any, AttemptId]:
         """The used IDs of one kind (``reservation_id``, ``permit_id``, ``receipt_id``)."""
@@ -687,35 +769,37 @@ class _Writer(Protocol):
 
 
 class _CopyOnWrite:
-    """Copies a table of ``base`` the first time it is written, never ``base``."""
+    """The live path's writer: each write makes a new ``_Layered`` table that
+    shares the earlier one's base (P-7 M4); ``base`` is never changed."""
 
     def __init__(self, base: RuntimeState) -> None:
         self._base = base
-        self._tables: dict[str, dict[Any, Any]] = {}
+        self._tables: dict[str, _Layered[Any, Any]] = {}
 
     def current(self, name: str) -> Mapping[Any, Any]:
         table = self._tables.get(name)
         return table if table is not None else getattr(self._base, name)
 
-    def _own(self, name: str) -> dict[Any, Any]:
-        if name not in self._tables:
-            self._tables[name] = dict(getattr(self._base, name))
-        return self._tables[name]
+    def _table(self, name: str) -> _Layered[Any, Any]:
+        table = self.current(name)
+        if not isinstance(table, _Layered):
+            raise StateIndexError(f"the {name} table is not an immutable state table")
+        return table
 
     def put(self, name: str, key: Any, value: Any) -> None:
-        self._own(name)[key] = value
+        self._tables[name] = self._table(name).set(key, value)
 
     def append(self, name: str, key: Any, value: Any) -> None:
-        table = self._own(name)
-        table[key] = (*table.get(key, ()), value)
+        table = self._table(name)
+        self._tables[name] = table.set(key, (*table.get(key, ()), value))
 
     def drop(self, name: str, key: Any) -> None:
-        self._own(name).pop(key, None)
+        self._tables[name] = self._table(name).delete(key)
 
     def result(self) -> RuntimeState:
         if not self._tables:
             return self._base
-        return self._base._replace(**{n: _frozen(t) for n, t in self._tables.items()})
+        return self._base._replace(**self._tables)
 
 
 class _Builder:
@@ -757,7 +841,7 @@ class _Builder:
             table = tables[name]
             for key, items in table.items():
                 table[key] = tuple(items)
-        return RuntimeState(**{n: _frozen(t) for n, t in tables.items()})
+        return RuntimeState(**{n: _Layered.adopt(t) for n, t in tables.items()})
 
 
 def _count(writer: _Writer, run_id: RunId, delta: int) -> None:
