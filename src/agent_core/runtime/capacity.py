@@ -43,6 +43,8 @@ class CapacityGate:
 
         ``extra_events``: events a caller knows it will write right after, so a
         composite start (a Task and its Run) is admitted or refused as a whole."""
+        if self.limits is None:
+            return CapacityLevel.NORMAL  # no limit: nothing to measure for admission
         usage = self.usage()
         if extra_events:
             usage = usage.model_copy(update={"events": usage.events + extra_events})

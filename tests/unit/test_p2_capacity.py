@@ -262,3 +262,17 @@ def test_a_limit_never_removes_an_event(tmp_path: Path) -> None:
     again = st.reopen()
     assert _events(again) == before
     assert len(again.sm.state.runs) == 1
+
+
+def test_without_limits_the_journal_is_not_probed_for_new_work() -> None:
+    class Probe:
+        calls = 0
+
+        def capacity_usage(self) -> CapacityUsage:
+            self.calls += 1
+            return CapacityUsage(events=0, bytes=0)
+
+    probe = Probe()
+    gate = CapacityGate(None, probe)
+    assert gate.admit(NewWork.STEP) is L.NORMAL
+    assert probe.calls == 0
