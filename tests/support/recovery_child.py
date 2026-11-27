@@ -18,7 +18,10 @@ kills it with SIGKILL:
 - ``file_committed``: the broker's write has committed the file (rename),
   before the result reaches the journal;
 - ``during_repair``: inside ``repair_projections``'s transaction, after the
-  mirror was rewritten, before the commit (the parent damaged the mirror).
+  mirror was rewritten, before the commit (the parent damaged the mirror);
+- ``during_settle``: inside the owner's ``recover``, in the transaction that
+  settles an unknown outcome and its cost (``ReconcileOutcome``), after the
+  ledger applied it, before the commit (QR-01).
 """
 
 from __future__ import annotations
@@ -116,6 +119,18 @@ def main() -> int:
             return real(self, draft, **kwargs)
 
         SqliteJournal.append_with_ledger = append  # type: ignore[method-assign]
+    if POINT == "during_settle":
+        from agent_core.adapters import sqlite_ledger
+
+        real_settle = sqlite_ledger._reconcile_outcome
+
+        def settle(*args: Any) -> None:
+            real_settle(*args)
+            block()  # inside the transaction, before COMMIT
+
+        sqlite_ledger._reconcile_outcome = settle  # type: ignore[assignment]
+    if POINT in ("during_recovery", "during_settle"):
+        lines = ["recover all"]
     if POINT == "during_recovery":
         real_abort = recovery._abort
 
@@ -124,8 +139,7 @@ def main() -> int:
             block()
 
         recovery._abort = abort  # type: ignore[assignment]
-        lines = ["recover all"]
-    else:
+    if POINT not in ("during_recovery", "during_settle"):
         lines = ["start report", "APPROVE"]
     out = io.StringIO()
 

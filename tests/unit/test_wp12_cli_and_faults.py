@@ -257,6 +257,36 @@ def test_a_process_killed_during_the_recovery(env: Env) -> None:
     assert kinds(events, "recovered")[0]["changed"] is False
 
 
+def _reconciliations(home: Path) -> int:
+    conn = sqlite3.connect(f"file:{home / 'journal.db'}?mode=ro", uri=True)
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM ledger_entries WHERE kind = 'RECONCILIATION'"
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+
+
+def test_a_process_killed_while_settling_an_unknown_outcome(env: Env) -> None:
+    """QR-01: SIGKILL inside the transaction that settles an unknown outcome and
+    its cost together (``ReconcileOutcome``): neither is committed."""
+    _kill_at(env.home, "file_prepare")  # the permit consumed, the start never recorded
+    _kill_at(env.home, "during_settle")  # proving it never started, before the commit
+    _, events, err = env.shell("recovery", "quit")
+    view = kinds(events, "recovery")[-1]
+    assert [u["reservation_state"] for u in view["unknown"]] == ["UNKNOWN"], err
+    assert _reconciliations(env.home) == 0
+    view, runs = _recover(env)  # a new process settles it, once
+    assert runs[0]["status"] == "FAILED"
+    assert view["unknown"] == []
+    assert _reconciliations(env.home) == 1
+    _, events, _ = env.shell("recover all", "quit")
+    assert kinds(events, "recovered")[0]["changed"] is False
+    assert _reconciliations(env.home) == 1
+
+
 def test_the_cli_never_recovers_a_run_of_its_own_live_session(env: Env) -> None:
     def recover_current(out: str) -> str:
         run_id = [json.loads(x) for x in out.splitlines() if '"started"' in x][-1]["run_id"]

@@ -551,16 +551,19 @@ def test_unknown_outcome_holds_until_reconciled(st: Any) -> None:
         )
     )
     assert st.journal.reservation(attempt.reservation_id).hold_micro == 1_000
-    st.owner(
-        Reconcile(
-            op="reconcile",
-            reservation_id=attempt.reservation_id,
-            actual=lw.xtu(250),
-            evidence_ref=b.digest("synthetic-reconciliation"),
+    # QR-01: the outcome is not settled, so its cost is not settled alone (the
+    # outcome and the cost are settled together; test_qr01_reconcile.py).
+    with pytest.raises(ReservationStateError, match="OUTCOME_NOT_SETTLED"):
+        st.owner(
+            Reconcile(
+                op="reconcile",
+                reservation_id=attempt.reservation_id,
+                actual=lw.xtu(250),
+                evidence_ref=b.digest("synthetic-reconciliation"),
+            )
         )
-    )
     view = st.journal.reservation(attempt.reservation_id)
-    assert (view.state, view.hold_micro, view.spent_micro) == (R.RECONCILED, 0, 250)
+    assert (view.state, view.hold_micro, view.spent_known) == (R.UNKNOWN, 1_000, False)
 
 
 def test_consumed_is_released_only_with_a_not_dispatched_report(st: Any) -> None:

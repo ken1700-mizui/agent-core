@@ -233,6 +233,9 @@ class RecoveryReport:
     # apart from the normal recovery (WP12-R04).
     escalated: tuple[RunId, ...] = ()
     unsettled: tuple[Unsettled, ...] = ()
+    # QR-01: unknown outcomes whose cost an earlier version settled apart. Reported
+    # for the owner, never repaired: the outcome cannot be settled with its cost.
+    conflicts: tuple[AttemptId, ...] = ()
 
 
 def _run_attempts(state: RuntimeState, run_id: RunId) -> list[Attempt]:
@@ -283,6 +286,19 @@ def _unsettled(state: RuntimeState, ledger: LedgerPort | None, run_id: RunId) ->
     return found
 
 
+def _cost_settled_apart(ledger: LedgerPort | None, attempt: Attempt) -> bool:
+    """QR-01: an unknown outcome whose reservation is already settled (a cost-only
+    reconciliation of an earlier version)."""
+    if ledger is None or attempt.state is not A.OUTCOME_UNKNOWN or attempt.reservation_id is None:
+        return False
+    view = ledger.reservation(str(attempt.reservation_id))
+    return view is not None and view.state is RS.RECONCILED
+
+
+def _conflicts(state: RuntimeState, ledger: LedgerPort | None) -> tuple[AttemptId, ...]:
+    return tuple(a.attempt_id for a in state.attempts.values() if _cost_settled_apart(ledger, a))
+
+
 def assess(state: RuntimeState, ledger: LedgerPort | None = None) -> RecoveryReport:
     """The recovery plan: every Run that is not finished, and every finished Run
     that still has unfinished work or an unsettled cost (WP12-R03). Reads only."""
@@ -299,7 +315,9 @@ def assess(state: RuntimeState, ledger: LedgerPort | None = None) -> RecoveryRep
         if run.status in _TERMINAL_RUN and not open_attempts and not costs:
             continue
         runs.append(RunPlan(run.run_id, run.status, open_attempts))
-    return RecoveryReport(runs=tuple(runs), unsettled=tuple(unsettled))
+    return RecoveryReport(
+        runs=tuple(runs), unsettled=tuple(unsettled), conflicts=_conflicts(state, ledger)
+    )
 
 
 # ================================================================ recovery (explicit)
@@ -470,7 +488,11 @@ def _old_authority_revoked(deps: RecoveryDeps, attempt: Attempt) -> bool:
 
 
 def _prove_not_started(deps: RecoveryDeps, attempt: Attempt) -> bool:
-    if _started_in_history(deps, attempt) or not _old_authority_revoked(deps, attempt):
+    if (
+        _cost_settled_apart(deps.ledger, attempt)
+        or _started_in_history(deps, attempt)
+        or not _old_authority_revoked(deps, attempt)
+    ):
         return False
     proof = sha256_digest(
         f"recovery:not-started:{attempt.attempt_id}:{attempt.receipt_id}".encode()
@@ -639,7 +661,11 @@ def recover(
                 escalated.append(run_id)
         plan = assess(deps.sm.state, deps.ledger)
         return RecoveryReport(
-            runs=plan.runs, changed=changed, escalated=tuple(escalated), unsettled=plan.unsettled
+            runs=plan.runs,
+            changed=changed,
+            escalated=tuple(escalated),
+            unsettled=plan.unsettled,
+            conflicts=plan.conflicts,
         )
     finally:
         _RECOVERING.discard(key)
@@ -679,6 +705,8 @@ def reconcile(
         return ReconcileResult(Reconciled.ALREADY_SETTLED)
     if attempt.state is not A.OUTCOME_UNKNOWN:
         raise RecoveryError("NOT_UNKNOWN")
+    if _cost_settled_apart(deps.ledger, attempt):
+        raise RecoveryError("COST_SETTLED_APART")  # reported, never repaired (QR-01)
     if evidence is None:
         if _prove_not_started(deps, attempt):
             return ReconcileResult(Reconciled.NOT_EXECUTED)

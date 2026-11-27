@@ -394,6 +394,7 @@ class _Shell:
             "recovered",
             changed=report.changed,
             escalated=[str(r) for r in report.escalated],
+            conflicts=[str(a) for a in report.conflicts],
         )
         for run_id, status in before.items():
             self._acted = run_id

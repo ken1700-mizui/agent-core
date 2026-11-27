@@ -211,7 +211,11 @@ def test_r02_a_settled_outcome_is_not_changed_by_other_evidence(tmp_path: Path) 
     assert st3.sm.state.attempts[attempt.attempt_id].state is A.COMPLETED
 
 
-def test_r02_a_cost_settled_apart_blocks_any_outcome(tmp_path: Path) -> None:
+def test_r02_a_cost_is_never_settled_apart_from_an_unknown_outcome(tmp_path: Path) -> None:
+    """QR-01: the earlier expectation (a cost settled apart, then no outcome can
+    be settled) was the defect; a cost-only reconciliation is now refused and the
+    outcome and its cost are settled together."""
+    from agent_core.types.errors import ReservationStateError
     from agent_core.types.ledger import Reconcile
 
     st = lw.setup(tmp_path)
@@ -220,17 +224,19 @@ def test_r02_a_cost_settled_apart_blocks_any_outcome(tmp_path: Path) -> None:
     st2 = st.reopen()
     deps = _deps(st2)
     rc.recover(deps, deadlines=DEADLINES, run_ids=_all(st2))
-    st2.owner(
-        Reconcile(
-            op="reconcile",
-            reservation_id=attempt.reservation_id,
-            actual=Budget(currency=Currency.XTU, micro_units=0),
-            evidence_ref=b.digest("cost only"),
+    with pytest.raises(ReservationStateError, match="OUTCOME_NOT_SETTLED"):
+        st2.owner(
+            Reconcile(
+                op="reconcile",
+                reservation_id=attempt.reservation_id,
+                actual=Budget(currency=Currency.XTU, micro_units=0),
+                evidence_ref=b.digest("cost only"),
+            )
         )
-    )
-    with pytest.raises(AgentCoreError):
-        rc.reconcile(deps, attempt.attempt_id, rc.ExecutionEvidence(report=report))
-    assert st2.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
+    assert _view(st2, attempt).state is RS.UNKNOWN
+    result = rc.reconcile(deps, attempt.attempt_id, rc.ExecutionEvidence(report=report))
+    assert result.outcome is rc.Reconciled.EXECUTED
+    assert _view(st2, attempt).state is RS.RECONCILED
 
 
 def test_r02_an_unknown_outcome_cannot_be_settled_without_the_ledger(tmp_path: Path) -> None:

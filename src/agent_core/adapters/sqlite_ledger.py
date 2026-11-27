@@ -978,10 +978,30 @@ def _release(
     )
 
 
+_OUTCOME_SETTLED: Final = frozenset(
+    {AttemptState.COMPLETED.value, AttemptState.FAILED_DEFINITE.value}
+)
+
+
+def _refuse_cost_only(cur: sqlite3.Cursor, row: dict[str, Any]) -> None:
+    """QR-01: a cost alone is settled only for an Attempt whose outcome is settled.
+    An unknown (or not yet ended) outcome and its cost are settled together, by
+    ``ReconcileOutcome``; a cost settled apart would leave the outcome unsettleable.
+    The state is the journal's projection, written in the same transaction as each
+    event and checked against the journal at every open."""
+    found = cur.execute(
+        "SELECT state FROM rt_attempts WHERE attempt_id = ?", (row["attempt_id"],)
+    ).fetchone()
+    if found is None or found[0] not in _OUTCOME_SETTLED:
+        raise ReservationStateError("OUTCOME_NOT_SETTLED")
+
+
 def _reconcile(cur: sqlite3.Cursor, op: Reconcile, now_ms: int) -> None:
+    """The owner's cost-only reconciliation of a settled outcome's bill."""
     row = _row(cur, op.reservation_id)
     if row is None:
         raise ReservationStateError("NOT_ALLOCATED")
+    _refuse_cost_only(cur, row)
     actual = op.actual.micro_units
     if row["spent_known"] and actual < row["spent_micro"]:
         # Lowering a recorded final cost frees budget: owner-only, not implemented.
@@ -1037,7 +1057,11 @@ def _reconcile_outcome(
         ):
             raise ReservationStateError("COST_NOT_FINAL")  # never inferred, never zero
         actual = cost
-        _record_result(cur, row["attempt_id"], report.result_digest)
+    if actual < row["spent_lower_micro"]:
+        # QR-01: a known lower bound (a partial report) is never undercut.
+        raise ReservationAmountError("BELOW_LOWER_BOUND")
+    if op.report is not None:
+        _record_result(cur, row["attempt_id"], op.report.result_digest)
     row = _record_cost(cur, row, R.RECONCILED, actual, now_ms)
     _entry(cur, row, "RECONCILIATION", now_ms, evidence_ref=op.evidence_ref)
 
