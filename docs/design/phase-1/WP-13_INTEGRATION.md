@@ -73,7 +73,7 @@
 | C1.S6 | 承認は action_hash に結び付く | PASS | `test_wp10_cli.py`、`test_wp12_recovery.py` |
 | C1.S7 | 権限は下るほど狭い | PASS | Run の許可とポリシーの積（`test_wp15_scenarios.py` S5） |
 | C1.S8 | 未登録・版の固定のないツールの拒否 | PASS | `test_tool_registry.py`、S5 |
-| C1.S9、S10 | Sandbox | DEFERRED | Phase 1 は合成のツールだけ（OS の隔離は Phase 3A） |
+| C1.S9、S10 | Sandbox | DEFERRED | Phase 1 は合成のツールだけ。**Phase 2 で、信頼しないコードを実行する前に**実装と試験が要る（ROADMAP の Phase 2・0.2）。OS のレベルの隔離の強化は Phase 3A |
 | C1.S11 | 認証情報を文脈・Journal・ログに入れない | PARTIAL | 認証情報は使わない。鍵の非表示と合成の印（I8）だけ |
 | C1.S12 | 外部通信は登録先だけ | DEFERRED | 外部通信なし（import の契約、試験中の遮断、I10 のネットワークのない実行） |
 | C1.S13 | 外部の内容でポリシーを変えられない | PASS | `test_wp14_context.py` |
@@ -82,7 +82,7 @@
 | C1.S16 | ファイルはワークスペースのルートの内側 | PASS | `test_wp08_*.py`（ADR-0008 の範囲） |
 | C1.S17 | ポリシーの変更はオーナーの認証された経路 | PASS | `test_safety.py`、I3 |
 | C1.S19 | ホストへの反映は検査を通った普通のファイルだけ、全体として原子的、安全なファイル操作の手段がなければ拒否 | PARTIAL | **Phase 1 の File Broker に当たる部分：** 安全なパスの解決（ADR-0008 の `dir_fd`）ができなければ開く前に拒否する、普通のファイルだけ（リンク、特殊なファイルを拒否）、1つのファイルの CREATE・REPLACE を一時ファイルと `link`・`rename` で行う（`test_wp08_*.py`）。**当たらない部分（DEFERRED）：** コンテナの停止の後の検査と、複数のファイルの全体としての原子的な反映（Sandbox は Phase 3A） |
-| C1.S18、S21、S24、S25 | Sandbox へのコピー、Gateway、プロセスの分離、MCP | DEFERRED | Phase 3A 以降 |
+| C1.S18、S21、S24、S25 | Sandbox へのコピー、Gateway、プロセスの分離、MCP | DEFERRED | S18（Sandbox へのコピー）は Phase 2（信頼しないコードの実行の前）。S21（Gateway）は Phase 3A。S24 は Docker の API の分離が Phase 2、認証情報の P3 の分離が Phase 3A。S25（MCP）は Phase 4 で必要なら |
 | C1.S20 | Permit の消費の検査 | PASS | `test_permits.py` |
 | C1.S22 | 停止の状態のファイルを先に書く | DEFERRED | Phase 1 は台帳の中の停止の記録（別ファイルではない） |
 | C1.S23 | manifest_hash・artifact_hash の変化で再審査 | PASS | `test_tool_registry.py`、`test_wp08_files.py` |
@@ -144,7 +144,7 @@
   2. A.I12、A.I17、A.I6：設計の文言との差。それぞれ別の延期の候補として、オーナーの承認を待つ（8章。一括して Phase 4 に送らない）。
   3. 独立品質レビュー（FAIL、HIGH 1・MEDIUM 3）の指摘の修正の再レビューが済んでいない（7章）。
   4. 包括的なセキュリティ監査は行われていない。AUDIT-02〜04、A-P6 は残っている。
-- **後に残せる（DEFERRED、各 Phase の範囲）：** Sandbox と OS の隔離（3A）、Gateway と外部通信、実 API（3B 以降）、評価（2）、記憶と要約、削除と復元（4）、鍵付きのハッシュ（実データの前）、外部の作業領域への反映。
+- **後に残せる（DEFERRED、各 Phase の範囲。ROADMAP が正本）：** Sandbox と隔離の自己診断（Phase 2、信頼しないコードの実行の前）、OS のレベルの隔離の強化（3A）、Gateway と外部通信、実 API（3B 以降）、評価（2）、記憶と要約、削除と復元（4）、鍵付きのハッシュ（実データの前）、外部の作業領域への反映。
 
 ### 3.7 追加した台帳の表の区分（QR-03）
 

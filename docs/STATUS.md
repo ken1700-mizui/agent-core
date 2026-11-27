@@ -11,8 +11,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1 最終受入の準備中**（`impl/phase-1-foundation`）。Codex の独立品質再レビュー（対象 `20fa058`）は CONDITIONAL_PASS（QR-01〜QR-04 の主要な指摘は解消、新しい HIGH・MEDIUM 以上なし）。残った LOW の RR-01 を補強した（`a54d52b`）。CI の準備として、公式の資料で確かめた Action の SHA への固定と uv のハッシュの固定を行った（`89f8584`、実行していない）。記録は `docs/reviews/PHASE_1_ACCEPTANCE.md`（再レビューの記録、CI の公式の資料、実行の方法の比較、3つの設計差の承認案、残っている受入の条件、正式な完了の条件、Codex の環境の再現）。**正式な完了ではない。** CI の実行、包括的なセキュリティ監査の扱いの決定、設計差のオーナーの判断、オーナーの最終承認の後に完了とする |
-| 次の作業 | オーナーの判断を待つ。**Phase 2 には進まない。** オーナーの操作（`PHASE_1_ACCEPTANCE.md` の 3.2）：CI の実行の方法の決定（`main` を変えない方法か、最小限のワークフローだけを `main` に加える方法か）、リポジトリの公開の確認、予算と「上限で利用を止める」の確認、初回の実行の許可。A.I6・A.I12・A.I17 の承認案（4章）はオーナーの承認待ち（一括して Phase 4 に送らない）。残っている課題：AUDIT-02〜04、A-P6、OS の隔離、鍵付きのハッシュ、FINAL-R05、`sqlite_ledger.py` の分割、包括的なセキュリティ監査 |
+| 今の段階 | **Phase 1 最終受入の準備中**（`impl/phase-1-foundation`）。Codex の最終品質検証（対象 `e724b2a`）は CONDITIONAL_PASS：RR-01 は解消を確認、新しい製品の不具合なし、文書の指摘 FA-01（MEDIUM）を修正した（この版のコミット。文書だけ）。Codex の環境では通常の pytest が 1788 件成功、130 件失敗、215 件エラー（`/` が UID 65534 の所有で、File Broker と CLI の祖先の条件に合わない環境。独立には未検証として扱う）、特権の5件は未実行。記録は `docs/reviews/PHASE_1_ACCEPTANCE.md`。**正式な完了ではない** |
+| 次の作業 | オーナーの判断を待つ。**Phase 2 には進まない。** 正式な完了の条件（`PHASE_1_ACCEPTANCE.md` の8章）：GitHub Actions での全品質検査（実行の方法のオーナーの決定が先。3.1）、Phase 1 の Technical Gate と Safety Gate の確認、独立に成功しなかった 345 件と特権の5件の、条件に合う環境での独立した実行、包括的なセキュリティ監査の範囲と時期の決定（CI の成功は監査の代わりにならない）、A.I6・A.I12・A.I17 の承認（未承認）、最終のオーナーの承認。Phase 2 の範囲は ROADMAP が正本（Sandbox、子プロセス、停止・タイムアウト、隔離の自己診断、A.I17 の再評価は Phase 2。OS の隔離の強化、Gateway、Process Supervisor、独立の予算の台帳、認証情報と実データの保護は 3A）。残っている課題：AUDIT-02〜04、A-P6、鍵付きのハッシュ、FINAL-R05、`sqlite_ledger.py` の分割 |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
