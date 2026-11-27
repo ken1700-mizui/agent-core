@@ -198,6 +198,13 @@ def decide(
         reasons.append(DenyReason.GRANT_SCOPE_MISMATCH)
     if descriptor.hash_scheme is not HashScheme.SYNTHETIC_SHA256:
         reasons.append(DenyReason.HASH_SCHEME_NOT_ALLOWED)
+    if (
+        grant.synthetic_task_ref is None
+        or grant.synthetic_task_ref not in policy.trusted_synthetic_tasks
+    ):
+        # P-6 (F07-3): only a Run of a synthetic task definition the owner's
+        # current policy trusts. The ref comes from the owner-installed grant.
+        reasons.append(DenyReason.SYNTHETIC_TASK_UNTRUSTED)
     if context.now_ms >= grant.expires_at_ms or context.now_ms < grant.issued_at_ms:
         reasons.append(DenyReason.GRANT_EXPIRED)
     if descriptor.expires_at_ms <= context.now_ms:

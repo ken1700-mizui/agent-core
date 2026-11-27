@@ -36,6 +36,7 @@ from agent_core.types.safety import (
     StopEntry,
     StopScopeType,
     StopStatus,
+    SyntheticTaskDefinition,
 )
 from agent_core.types.serialization import dump_json
 from agent_core.types.tools import ToolEffectClass, ToolManifest, ToolRegistration
@@ -146,6 +147,12 @@ def ref(**overrides: Any) -> AttemptRef:
     return AttemptRef(**values)
 
 
+# P-6 (F07-3): the managed synthetic task definition the test policy trusts.
+SYNTHETIC_TASK = SyntheticTaskDefinition(
+    kind="synthetic_task_definition", name="synthetic_test_task", version=1
+)
+
+
 def policy(**overrides: Any) -> Policy:
     values: dict[str, Any] = {
         "policy_version": POLICY_VERSION,
@@ -161,6 +168,7 @@ def policy(**overrides: Any) -> Policy:
         "model_providers": (ModelProviderKind.FAKE, ModelProviderKind.REPLAY),
         "deny_resources": ("workspace/secret/**",),
         "trusted_synthetic_workspaces": (WORKSPACE,),
+        "trusted_synthetic_tasks": (SYNTHETIC_TASK.ref(),),
         "price_table_id": PRICE_TABLE.price_table_id,
         "price_table_version": PRICE_TABLE.version,
         "max_permit_ttl_ms": 60_000,
@@ -187,6 +195,7 @@ def grant(at: AttemptRef, **overrides: Any) -> RunGrant:
         "access_epoch_at_grant": 0,
         "issued_at_ms": NOW - 1_000,
         "expires_at_ms": NOW + 3_600_000,
+        "synthetic_task_ref": SYNTHETIC_TASK.ref(),
     }
     values.update(overrides)
     return RunGrant(**values)

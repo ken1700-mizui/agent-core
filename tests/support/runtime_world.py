@@ -10,6 +10,7 @@ from agent_core.ports.journal import JournalPort
 from agent_core.runtime.service import RuntimeStateMachine
 from agent_core.types.errors import EvidenceRejectedError
 from agent_core.types.ids import PermitId, ReceiptId, ReservationId, RunGrantId
+from agent_core.types.profile import PHASE1_SYNTHETIC
 from agent_core.types.records import Attempt, AttemptState, Run, RunStatus, Step, StepKind, Task
 from agent_core.types.transitions import (
     AbortEvidence,
@@ -56,6 +57,7 @@ def machine(journal: JournalPort | None = None, verifier: Any = None) -> Runtime
         tenant_id=b.TENANT,
         engine=b.ENGINE,
         policy_version="policy-1",
+        profile=PHASE1_SYNTHETIC,
     )
 
 

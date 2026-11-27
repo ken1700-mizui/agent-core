@@ -1878,8 +1878,15 @@ def _install_policy(cur: sqlite3.Cursor, op: InstallPolicy, now_ms: int) -> None
 
 def _install_grant(cur: sqlite3.Cursor, op: InstallRunGrant, now_ms: int) -> None:
     grant = op.grant
-    if _policy(cur, str(grant.tenant_id)) is None:
+    policy = _policy(cur, str(grant.tenant_id))
+    if policy is None:
         raise PermitRejectedError(PermitReason.POLICY_DENIED, "NO_POLICY")
+    if (
+        grant.synthetic_task_ref is None
+        or grant.synthetic_task_ref not in policy.trusted_synthetic_tasks
+    ):
+        # P-6 (F07-3): a Run is granted only for a trusted synthetic task definition.
+        raise PermitRejectedError(PermitReason.POLICY_DENIED, "SYNTHETIC_TASK_UNTRUSTED")
     row = cur.execute(
         "SELECT grant_hash FROM run_grants WHERE run_id = ?", (str(grant.run_id),)
     ).fetchone()

@@ -56,7 +56,7 @@ from agent_core.types.model import (
     ToolUseBlock,
     WindowCounts,
 )
-from agent_core.types.safety import ToolPin
+from agent_core.types.safety import SyntheticTaskDefinition, ToolPin
 from agent_core.types.tools import (
     ApplyField,
     ApprovalCondition,
@@ -322,6 +322,23 @@ class DemoTask:
 
 
 DEMOS: Final = ("report", "repair", "falseclaim")
+
+
+def task_definition(name: str) -> SyntheticTaskDefinition | None:
+    """P-6 (F07-3): the managed synthetic task definition of a demo, or None."""
+    if name not in DEMOS:
+        return None
+    return SyntheticTaskDefinition(kind="synthetic_task_definition", name=name, version=1)
+
+
+def trusted_task_refs() -> tuple[str, ...]:
+    """The definitions the owner's policy trusts: the demos, nothing else."""
+    refs = []
+    for name in DEMOS:
+        definition = task_definition(name)
+        assert definition is not None  # noqa: S101 (every demo has one)
+        refs.append(definition.ref())
+    return tuple(refs)
 
 
 def demo_task(name: str, number: int) -> DemoTask | None:

@@ -70,7 +70,7 @@ from agent_core.tool.registry import ToolRegistry
 from agent_core.types.base import FrozenModel
 from agent_core.types.context import SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind
-from agent_core.types.errors import WorkspaceRejectedError
+from agent_core.types.errors import RuntimeProfileError, WorkspaceRejectedError
 from agent_core.types.ids import (
     ApprovalId,
     AttemptId,
@@ -95,6 +95,7 @@ from agent_core.types.ledger import (
     StopScope,
 )
 from agent_core.types.model_errors import ModelNotSentError
+from agent_core.types.profile import PHASE1_SYNTHETIC, require_phase1_profile
 from agent_core.types.records import Attempt, AttemptState, Run, RunStatus, Task
 from agent_core.types.safety import (
     ApproverRole,
@@ -222,6 +223,9 @@ class _ConfigFile(FrozenModel):
     tenant_id: Annotated[str, StringConstraints(strict=True, max_length=128)]
     owner_id: Annotated[str, StringConstraints(strict=True, max_length=128)]
     workspace_ref: Digest
+    # P-6 (F07-1): the start profile. Missing reads as None and is refused (no
+    # default); a value of another type is a malformed file (HOME_UNSAFE).
+    profile: Annotated[str, StringConstraints(strict=True, max_length=64)] | None = None
 
 
 def _load_keys(home: Home) -> LedgerKeys:
@@ -240,18 +244,28 @@ class HomeConfig:
     tenant_id: TenantId
     owner_id: UserId
     workspace_ref: str
+    profile: str = PHASE1_SYNTHETIC
 
     @classmethod
     def load(cls, home: Home) -> HomeConfig:
+        """The home's configuration, checked before the journal is opened: a home
+        whose profile is not ``phase1_synthetic`` is refused (PROFILE_REFUSED)
+        before any owner epoch or other state changes (P-6, F07-1)."""
         try:
             data = _ConfigFile.model_validate(_strict_json(home.read(CONFIG_FILE)))
-            return cls(
+            config = cls(
                 tenant_id=TenantId(data.tenant_id),
                 owner_id=UserId(data.owner_id),
                 workspace_ref=data.workspace_ref,
+                profile=data.profile if data.profile is not None else "",
             )
         except (ValueError, TypeError, UnicodeDecodeError):
             raise CliError("HOME_UNSAFE") from None
+        try:
+            require_phase1_profile(config.profile)
+        except RuntimeProfileError:
+            raise CliError("PROFILE_REFUSED") from None
+        return config
 
 
 def parse_seq(data: bytes) -> int | None:
@@ -310,6 +324,7 @@ def policy_for(config: HomeConfig, tools: tuple[ToolRegistration, ...]) -> Polic
         model_providers=(ModelProviderKind.FAKE,),
         deny_resources=("workspace/secret/**",),
         trusted_synthetic_workspaces=(config.workspace_ref,),
+        trusted_synthetic_tasks=demo.trusted_task_refs(),
         price_table_id=demo.PRICE_TABLE.price_table_id,
         price_table_version=demo.PRICE_TABLE.version,
         max_permit_ttl_ms=60_000,
@@ -373,6 +388,7 @@ def init_home(home: Path, *, clock: Clock) -> None:
             json.dumps(
                 {
                     "version": 1,
+                    "profile": PHASE1_SYNTHETIC,
                     "tenant_id": str(config.tenant_id),
                     "owner_id": str(config.owner_id),
                     "workspace_ref": config.workspace_ref,
@@ -611,14 +627,15 @@ class Session:
         run = self.sm.start_run(task, run_grant_ref=self.ids.new(RunGrantId))
         run = self.sm.set_run_status(run, RunStatus.QUEUED)
         run = self.sm.set_run_status(run, RunStatus.RUNNING)
-        self._install_run(task, run)
+        self._install_run(task, run, name)
         loop = self._make_loop(task_demo, task, demo.ScriptedFakeModel(list(task_demo.replies)))
         self.runs[run.run_id] = _RunEntry(loop, name)
         self.current = run.run_id
         return task, run, loop.run(run.run_id)
 
-    def _install_run(self, task: Task, run: Run) -> None:
+    def _install_run(self, task: Task, run: Run, name: str) -> None:
         now = self.clock.now_ms()
+        definition = demo.task_definition(name)
         grant = RunGrant(
             run_grant_id=run.run_grant_ref,
             tenant_id=self.config.tenant_id,
@@ -635,6 +652,7 @@ class Session:
             access_epoch_at_grant=self.journal.access_epoch(str(self.config.tenant_id)),
             issued_at_ms=now,
             expires_at_ms=now + demo.GRANT_TTL_MS,
+            synthetic_task_ref=None if definition is None else definition.ref(),
         )
         ops: list[LedgerOp] = [
             InstallRunGrant(op="install_run_grant", grant=grant),
@@ -829,6 +847,7 @@ def _load_state(
         tenant_id=config.tenant_id,
         engine=ENGINE,
         policy_version=demo.POLICY_VERSION,
+        profile=config.profile,
     )
     return ids, sm
 

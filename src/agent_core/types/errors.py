@@ -292,6 +292,14 @@ class RuntimeReloadRequiredError(AgentCoreError):
     fatal = True
 
 
+class RuntimeProfileError(AgentCoreError):
+    """P-6, F07-1: the Runtime starts only under the ``phase1_synthetic`` profile.
+    Any other value (another profile, a missing one, another type) is refused
+    before anything is read or written."""
+
+    code = "RUNTIME_PROFILE_REFUSED"
+
+
 class StateDivergenceError(AgentCoreError):
     """The journal stored an event whose position differs from the one planned."""
 

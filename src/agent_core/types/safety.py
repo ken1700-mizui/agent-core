@@ -53,6 +53,7 @@ from agent_core.types.values import (
     SemVer,
     TimestampMs,
     require_unique,
+    sha256_digest,
 )
 
 ACTION_HASH_DOMAIN = b"agent-core/action-descriptor/v1\x00"
@@ -193,6 +194,7 @@ class DenyReason(StrEnum):
     STOP_STATE_INCONSISTENT = "STOP_STATE_INCONSISTENT"
     HASH_SCHEME_NOT_ALLOWED = "HASH_SCHEME_NOT_ALLOWED"
     COST_BASIS_UNTRUSTED = "COST_BASIS_UNTRUSTED"
+    SYNTHETIC_TASK_UNTRUSTED = "SYNTHETIC_TASK_UNTRUSTED"
 
 
 class ApprovalReason(StrEnum):
@@ -338,6 +340,9 @@ class Policy(FrozenModel):
     model_providers: tuple[ModelProviderKind, ...]
     deny_resources: tuple[RelPath, ...]
     trusted_synthetic_workspaces: tuple[Digest, ...]
+    # P-6 (F07-3): the synthetic task definitions the owner trusts, by their ref.
+    # A Run's grant must name one of them (``RunGrant.synthetic_task_ref``).
+    trusted_synthetic_tasks: tuple[Digest, ...]
     # The owner's installed synthetic price table every model call is priced with.
     price_table_id: Identifier
     price_table_version: SemVer
@@ -354,6 +359,22 @@ class Policy(FrozenModel):
 
     def policy_hash(self) -> str:
         return _domain_hash(POLICY_HASH_DOMAIN, self)
+
+
+class SyntheticTaskDefinition(FrozenModel):
+    """P-6 (F07-3): a managed synthetic task definition, identified by its ref.
+
+    Phase 1's minimal form (the CLI's demo tasks); the Phase 2 Task Catalog will
+    supply its entries in this place. Trust comes from the owner's policy listing
+    the ref, never from a "synthetic" flag in data the model can write. It does
+    not prove that the data a task touches is not real data."""
+
+    kind: Literal["synthetic_task_definition"]
+    name: Identifier
+    version: Annotated[int, Field(strict=True, ge=1)]
+
+    def ref(self) -> str:
+        return sha256_digest(dump_json(self))
 
 
 class RunGrant(FrozenModel):
@@ -375,6 +396,10 @@ class RunGrant(FrozenModel):
     access_epoch_at_grant: Epoch
     issued_at_ms: TimestampMs
     expires_at_ms: TimestampMs
+    # P-6 (F07-3): the managed synthetic task definition this Run carries out, set
+    # by the owner's path when the grant is installed (never by the model). None
+    # (missing) is refused, like a definition the policy does not trust.
+    synthetic_task_ref: Digest | None
 
     @model_validator(mode="after")
     def _ordered(self) -> Self:

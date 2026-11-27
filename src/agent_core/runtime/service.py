@@ -59,6 +59,7 @@ from agent_core.types.event_hash import event_hash
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import AttemptId, EventId, RunGrantId, RunId, StepId, TaskId, TenantId
 from agent_core.types.ledger import LedgerOp
+from agent_core.types.profile import require_phase1_profile
 from agent_core.types.records import (
     Attempt,
     AttemptState,
@@ -164,13 +165,18 @@ class RuntimeStateMachine:
         tenant_id: TenantId,
         engine: EngineVersion,
         policy_version: str,
+        profile: str,
     ) -> RuntimeStateMachine:
         """Rebuild the state from the Journal (the source of truth).
+
+        P-6 (F07-1): only under the ``phase1_synthetic`` profile; any other value
+        is refused before the journal is read.
 
         Pages are read until the journal's head is the last event read; if the
         journal grew while reading, reading continues. The resulting state is
         bound to that head (``tenant_seq`` and hash) for every later append.
         """
+        require_phase1_profile(profile)
         events: list[Event] = []
         while True:
             page = journal.read_tenant(tenant_id, after_tenant_seq=len(events), limit=READ_PAGE)
