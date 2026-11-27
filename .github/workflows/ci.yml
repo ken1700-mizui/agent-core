@@ -12,6 +12,17 @@
 # Secrets: none are used. Permissions are read-only and the checkout does not
 # keep credentials.
 #
+# Privileged tests (tests/support/privileged.py): a test whose setup needs root
+# (CAP_MKNOD, CAP_CHOWN) fails as PRIVILEGED_NOT_RUN without root; it is never
+# skipped. The ordinary tests run as the runner's user with -m "not privileged";
+# the privileged ones run as root in their own step with -m privileged (an empty
+# selection fails: pytest exits 5). That the runner has password-less sudo is
+# not verified here (docs/design/phase-1/WP-13_INTEGRATION.md).
+#
+# Dispatch: a workflow_dispatch workflow is expected to be dispatchable only
+# when its file is on the default branch (main, an empty commit here). Not
+# verified, and main is not changed without the owner's approval.
+#
 # Supply chain (WP01-R03, open item): the actions below are GitHub's own, but
 # they are referenced by tag, not by commit SHA. The official SHAs have not
 # been verified because no external lookup was authorized; they must not be
@@ -42,6 +53,15 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Record the commit and the environment
+        run: |
+          {
+            echo "commit: $(git rev-parse HEAD) (GITHUB_SHA ${GITHUB_SHA}, ref ${GITHUB_REF})"
+            echo "runner: ${RUNNER_OS} ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+            echo "kernel: $(uname -srm)"
+            echo "user: $(id)"
+          } | tee -a "${GITHUB_STEP_SUMMARY}"
+
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
@@ -51,7 +71,9 @@ jobs:
         run: python -I tools/secret_scan.py --mode commit --rev HEAD
 
       - name: Install uv
-        run: python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+        run: |
+          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          { python --version; uv --version; } | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Check that uv.lock matches pyproject.toml
         run: uv lock --check
@@ -76,5 +98,8 @@ jobs:
           PYTHONPATH: src
         run: uv run --locked --offline lint-imports
 
-      - name: pytest
-        run: uv run --locked --offline pytest
+      - name: pytest (ordinary tests, as the runner's user)
+        run: uv run --locked --offline pytest -m "not privileged"
+
+      - name: pytest (privileged tests, as root)
+        run: sudo "${PWD}/.venv/bin/python" -m pytest -p no:cacheprovider -m privileged

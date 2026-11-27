@@ -75,6 +75,19 @@ def test_two_overlapping_writes_have_no_provable_last() -> None:
     assert reasons == ["WRITE_ORDER_UNPROVEN"]
 
 
+def test_earlier_overlapping_writes_do_not_hide_a_provable_last_write() -> None:
+    # The first two overlap each other; the third started after both ended, so it
+    # is provably the last write (the file's content), and it ended before the read.
+    writes = [(X, _done(2, 5)), (Y, _done(3, 6)), (Y, _done(7, 8))]
+    assert _write_order_reasons(writes, READ) == ([], Y)
+
+
+def test_the_last_write_overlapping_an_earlier_one_has_no_provable_last() -> None:
+    writes = [(X, _done(2, 3)), (Y, _done(4, 7)), (X, _done(6, 8))]
+    reasons, _ = _write_order_reasons(writes, READ)
+    assert reasons == ["WRITE_ORDER_UNPROVEN"]
+
+
 def test_an_unknown_or_late_reconciled_write_is_not_ordered() -> None:
     late = _Span(state="COMPLETED", started=2, ended=3, unknown=True)
     reasons, _ = _write_order_reasons([(X, late)], READ)

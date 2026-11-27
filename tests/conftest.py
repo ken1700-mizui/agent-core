@@ -16,6 +16,7 @@ Scope of this guard (it is not OS-level isolation):
 
 from __future__ import annotations
 
+import os
 import socket
 from typing import Any, NoReturn
 
@@ -57,3 +58,23 @@ def _block_network(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(socket.socket, method, _refuse)
     for function in _REFUSED_MODULE_FUNCTIONS:
         monkeypatch.setattr(socket, function, _refuse)
+
+
+def pytest_runtest_setup(item: Any) -> None:
+    """A privileged test (``@pytest.mark.privileged(reason=...)``, see
+    ``tests/support/privileged.py``) runs only as root. Without root it fails as
+    ``PRIVILEGED_NOT_RUN``: never skipped, never counted as a success. Deselect
+    it explicitly with ``-m "not privileged"``; run it as root with
+    ``-m privileged``."""
+    marker = item.get_closest_marker("privileged")
+    if marker is None:
+        return
+    reason = marker.kwargs.get("reason")
+    if not reason:
+        pytest.fail("PRIVILEGED_REASON_MISSING: a privileged test states why", pytrace=False)
+    if os.geteuid() != 0:
+        pytest.fail(
+            f"PRIVILEGED_NOT_RUN: {reason}; run as root with -m privileged, "
+            "or deselect with -m 'not privileged'",
+            pytrace=False,
+        )

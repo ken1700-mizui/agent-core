@@ -29,6 +29,7 @@ from agent_core.types.transitions import AbortReason
 from support import builders as b
 from support import files_world as fw
 from support import ledger_world as lw
+from support import privileged
 from support import safety_world as s
 from support import tool_world as tw
 
@@ -145,7 +146,16 @@ def test_a_read_in_a_moved_tree_reads_the_verified_tree(world: Any) -> None:
 
 
 @pytest.mark.parametrize(
-    "kind", ["symlink", "hardlink", "fifo", "socket", "char-device", "directory", "missing"]
+    "kind",
+    [
+        "symlink",
+        "hardlink",
+        "fifo",
+        "socket",
+        pytest.param("char-device", marks=privileged.MKNOD),
+        "directory",
+        "missing",
+    ],
 )
 def test_only_a_regular_file_with_one_link_is_read(
     world: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str

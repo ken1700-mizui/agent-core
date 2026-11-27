@@ -31,6 +31,11 @@ testpaths = ["tests"]
 pythonpath = ["src", "tools", "tests"]
 addopts = ["-ra", "--strict-markers", "--strict-config"]
 xfail_strict = true
+# A test whose setup needs root is marked ``privileged``; without root it fails
+# (never skipped). Non-root runs deselect it with -m "not privileged".
+markers = [
+    "privileged(reason): the setup needs a privilege only root has; runs only as root",
+]
 filterwarnings = ["error"]
 
 # ---------------------------------------------------------------- ruff

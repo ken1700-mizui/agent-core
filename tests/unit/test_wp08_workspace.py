@@ -42,6 +42,7 @@ from agent_core.types.serialization import dump_json
 from agent_core.types.transitions import AbortReason
 from support import files_world as fw
 from support import ledger_world as lw
+from support import privileged
 from support import safety_world as s
 
 A = AttemptState
@@ -202,7 +203,9 @@ def test_a_root_behind_a_link_is_refused(world: Any) -> None:
     _rejected(lambda: _prepare(st, tree, attempt, workspace_id="link"), "ROOT_UNUSABLE")
 
 
-@pytest.mark.parametrize("change", ["group-readable", "other-owner"])
+@pytest.mark.parametrize(
+    "change", ["group-readable", pytest.param("other-owner", marks=privileged.CHOWN)]
+)
 def test_the_root_must_be_private_and_ours(world: Any, change: str) -> None:
     st, tree = world
     attempt = fw.consumed(st, tree)
@@ -279,7 +282,7 @@ def test_a_link_above_the_area_is_refused(tmp_path: Path) -> None:
     [
         pytest.param(0o777, None, False, id="world-writable"),
         pytest.param(0o1777, None, True, id="world-writable-sticky"),
-        pytest.param(0o755, 54_321, False, id="other-owner"),
+        pytest.param(0o755, 54_321, False, id="other-owner", marks=privileged.CHOWN),
         pytest.param(0o755, None, True, id="plain"),
     ],
 )
@@ -383,7 +386,7 @@ def test_reserved_names_are_not_tool_targets(path: str) -> None:
         pytest.param("symlink-second", id="link-at-second-level"),
         pytest.param("file-instead", id="file-instead-of-directory"),
         pytest.param("group-writable", id="group-writable-directory"),
-        pytest.param("other-owner", id="directory-of-another-user"),
+        pytest.param("other-owner", id="directory-of-another-user", marks=privileged.CHOWN),
         pytest.param("fifo-instead", id="fifo-instead-of-directory"),
     ],
 )
@@ -420,6 +423,28 @@ def test_each_level_of_the_walk_is_checked(world: Any, tmp_path: Path, change: s
     assert excinfo.value.reasons == ("PATH_UNSAFE",)
     assert excinfo.value.effect is FileEffect.NONE
     assert (outside / "out/r.txt").read_bytes() == b"outside\n"
+
+
+def test_the_walk_compares_each_owner_without_privilege(
+    world: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unprivileged counterpart of ``directory-of-another-user`` (which needs
+    CAP_CHOWN and stays a privileged test): the broker compares each directory's
+    owner with the effective uid at the time of the walk; with the effective uid
+    another user's, this user's own directories are another user's."""
+    st, tree = world
+    attempt = fw.consumed(st, tree)
+    other = os.geteuid() + 1
+    with _prepare(st, tree, attempt) as prepared:
+        monkeypatch.setattr(os, "geteuid", lambda: other)  # as file_broker sees it
+        with (
+            pytest.raises(FileOperationFailedError) as excinfo,
+            prepared.resolve_parent("workspace/out/r.txt"),
+        ):
+            pass
+        monkeypatch.undo()
+    assert excinfo.value.reasons == ("PATH_UNSAFE",)
+    assert excinfo.value.effect is FileEffect.NONE
 
 
 def test_the_walk_uses_only_single_names_and_fds(

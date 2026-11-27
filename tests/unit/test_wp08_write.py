@@ -45,6 +45,7 @@ from agent_core.types.safety import ReceiptState, StopScopeType, ToolContent
 from support import builders as b
 from support import files_world as fw
 from support import ledger_world as lw
+from support import privileged
 from support import safety_world as s
 from support import tool_world as tw
 
@@ -208,7 +209,9 @@ def test_replace_needs_the_target(world: Any) -> None:
     _refused_without_effect(st, tree, attempt, b"synthetic replaced\n")
 
 
-@pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "char-device"])
+@pytest.mark.parametrize(
+    "kind", ["symlink", "hardlink", "fifo", pytest.param("char-device", marks=privileged.MKNOD)]
+)
 def test_replace_refuses_special_targets(
     world: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
