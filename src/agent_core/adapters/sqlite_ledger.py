@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import sqlite3
 import threading
 from typing import Any, Final
@@ -2945,22 +2946,55 @@ def _inconsistent(reason: str) -> LedgerInconsistencyError:
 
 
 def _journal_view(cur: sqlite3.Cursor) -> dict[str, dict[str, Any]]:
-    """The runtime chain as the journal's own events record it (last snapshot wins)."""
-    view: dict[str, dict[str, Any]] = {"tasks": {}, "runs": {}, "steps": {}, "attempts": {}}
-    for (body,) in cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq"):
+    """The runtime chain as the journal's own events record it (last snapshot wins).
+
+    QR-02: each entity's tenant is its events' tenant (the journal is its source);
+    an entity recorded under two tenants is refused. ``completions`` keeps each
+    Run's completion evidence (QR-03), as the journal recorded it."""
+    view: dict[str, dict[str, Any]] = {
+        "tasks": {},
+        "runs": {},
+        "steps": {},
+        "attempts": {},
+        "tenants": {},
+        "completions": {},
+    }
+    bodies = cur.execute("SELECT body FROM events ORDER BY tenant_id, tenant_seq").fetchall()
+    for (body,) in bodies:
         event = Event.model_validate_json(body)
         if not isinstance(event.payload, RuntimePayload):
             continue
+        tenant = str(event.tenant_id)
         for t in event.payload.transitions:
             if isinstance(t, TaskTransition):
-                view["tasks"][str(t.after.task_id)] = t.after
+                key, table = str(t.after.task_id), "tasks"
             elif isinstance(t, RunTransition):
-                view["runs"][str(t.after.run_id)] = t.after
+                key, table = str(t.after.run_id), "runs"
+                if t.after.status.value == "COMPLETED":
+                    view["completions"][key] = t.evidence
             elif isinstance(t, StepTransition):
-                view["steps"][str(t.after.step_id)] = t.after
-            elif isinstance(t, AttemptTransition):
-                view["attempts"][str(t.after.attempt_id)] = t.after
+                key, table = str(t.after.step_id), "steps"
+            else:  # the transitions are of these four kinds only
+                key, table = str(t.after.attempt_id), "attempts"
+            view[table][key] = t.after
+            if view["tenants"].setdefault(key, tenant) != tenant:
+                raise _inconsistent("TENANT_MISMATCH")
     return view
+
+
+def _check_chain(view: dict[str, dict[str, Any]]) -> None:
+    """QR-02: every parent the journal names exists, of the same tenant."""
+    tenants = view["tenants"]
+    links = (
+        [(k, str(r.task_id), "tasks") for k, r in view["runs"].items()]
+        + [(k, str(s.run_id), "runs") for k, s in view["steps"].items()]
+        + [(k, str(a.step_id), "steps") for k, a in view["attempts"].items()]
+    )
+    for child, parent, table in links:
+        if parent not in view[table]:
+            raise _inconsistent("PARENT_MISSING")
+        if tenants[child] != tenants[parent]:
+            raise _inconsistent("TENANT_MISMATCH")
 
 
 MIRROR_TABLES: Final = ("rt_tasks", "rt_runs", "rt_steps", "rt_attempts")
@@ -2976,7 +3010,12 @@ def repair_mirror(cur: sqlite3.Cursor) -> tuple[str, ...]:
     A damaged projection's values are never
     kept. Nothing else is touched: costs, approvals, permits, receipts, stops,
     results and the audit are sources of truth, not projections. Returns the
-    names of the tables rewritten (empty when nothing differed)."""
+    names of the tables rewritten (empty when nothing differed).
+
+    QR-02: a journal whose own chain is inconsistent (an entity under two tenants,
+    a child of another tenant than its parent, a missing parent) is refused, never
+    "repaired": the projection would only hide the source's damage."""
+    _check_chain(_journal_view(cur))
     want: dict[str, dict[str, tuple[Any, ...]]] = {
         "rt_tasks": {},
         "rt_runs": {},
@@ -3057,26 +3096,32 @@ def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
         for r in cur.execute("SELECT attempt_id, step_id, state FROM rt_attempts")
     }
     expected = {k: (str(a.step_id), a.state.value) for k, a in view["attempts"].items()}
+    tenants = view["tenants"]
     runs = {
-        r[0]: (r[1], r[2], bool(r[3]))
-        for r in cur.execute("SELECT run_id, task_id, status, cancel_requested FROM rt_runs")
+        r[0]: (r[1], r[2], bool(r[3]), r[4])
+        for r in cur.execute(
+            "SELECT run_id, task_id, status, cancel_requested, tenant_id FROM rt_runs"
+        )
     }
     expected_runs = {
-        k: (str(r.task_id), r.status.value, r.cancel_requested) for k, r in view["runs"].items()
+        k: (str(r.task_id), r.status.value, r.cancel_requested, tenants[k])
+        for k, r in view["runs"].items()
     }
     steps = {r[0]: (r[1], r[2]) for r in cur.execute("SELECT step_id, run_id, kind FROM rt_steps")}
     expected_steps = {k: (str(s.run_id), s.kind.value) for k, s in view["steps"].items()}
     # Task limits are compared too: the budget in micro units and every cap, the
     # caps read back as their type (a malformed copy is a mismatch as well).
-    tasks: dict[str, tuple[int, NonMonetaryCaps | None]] = {}
-    for task_id, budget, caps in cur.execute("SELECT task_id, budget_micro, caps FROM rt_tasks"):
+    tasks: dict[str, tuple[int, NonMonetaryCaps | None, str]] = {}
+    for task_id, budget, caps, tenant in cur.execute(
+        "SELECT task_id, budget_micro, caps, tenant_id FROM rt_tasks"
+    ):
         try:
             parsed: NonMonetaryCaps | None = NonMonetaryCaps.model_validate_json(caps)
         except ValueError:
             parsed = None
-        tasks[task_id] = (int(budget), parsed)
+        tasks[task_id] = (int(budget), parsed, tenant)
     expected_tasks = {
-        k: (t.budget_total.micro_units, t.caps_total) for k, t in view["tasks"].items()
+        k: (t.budget_total.micro_units, t.caps_total, tenants[k]) for k, t in view["tasks"].items()
     }
     if (attempts, runs, steps, tasks) != (
         expected,
@@ -3085,6 +3130,80 @@ def _check_mirror(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
         expected_tasks,
     ):
         raise _inconsistent("MIRROR_MISMATCH")
+
+
+# QR-03: which of the ledger's own records are sources of truth, projections or
+# derived data (WP-13_INTEGRATION.md):
+# - rt_tasks, rt_runs, rt_steps, rt_attempts: projections of the journal's events
+#   (re-derivable; ProjectionRepair rewrites them).
+# - entity_times, run_status_times: sources of truth, in the ledger's own clock;
+#   the events carry another clock's time, so these are never re-derivable. Only
+#   their presence, their entity, their status and their bounds are checked.
+# - operation_results: a source of truth from a MAC-checked execution report that
+#   is not kept; the digest is checked for its form, its Attempt, a recorded start
+#   and the completions that name it, never against the bytes (not kept either).
+_STARTED_STATES: Final = frozenset(
+    {
+        AttemptState.DISPATCH_STARTED.value,
+        AttemptState.COMPLETED.value,
+        AttemptState.FAILED_DEFINITE.value,
+        AttemptState.OUTCOME_UNKNOWN.value,
+    }
+)
+_DIGEST_FORM: Final = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _check_ledger_records(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
+    clock = cur.execute("SELECT high_water_ms FROM ledger_clock WHERE singleton = 1").fetchone()
+    if clock is None:
+        raise _inconsistent("CLOCK_STATE_MISSING")
+    high = int(clock[0])
+    times = {
+        r[0]: int(r[1]) for r in cur.execute("SELECT entity_id, created_at_ms FROM entity_times")
+    }
+    if set(times) != set(view["tasks"]) | set(view["runs"]):
+        raise _inconsistent("ENTITY_TIMES_DIFFER")  # missing, or of no such entity
+    if any(t > high for t in times.values()):
+        raise _inconsistent("ENTITY_TIME_AFTER_CLOCK")
+    for run_id, run in view["runs"].items():
+        if times[run_id] < times[str(run.task_id)]:
+            raise _inconsistent("RUN_BEFORE_TASK")
+    since = {
+        r[0]: (r[1], int(r[2]))
+        for r in cur.execute("SELECT run_id, status, since_ms FROM run_status_times")
+    }
+    if set(since) != set(view["runs"]):
+        raise _inconsistent("RUN_STATUS_TIMES_DIFFER")
+    for run_id, run in view["runs"].items():
+        status, at = since[run_id]
+        if status != run.status.value:
+            raise _inconsistent("RUN_STATUS_TIME_OF_ANOTHER_STATUS")
+        if not times[run_id] <= at <= high:
+            raise _inconsistent("RUN_STATUS_TIME_OUT_OF_BOUNDS")
+    receipts = {r[0]: r[1] for r in cur.execute("SELECT receipt_id, state FROM receipts")}
+    receipt_of = {
+        r[0]: r[1]
+        for r in cur.execute("SELECT attempt_id, receipt_id FROM reservations")
+        if r[1] is not None
+    }
+    results = {
+        r[0]: r[1] for r in cur.execute("SELECT attempt_id, result_digest FROM operation_results")
+    }
+    for attempt_id, digest in results.items():
+        attempt = view["attempts"].get(attempt_id)
+        if attempt is None:
+            raise _inconsistent("RESULT_OF_NO_ATTEMPT")
+        if not isinstance(digest, str) or _DIGEST_FORM.fullmatch(digest) is None:
+            raise _inconsistent("RESULT_MALFORMED")
+        started = receipts.get(receipt_of.get(attempt_id, "")) == ReceiptState.USED.value
+        if attempt.state.value not in _STARTED_STATES or not started:
+            raise _inconsistent("RESULT_WITHOUT_START")
+    for evidence in view["completions"].values():
+        for check in getattr(evidence, "checks", ()):
+            if check.read_attempt_id is None:
+                continue
+            if results.get(str(check.read_attempt_id)) != check.observed_digest:
+                raise _inconsistent("COMPLETION_RESULT_DIFFERS")  # missing or changed
 
 
 def _check_reservations(cur: sqlite3.Cursor, view: dict[str, dict[str, Any]]) -> None:
@@ -3226,7 +3345,9 @@ def verify_consistency(cur: sqlite3.Cursor) -> None:
     Not a full Recovery Engine: it detects disagreement, it does not repair it, and
     it cannot detect a consistent rewrite by someone holding the database."""
     view = _journal_view(cur)
+    _check_chain(view)
     _check_mirror(cur, view)
+    _check_ledger_records(cur, view)
     _check_reservations(cur, view)
     _check_permits(cur)
     _check_entries(cur)
@@ -3262,7 +3383,14 @@ def revoke_stale(cur: sqlite3.Cursor, new_owner_epoch: int, wall_ms: int) -> Non
 
 
 def read_run_status_since(cur: sqlite3.Cursor, run_id: str) -> int | None:
+    """QR-03: read only when the record agrees with the Run's current status (a
+    record of another status, or a Run without one, is refused, never used)."""
+    run = cur.execute("SELECT status FROM rt_runs WHERE run_id = ?", (run_id,)).fetchone()
     row = cur.execute(
-        "SELECT since_ms FROM run_status_times WHERE run_id = ?", (run_id,)
+        "SELECT status, since_ms FROM run_status_times WHERE run_id = ?", (run_id,)
     ).fetchone()
-    return None if row is None else int(row[0])
+    if run is None and row is None:
+        return None
+    if run is None or row is None or row[0] != run[0]:
+        raise _inconsistent("RUN_STATUS_TIME_DISAGREES")
+    return int(row[1])
