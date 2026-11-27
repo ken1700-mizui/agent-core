@@ -1,0 +1,8 @@
+# uv for the CI job (WP-01), installed in pip's hash-checking mode:
+#   python -m pip install --require-hashes --only-binary :all: --no-deps -r tools/ci/uv-requirements.txt
+# The one wheel of uv 0.11.32 for x86_64 glibc Linux (ubuntu-24.04), by the sha256
+# PyPI publishes for it (https://pypi.org/pypi/uv/0.11.32/json, read 2026-11-27).
+# Any other file (another platform, the sdist) is refused. The version must equal
+# UV_VERSION in .github/workflows/ci.yml (tests/unit/test_ci_definition.py).
+uv==0.11.32 \
+    --hash=sha256:3da76cd4e2697de30928b8a8524bd39183ac1e08cb7e72833807c022b7cba6c4

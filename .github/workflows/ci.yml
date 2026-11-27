@@ -16,17 +16,23 @@
 # (CAP_MKNOD, CAP_CHOWN) fails as PRIVILEGED_NOT_RUN without root; it is never
 # skipped. The ordinary tests run as the runner's user with -m "not privileged";
 # the privileged ones run as root in their own step with -m privileged (an empty
-# selection fails: pytest exits 5). That the runner has password-less sudo is
-# not verified here (docs/design/phase-1/WP-13_INTEGRATION.md).
+# selection fails: pytest exits 5). GitHub's documentation says the Linux
+# runners use passwordless sudo.
 #
-# Dispatch: a workflow_dispatch workflow is expected to be dispatchable only
-# when its file is on the default branch (main, an empty commit here). Not
-# verified, and main is not changed without the owner's approval.
+# Dispatch: GitHub's documentation says that to trigger workflow_dispatch the
+# workflow must be in the default branch. The default branch (main) is an empty
+# commit, so this workflow cannot be dispatched until the owner decides how
+# (main is not changed without the owner's approval).
 #
-# Supply chain (WP01-R03, open item): the actions below are GitHub's own, but
-# they are referenced by tag, not by commit SHA. The official SHAs have not
-# been verified because no external lookup was authorized; they must not be
-# guessed. Pin them once the SHAs are verified (docs/STATUS.md).
+# Supply chain (WP01-R03): the actions are GitHub's own, pinned to full commit
+# SHAs read on 2026-11-27 from the official repositories (git ls-remote of the
+# release tags; lightweight tags, so the SHA is the commit):
+#   actions/checkout     v6.1.0 (= v6)  d23441a48e516b6c34aea4fa41551a30e30af803
+#   actions/setup-python v6.3.0 (= v6)  ece7cb06caefa5fff74198d8649806c4678c61a1
+# v6 of both runs on node24. Node 20 is no longer available on GitHub Actions
+# runners (GitHub changelog, 2026-09-23), and the earlier pins (checkout v4,
+# setup-python v5) were node20 actions. uv itself is installed by hash
+# (tools/ci/uv-requirements.txt). Sources: docs/design/phase-1/WP-13_INTEGRATION.md.
 name: ci
 
 on:
@@ -49,7 +55,7 @@ jobs:
       UV_NO_PROGRESS: "1"
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
 
@@ -63,16 +69,16 @@ jobs:
           } | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
 
       - name: Secret scan of the checked-out commit (stdlib only, before any download)
         run: python -I tools/secret_scan.py --mode commit --rev HEAD
 
-      - name: Install uv
+      - name: Install uv (hash-checked, binary only)
         run: |
-          python -m pip install --disable-pip-version-check "uv==${UV_VERSION}"
+          python -m pip install --disable-pip-version-check --require-hashes --only-binary :all: --no-deps -r tools/ci/uv-requirements.txt
           { python --version; uv --version; } | tee -a "${GITHUB_STEP_SUMMARY}"
 
       - name: Check that uv.lock matches pyproject.toml
