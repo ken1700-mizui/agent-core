@@ -97,18 +97,22 @@ def _started(st: lw.Setup, *, model: bool = False) -> Any:
     return gate.start(gate.claim(attempt, **lw.actual(st, attempt)))[0]
 
 
-def _report(st: lw.Setup, attempt: Any, usage: Usage, *, final: bool = True) -> Any:
+def _report(
+    st: lw.Setup, attempt: Any, usage: Usage, *, final: bool = True, digest: str | None = None
+) -> Any:
     current = st.sm.state.attempts[attempt.attempt_id]
-    result = SyntheticResult(outcome="COMPLETED", usage=usage, final=final)
+    result = SyntheticResult(outcome="COMPLETED", usage=usage, final=final, result_digest=digest)
     return lw.gate(st).execution_report(current, result)
 
 
-def _unknown(tmp_path: Path) -> tuple[lw.Setup, rc.RecoveryDeps, Any, Any]:
+def _unknown(
+    tmp_path: Path, digest: str | None = None
+) -> tuple[lw.Setup, rc.RecoveryDeps, Any, Any]:
     """A started tool call, its signed final report kept, then a restart: the
     recovery keeps the Attempt OUTCOME_UNKNOWN and its whole hold."""
     st = lw.setup(tmp_path)
     attempt = _started(st)
-    report = _report(st, attempt, _tool_zero())
+    report = _report(st, attempt, _tool_zero(), digest=digest)
     st2 = st.reopen()
     deps = _deps(st2)
     rc.recover(deps, deadlines=DEADLINES, run_ids=_all(st2))
@@ -183,35 +187,56 @@ def test_reconciling_again_never_counts_the_cost_twice(tmp_path: Path) -> None:
 # ---------------------------------------------------------------- 5: a crash inside the transaction
 
 
+RESULT = b.digest("synthetic operation result")
+
+
+def _results(path: Path, attempt: Any) -> list[str]:
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT result_digest FROM operation_results WHERE attempt_id = ?",
+            (str(attempt.attempt_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [r[0] for r in rows]
+
+
 def test_a_crash_inside_the_reconciliation_leaves_no_half_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    st, deps, attempt, report = _unknown(tmp_path)
+    """RR-01: the report carries a result digest, so the transaction really writes
+    the result row before the crash; the rollback must take it back."""
+    st, deps, attempt, report = _unknown(tmp_path, digest=RESULT)
+    assert report.result_digest == RESULT
+    written: list[str] = []
 
-    def crash(*args: Any, **kwargs: Any) -> Any:
-        # After the result digest was written in the same transaction.
+    def crash(cur: sqlite3.Cursor, *args: Any, **kwargs: Any) -> Any:
+        # Inside the transaction, after the ledger wrote the result row.
+        written.extend(
+            r[0]
+            for r in cur.execute(
+                "SELECT result_digest FROM operation_results WHERE attempt_id = ?",
+                (str(attempt.attempt_id),),
+            )
+        )
         raise sqlite3.OperationalError("synthetic crash inside the reconciliation")
 
     monkeypatch.setattr(sqlite_ledger, "_record_cost", crash)
     with pytest.raises(JournalStorageError):  # the journal fails closed, rolled back
         rc.reconcile(deps, attempt.attempt_id, rc.ExecutionEvidence(report=report))
     monkeypatch.undo()
+    assert written == [RESULT]  # the row existed inside the transaction
     st2 = st.reopen()
     view = _view(st2, attempt)
     assert st2.sm.state.attempts[attempt.attempt_id].state is A.OUTCOME_UNKNOWN
-    assert (view.state, view.hold_micro) == (RS.UNKNOWN, 5_000)
-    conn = sqlite3.connect(f"file:{st2.path}?mode=ro", uri=True)
-    try:
-        rows = conn.execute(
-            "SELECT 1 FROM operation_results WHERE attempt_id = ?", (str(attempt.attempt_id),)
-        ).fetchall()
-    finally:
-        conn.close()
-    assert rows == []
+    assert (view.state, view.hold_micro, view.spent_known) == (RS.UNKNOWN, 5_000, False)
+    assert _results(st2.path, attempt) == []  # rolled back with the rest
     deps2 = _deps(st2)
     done = rc.reconcile(deps2, attempt.attempt_id, rc.ExecutionEvidence(report=report))
     assert done.outcome is rc.Reconciled.EXECUTED
     assert _view(st2, attempt).hold_micro == 0
+    assert _results(st2.path, attempt) == [RESULT]  # written once, with the right digest
 
 
 # ---------------------------------------------------------------- 6: the lower bound
