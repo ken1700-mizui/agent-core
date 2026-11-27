@@ -32,11 +32,17 @@ from typing import Any, Final, NoReturn, TextIO
 from agent_core.adapters.system import SystemClock
 from agent_core.ports.clock import Clock
 from agent_core.runtime.recovery import RecoveryError
-from agent_core.types.errors import JournalError, RuntimeLockHeldError, WorkspaceRejectedError
+from agent_core.types.errors import (
+    JournalError,
+    RuntimeLockHeldError,
+    StoredFormatUnsupportedError,
+    WorkspaceRejectedError,
+)
 from agent_core.types.ids import RunId
 from agent_core.types.records import RunStatus
 from agent_core_cli import demo, views
 from agent_core_cli.environment import (
+    FORMAT_GUIDANCE,
     CliError,
     Hooks,
     Session,
@@ -186,6 +192,9 @@ def _refused(stderr: TextIO, exc: BaseException) -> int:
     if isinstance(exc, CliError):
         stderr.write(f"error: {exc.code}\n")
         return EXIT_FAILURE
+    if isinstance(exc, StoredFormatUnsupportedError):
+        stderr.write(f"error: {exc.code}: {FORMAT_GUIDANCE}\n")
+        return EXIT_FAILURE
     if isinstance(exc, RuntimeLockHeldError):
         stderr.write("error: RUNTIME_LOCKED\n")
         return EXIT_LOCKED
@@ -284,6 +293,10 @@ class _Shell:
             return handler(self, rest)
         except CliError as refused:
             self._printer.event("error", code=refused.code, detail=refused.detail)
+            return None
+        except StoredFormatUnsupportedError as refused:
+            # P-6 compatibility: refused, nothing changed; the shell goes on.
+            self._printer.event("error", code=refused.code, detail=FORMAT_GUIDANCE)
             return None
         except KeyboardInterrupt:
             raise

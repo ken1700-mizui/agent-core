@@ -32,6 +32,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Final
 
+from pydantic import ValidationError
+
 from agent_core.cost.rules import (
     ceil_div,
     check_transition,
@@ -78,6 +80,7 @@ from agent_core.types.errors import (
     ReservationMismatchError,
     ReservationReuseError,
     ReservationStateError,
+    StoredFormatUnsupportedError,
 )
 from agent_core.types.events import Event, EventDraft
 from agent_core.types.ledger import (
@@ -512,7 +515,7 @@ def _allocate(cur: sqlite3.Cursor, op: AllocateReservation, now_ms: int) -> None
     ).fetchone()
     if found is None:
         raise BudgetCapMissingError("RUN_GRANT")
-    grant = RunGrant.model_validate_json(found[0])
+    grant = _stored_grant(found[0])
     if (str(grant.tenant_id), str(grant.task_id)) != (chain["tenant_id"], chain["task_id"]):
         raise ReservationMismatchError("GRANT_SCOPE")
     expires = checked_add(now_ms, op.ttl_ms)
@@ -1667,14 +1670,30 @@ def _bump(cur: sqlite3.Cursor, *, tenants: tuple[str, ...]) -> None:
         )
 
 
+def _stored_policy(body: str) -> Policy:
+    """A stored Policy in the supported format; any other is a typed refusal."""
+    try:
+        return Policy.model_validate_json(body)
+    except ValidationError as exc:
+        raise StoredFormatUnsupportedError("POLICY") from exc
+
+
+def _stored_grant(body: str) -> RunGrant:
+    """A stored RunGrant in the supported format; any other is a typed refusal."""
+    try:
+        return RunGrant.model_validate_json(body)
+    except ValidationError as exc:
+        raise StoredFormatUnsupportedError("RUN_GRANT") from exc
+
+
 def _policy(cur: sqlite3.Cursor, tenant_id: str) -> Policy | None:
     row = cur.execute("SELECT body FROM policies WHERE tenant_id = ?", (tenant_id,)).fetchone()
-    return None if row is None else Policy.model_validate_json(row[0])
+    return None if row is None else _stored_policy(row[0])
 
 
 def _grant(cur: sqlite3.Cursor, run_id: str) -> RunGrant | None:
     row = cur.execute("SELECT body FROM run_grants WHERE run_id = ?", (run_id,)).fetchone()
-    return None if row is None else RunGrant.model_validate_json(row[0])
+    return None if row is None else _stored_grant(row[0])
 
 
 def _stops(cur: sqlite3.Cursor, tenant_id: str, run_id: str) -> tuple[StopEntry, ...]:

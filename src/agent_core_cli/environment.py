@@ -70,7 +70,11 @@ from agent_core.tool.registry import ToolRegistry
 from agent_core.types.base import FrozenModel
 from agent_core.types.context import SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind
-from agent_core.types.errors import RuntimeProfileError, WorkspaceRejectedError
+from agent_core.types.errors import (
+    RuntimeProfileError,
+    StoredFormatUnsupportedError,
+    WorkspaceRejectedError,
+)
 from agent_core.types.ids import (
     ApprovalId,
     AttemptId,
@@ -110,6 +114,7 @@ from agent_core.types.safety import (
     StopStatus,
 )
 from agent_core.types.tools import ToolEffectClass, ToolRegistration
+from agent_core.types.transitions import Termination, TerminationReason
 from agent_core.types.values import Digest, EngineName, EngineVersion, sha256_digest
 from agent_core_cli import demo
 
@@ -120,6 +125,15 @@ JOURNAL_FILE: Final = "journal.db"
 AREA_DIR: Final = "area"
 ENGINE: Final = EngineVersion(engine=EngineName.RUNTIME, version="0.1.0")
 _FILE_FLAGS: Final = os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+# P-6 compatibility: the fixed guidance for a stored format this version does not
+# support (no automatic migration; status, stop and recovery stay available).
+FORMAT_GUIDANCE = (
+    "a stored Policy or RunGrant predates this version: new Runs are refused; "
+    "status, stop, recover and reconcile still work; there is no automatic "
+    "migration: start new work in a new home (init)"
+)
 
 
 class CliError(Exception):
@@ -618,6 +632,8 @@ class Session:
         if task_demo is None:
             raise CliError("UNKNOWN_DEMO")
         criterion = task_demo.criterion
+        # A grant refusal that can be seen now is refused before anything is created.
+        self._check_authority(name)
         task = self.sm.create_task(
             goal_ref=sha256_digest(task_demo.goal.encode()),
             done_criteria=(criterion.ref(),),
@@ -627,11 +643,45 @@ class Session:
         run = self.sm.start_run(task, run_grant_ref=self.ids.new(RunGrantId))
         run = self.sm.set_run_status(run, RunStatus.QUEUED)
         run = self.sm.set_run_status(run, RunStatus.RUNNING)
-        self._install_run(task, run, name)
+        try:
+            self._install_run(task, run, name)
+        except Exception as failed:
+            # Unexpected: the Run exists without its authority. End it at once so it
+            # never runs; if that fails too, the owner's recovery ends it.
+            try:
+                self._end_unauthorized(run)
+            except Exception as also:
+                raise CliError("RUN_NOT_AUTHORIZED", "RUN_LEFT_FOR_RECOVERY") from also
+            if isinstance(failed, CliError):
+                raise  # a refusal with its own fixed code (for example the owner sequence)
+            raise CliError("RUN_NOT_AUTHORIZED", "GRANT_NOT_INSTALLED") from failed
         loop = self._make_loop(task_demo, task, demo.ScriptedFakeModel(list(task_demo.replies)))
         self.runs[run.run_id] = _RunEntry(loop, name)
         self.current = run.run_id
         return task, run, loop.run(run.run_id)
+
+    def _check_authority(self, name: str) -> None:
+        """P-6 compatibility: the checks the ledger makes when the grant is
+        installed, made before the Task and the Run exist (the ledger still makes
+        them). An unsupported stored Policy is refused with the fixed guidance."""
+        definition = demo.task_definition(name)
+        try:
+            policy = self.journal.policy(str(self.config.tenant_id))
+        except StoredFormatUnsupportedError:
+            raise CliError("STORED_FORMAT_UNSUPPORTED", FORMAT_GUIDANCE) from None
+        if policy is None:
+            raise CliError("RUN_NOT_AUTHORIZED", "NO_POLICY")
+        if definition is None or definition.ref() not in policy.trusted_synthetic_tasks:
+            raise CliError("RUN_NOT_AUTHORIZED", "SYNTHETIC_TASK_UNTRUSTED")
+
+    def _end_unauthorized(self, run: Run) -> None:
+        current = self.sm.state.runs[run.run_id]
+        termination = Termination(
+            kind="termination",
+            reason=TerminationReason.INTERNAL_ERROR,
+            evidence_ref=sha256_digest(b"agent-core: run grant not installed"),
+        )
+        self.sm.set_run_status(current, RunStatus.FAILED, termination)
 
     def _install_run(self, task: Task, run: Run, name: str) -> None:
         now = self.clock.now_ms()

@@ -630,6 +630,16 @@ class PermitRejectedError(SafetyError):
     code = "PERMIT_REJECTED"
 
 
+class StoredFormatUnsupportedError(SafetyError):
+    """P-6 compatibility: a stored Policy or RunGrant is in a format this version
+    does not support (for example written before P-6, without the trusted
+    synthetic task fields). ``reasons`` names the record (``POLICY`` or
+    ``RUN_GRANT``). The record is never rewritten or migrated; the operation that
+    needed it is refused and its transaction rolled back."""
+
+    code = "STORED_FORMAT_UNSUPPORTED"
+
+
 class CostBasisMissingError(CostError):
     """No trusted basis for the required amount (no installed price table, no
     price for the model, or no recorded descriptor): nothing is reserved (WP09-R01)."""
