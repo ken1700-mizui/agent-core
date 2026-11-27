@@ -1,6 +1,6 @@
 # Phase 1 最終受入の準備
 
-> 文書の状態：**DRAFT**（オーナーの判断と承認を待つ。正式な完了の宣言ではない）　作成：2026-11-27　更新：2026-11-27（FA-01 の修正）
+> 文書の状態：**DRAFT**（オーナーの判断と承認を待つ。正式な完了の宣言ではない）　作成：2026-11-27　更新：2026-11-27（FA-01 の修正、初回の CI の記録）
 >
 > - 対象：`impl/phase-1-foundation`。RR-01 の補強は `a54d52b`、CI の固定は `89f8584`、この文書の初版は `e724b2a`。この版は FA-01（MEDIUM、文書の指摘）の修正で、製品のコードは変えていない。
 > - **Phase の範囲は、承認済みの `docs/design/phase-0/ROADMAP.md` を正本とする。** この文書の初版は、Sandbox と子プロセスを Phase 3A としていた（FA-01）。ROADMAP では Phase 2 の範囲であり、この版で直した（6章）。
@@ -49,7 +49,7 @@
 - Codex の分析（環境の条件の不適合）は、この製品の検査の仕様と整合する。**ただし 345 件（130 件と 215 件）の一つずつの原因を、Claude Code は確かめていない。** 環境の問題であるという推定にとどまり、これらの試験は**独立した実行では成功していない（未検証）**として扱う。成功に数えない。
 - 製品の安全性の検査は変えない（祖先の所有者の条件を緩めて Codex の環境で通すことはしない）。
 - 解決の方法は、条件に合う環境で独立に実行することである（9章の手順。CI の runner、または `/` と作業の場所の祖先が root か実行者の所有である環境）。
-- パッケージの数：手元の `uv lock --check` は「23 packages を解決」と表示する。Codex の「21 パッケージ」は導入された数と理解しているが、差の内訳は確かめていない（未確認）。
+- パッケージの数：`uv lock --check` は「23 packages を解決」、導入は 21 パッケージ（初回の CI の記録で確認：解決 23、導入 21）。Codex の「21 パッケージ」と一致する。
 
 ### 1.3 共通の注意
 
@@ -207,11 +207,11 @@ HEAD `89f8584`（2026-11-27）の結果。依存は既存の `uv.lock` のまま
 
 ## 8. Phase 1 の正式な完了の条件の一覧
 
-1. **GitHub Actions での全品質検査：** オーナーの決めた方法（3.1）で CI を実行し、8種類の検査（通常の試験を runner の利用者で）と特権の試験（root）が成功し、対象の SHA、環境、件数を記録する。
+1. **GitHub Actions での全品質検査：** **済み**（11章。run `46031933145`、対象 `71208ad`、2138 件がすべて成功）。
 2. **Phase 1 の Technical Gate と Safety Gate の確認**（ROADMAP の Phase 1）：
    - Technical Gate（状態遷移、Journal、復旧の不変条件の試験の合格、障害の注入を含む）：Claude Code の環境では成功。独立した環境での全件の成功は、まだない（1.2）。CI で確かめる。
    - Safety Gate（外部への通信 0 件、Permit のない副作用 0 件、認証情報が存在しないこと）：import の契約、試験の中の通信の遮断、ネットワークのない環境での全試験の成功、Permit の試験（A.I2、A.I13）、秘密情報の検査で確かめた範囲。OS のレベルの遮断は Phase 1 の範囲では主張しない。オーナーがこの範囲で合格と認めるかを決める。
-3. **独立に実行できなかった試験の扱い：** Codex の環境で成功しなかった 345 件（130 件の失敗、215 件のエラー）と、未実行の特権の5件は、条件に合う環境（CI など）で独立に成功するまで未検証とする。環境の問題という推定を成功として扱わない。
+3. **独立に実行できなかった試験の扱い：** 345 件と特権の5件は、初回の CI（条件に合う GitHub-hosted の環境）ですべて成功した（11章）。Codex 自身の環境での再実行は、条件に合う環境で行う場合だけ意味がある（9章）。
 4. **包括的なセキュリティ監査：** 行われていない。Phase 1 の完了の前に行うか、どの範囲を後の Phase の Gate で行うかをオーナーが決める（5.1）。CI の成功は監査の代わりにならない。
 5. **A.I6、A.I12、A.I17 の承認：** オーナーが承認・修正・却下を決める（今回は承認していない）。
 6. **最終のオーナーの承認：** 上の条件と、残った課題（5章）の扱い（移しただけで解決とはしない）を確かめたうえでの承認。
@@ -233,3 +233,57 @@ HEAD `89f8584`（2026-11-27）の結果。依存は既存の `uv.lock` のまま
 4. 8種類の検査：`python3 -I tools/secret_scan.py --mode commit --rev HEAD`、`uv lock --check`、`uv sync --locked --offline --check`、`uv run --locked --offline ruff check .`、`uv run --locked --offline ruff format --check .`、`uv run --locked --offline mypy`、`PYTHONPATH=src uv run --locked --offline lint-imports`、`uv run --locked --offline pytest -m "not privileged"`。
 5. 特権の試験（root）：`sudo .venv/bin/python -m pytest -p no:cacheprovider -m privileged`（5件）。root で実行できなければ「未実行」と記録する。
 6. 記録すること：対象の SHA、OS とカーネル、Python と uv の版、利用者（uid）、`/` と作業の場所の祖先の所有者、各検査の件数（成功・失敗・エラー・除外・未実行）。
+
+## 10. オーナーの承認の記録（2026-11-27）
+
+オーナーから、次の3つの承認が正式に出た（オーナーの指示の伝達による。`OWNER_DECISIONS.md` は承認なしに変えないため、ここに記録する）。
+
+| # | 承認 | 範囲 |
+|---|---|---|
+| 1 | CI の設定のファイルだけを `main` に加えること | `.github/workflows/ci.yml` の1つのファイルだけ。実装ブランチの対象の SHA の版と同じ内容。製品のコード、試験、依存、設計の文書は加えない。マージしない。履歴を書き換えない。自動の契機を加えない。既定のブランチを変えない。**今後の自由な `main` の変更の許可ではない** |
+| 2 | 初回の CI | 追加の課金なし、対象の SHA を固定、手動で1回だけ。再実行には別の承認が要る |
+| 3 | Phase 1 の安全性の確認 | 正式な完了の前に行う。Phase 3A でも、実 API の接続の前に改めて確認する |
+
+**承認されていないこと（維持）：** A.I6・A.I12・A.I17 の延期、そのほかの設計差、Phase 1 の正式な完了、Phase 2 の開始。
+
+## 11. 初回の CI の記録
+
+| 項目 | 内容 |
+|---|---|
+| `main` の変更の前 | `aa089aec0ebd0e65e5d96bca0cc5f4f4d3d35c93`（空の初期コミット） |
+| `main` の変更の後 | `d0b8635f234022f5d94c2124c4b6dc8efb62cb5c`（親は `aa089ae`。早送りで、履歴の書き換えなし）。変更は `.github/workflows/ci.yml` の追加だけ（1ファイル、111行）。内容は `71208ad` の版と同一（Git の blob `00f96330b495f32634a6c4b246cb2a0f4bb6a6ca`、sha256 `acee59e0…6122`） |
+| 既定のブランチ | `main` のまま（変えていない） |
+| CI の対象 | `impl/phase-1-foundation` の `71208adfc7884da097be377053a38f16d4886293`（起動の直前に、ブランチの HEAD がこの SHA と一致することを確認） |
+| 起動 | `workflow_dispatch` を1回だけ（起動の前の実行の履歴は 0 件、起動の後は 1 件） |
+| Workflow Run | ID `46031933145`、run number 1、attempt 1。https://github.com/ken1700-mizui/agent-core/actions/runs/46031933145 （ジョブ `140617669578`） |
+| `head_sha` と取り出した SHA | run の `head_sha` = `71208ad…`。checkout は `71208ad…` を取得し、`git log -1` = `71208ad…`、`GITHUB_SHA` = `71208ad…`。**一致** |
+| 結論 | **success**（2026-11-27T16:14:41Z〜16:16:22Z、約 101 秒） |
+| runner | GitHub-hosted の標準の runner。ラベル `ubuntu-24.04`、イメージ `ubuntu-24.04` 20261122.23.1、Ubuntu 24.04.5 LTS、カーネル `Linux 7.0.0-1018-aws x86_64`、runner 2.338.2、利用者 `runner`（uid 1001） |
+| 道具 | Python 3.12.16（`setup-python`）、uv 0.11.32（ハッシュ検査付きの wheel） |
+| 権限 | `GITHUB_TOKEN`：Contents read、Metadata read。checkout の認証情報は取得の後に除かれた（`persist-credentials: false`） |
+| 課金 | 使用量の API で **billable UBUNTU 0 ms**。公開リポジトリの標準の runner は無料（3章の出典）。成果物なし |
+
+| # | 検査 | 結果 |
+|---|---|---|
+| 1 | 秘密情報の検査（`--mode commit --rev HEAD`） | 成功 |
+| 2 | `uv lock --check` | 成功（23 packages を解決） |
+| 3 | `uv sync --locked --offline --check` | 成功（21 packages、変更なし） |
+| 4 | ruff check | 成功（All checks passed） |
+| 5 | ruff format --check | 成功（157 files already formatted） |
+| 6 | mypy strict | 成功（157 source files に問題なし） |
+| 7 | import-linter | 成功（5 kept、0 broken） |
+| 8 | pytest（通常、`runner` の利用者） | **2133 passed、5 deselected**（失敗 0、エラー 0） |
+| 8' | pytest（特権、root） | **5 passed、2133 deselected** |
+| | 合計 | **2138 件のすべてが成功**（除外は、それぞれの手順で相手の区分だけ。未実行 0） |
+
+- Codex の環境で成功しなかった 345 件（130 件の失敗、215 件のエラー）と、未実行だった特権の5件は、条件に合う Linux の環境（`/` が root の所有）で、すべて成功した。試験の削除と、製品の安全性の検査の緩和はしていない。
+- 自動の再実行はしていない。CI は1回だけ実行した。
+
+## 12. Phase 1 の Technical Gate と Safety Gate の評価（Claude Code の評価。合格の判断はオーナー）
+
+| Gate | ROADMAP の条件 | 根拠 | 評価 |
+|---|---|---|---|
+| Technical Gate | 状態遷移、Journal、復旧の不変条件の試験の合格（障害の注入を含む） | 初回の CI で、状態機械、Journal、台帳、復旧、照合、障害の注入、実際の SIGKILL の試験を含む 2138 件がすべて成功 | **条件を満たす**（CI の証拠による） |
+| Safety Gate | 外部への通信 0 件、Permit のない副作用 0 件、認証情報が存在しないこと | import の契約（通信・プロバイダーの SDK・プロセスの起動の経路なし）、通信の遮断の試験、Permit の試験、秘密情報の検査が CI で成功。詳細は `PHASE_1_SAFETY_CHECK.md` | **3つの条件は満たす。ただし F07 の 1（起動の構成の検査）と 3（合成のタスクの検査）に未実装の部分がある**（安全性の確認の 3章）。合格と認めるかはオーナーが決める |
+
+- CI の成功は、包括的なセキュリティ監査の完了ではない。

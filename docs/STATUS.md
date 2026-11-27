@@ -11,8 +11,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1 最終受入の準備中**（`impl/phase-1-foundation`）。Codex の最終品質検証（対象 `e724b2a`）は CONDITIONAL_PASS：RR-01 は解消を確認、新しい製品の不具合なし、文書の指摘 FA-01（MEDIUM）を修正した（この版のコミット。文書だけ）。Codex の環境では通常の pytest が 1788 件成功、130 件失敗、215 件エラー（`/` が UID 65534 の所有で、File Broker と CLI の祖先の条件に合わない環境。独立には未検証として扱う）、特権の5件は未実行。記録は `docs/reviews/PHASE_1_ACCEPTANCE.md`。**正式な完了ではない** |
-| 次の作業 | オーナーの判断を待つ。**Phase 2 には進まない。** 正式な完了の条件（`PHASE_1_ACCEPTANCE.md` の8章）：GitHub Actions での全品質検査（実行の方法のオーナーの決定が先。3.1）、Phase 1 の Technical Gate と Safety Gate の確認、独立に成功しなかった 345 件と特権の5件の、条件に合う環境での独立した実行、包括的なセキュリティ監査の範囲と時期の決定（CI の成功は監査の代わりにならない）、A.I6・A.I12・A.I17 の承認（未承認）、最終のオーナーの承認。Phase 2 の範囲は ROADMAP が正本（Sandbox、子プロセス、停止・タイムアウト、隔離の自己診断、A.I17 の再評価は Phase 2。OS の隔離の強化、Gateway、Process Supervisor、独立の予算の台帳、認証情報と実データの保護は 3A）。残っている課題：AUDIT-02〜04、A-P6、鍵付きのハッシュ、FINAL-R05、`sqlite_ledger.py` の分割 |
+| 今の段階 | **Phase 1 最終受入の準備中（初回の CI と安全性の確認を実施）**。オーナーの承認（2026-11-27）：CI の設定だけを `main` に加えること、初回の CI（追加の課金なし、SHA を固定、手動1回）、正式な完了の前の安全性の確認。`main` は `aa089ae` から `d0b8635`（`ci.yml` の1ファイルだけ）。初回の CI：run `46031933145`、対象 `71208ad`（`head_sha` と取り出した SHA が一致）、結論 success、8種類の検査がすべて成功、通常 2133 件と特権5件の合計 2138 件がすべて成功、billable 0 ms。安全性の確認は `docs/reviews/PHASE_1_SAFETY_CHECK.md`（F07 の 1・3 に未実装の部分あり、報告だけ）。記録は `docs/reviews/PHASE_1_ACCEPTANCE.md`（10〜12章）。CI で検証した SHA は `71208ad`、この記録のコミットは文書だけ。**正式な完了ではない** |
+| 次の作業 | オーナーの判断を待つ。**Phase 2 には進まない。** 残る正式な完了の条件：Phase 1 の Technical Gate と Safety Gate のオーナーによる合格の判断（F07 の 1・3 の扱いを含む）、独立した安全性の確認（`PHASE_1_SAFETY_CHECK.md` の6章）、包括的なセキュリティ監査の範囲と時期（CI の成功は監査の代わりにならない）、A.I6・A.I12・A.I17 の承認（未承認）、最終のオーナーの承認。CI の再実行には別の承認が要る。`main` の変更の例外は今回の1ファイルだけ。残っている課題：AUDIT-02〜04、A-P6、鍵付きのハッシュ、FINAL-R05、`sqlite_ledger.py` の分割 |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
@@ -111,7 +111,7 @@
 
 ## 6. リポジトリの状況
 
-- `main`：空の初期コミットだけ（`aa089ae`）。GitHub の既定のブランチ。
+- `main`：`d0b8635`（空の初期コミット `aa089ae` に、オーナーの例外の承認で `.github/workflows/ci.yml` の1ファイルだけを加えた。2026-11-27）。GitHub の既定のブランチ。
 - `docs/phase-0-design`：設計資料の作業ブランチ。Draft PR #1 で、`main` への変更として提案している。マージはしない。
 - `impl/phase-1-foundation`：Phase 1 の実装のブランチ。Phase 1 の承認の記録を含む、設計のコミットから作る。
 - holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：作っておらず、接続もしていない。
