@@ -17,13 +17,13 @@ module depends on ports only, never on a concrete adapter.
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, Concatenate
 
 from agent_core.identity.generator import IdGenerator
 from agent_core.ports.clock import Clock
 from agent_core.ports.evidence import EvidenceVerifier
-from agent_core.ports.journal import HeadExpectation, JournalPort
+from agent_core.ports.journal import HeadExpectation, JournalHead, JournalPort
 from agent_core.runtime.state_machine import (
     RuntimeState,
     apply_event,
@@ -126,6 +126,34 @@ def _exclusive[**P, T](
     return wrapper
 
 
+def _read_pages(
+    journal: JournalPort, tenant_id: TenantId, heads: list[JournalHead | None]
+) -> Iterator[Event]:
+    """Yield the tenant's events page by page; append the final head to ``heads``.
+
+    Reading stops once a short page is followed by a head that is not ahead of
+    the events read. A page read because the head was ahead must bring events:
+    otherwise the journal's head and its events disagree (fail closed).
+    """
+    read = 0
+    head_was_ahead = False
+    while True:
+        page = journal.read_tenant(tenant_id, after_tenant_seq=read, limit=READ_PAGE)
+        if head_was_ahead and not page:
+            raise StateRebuildError("the journal head is ahead of the events it hands out")
+        yield from page
+        read += len(page)
+        if len(page) == READ_PAGE:
+            head_was_ahead = False
+            continue
+        head = journal.head(tenant_id)
+        if head is not None and head.tenant_seq > read:
+            head_was_ahead = True
+            continue
+        heads.append(head)
+        return
+
+
 class RuntimeStateMachine:
     def __init__(
         self,
@@ -176,19 +204,16 @@ class RuntimeStateMachine:
         Pages are read until the journal's head is the last event read; if the
         journal grew while reading, reading continues. The resulting state is
         bound to that head (``tenant_seq`` and hash) for every later append.
+
+        P-7 M5: the events are not collected; each page is folded (with the
+        Rebuild's order, gap, duplicate and hash chain checks) before the next
+        one is read. A head that stays ahead of the events handed out is
+        refused. On any failure no state is returned.
         """
         require_phase1_profile(profile)
-        events: list[Event] = []
-        while True:
-            page = journal.read_tenant(tenant_id, after_tenant_seq=len(events), limit=READ_PAGE)
-            events.extend(page)
-            if len(page) == READ_PAGE:
-                continue
-            head = journal.head(tenant_id)
-            if head is not None and head.tenant_seq > len(events):
-                continue
-            break
-        state, last, last_hash = rebuild_with_head(events)
+        heads: list[JournalHead | None] = []
+        state, last, last_hash = rebuild_with_head(_read_pages(journal, tenant_id, heads))
+        head = heads[-1]
         expected = HeadExpectation(
             tenant_seq=0 if last is None else last.tenant_seq, head_hash=last_hash
         )
