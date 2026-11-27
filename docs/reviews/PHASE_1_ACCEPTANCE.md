@@ -1,6 +1,6 @@
 # Phase 1 最終受入の準備
 
-> 文書の状態：**DRAFT**（オーナーの判断と承認を待つ。正式な完了の宣言ではない）　作成：2026-11-27　更新：2026-11-27（FA-01 の修正、初回の CI の記録、最終独立品質レビューの記録と FQ-01 の修正）
+> 文書の状態：**DRAFT**（オーナーの判断と承認を待つ。正式な完了の宣言ではない）　作成：2026-11-27　更新：2026-11-27（FA-01 の修正、初回の CI の記録、最終独立品質レビューの記録と FQ-01 の修正、最終の CI の記録と最終受入の評価）
 >
 > - 対象：`impl/phase-1-foundation`。RR-01 の補強は `a54d52b`、CI の固定は `89f8584`、この文書の初版は `e724b2a`。この版は FA-01（MEDIUM、文書の指摘）の修正で、製品のコードは変えていない。
 > - **Phase の範囲は、承認済みの `docs/design/phase-0/ROADMAP.md` を正本とする。** この文書の初版は、Sandbox と子プロセスを Phase 3A としていた（FA-01）。ROADMAP では Phase 2 の範囲であり、この版で直した（6章）。
@@ -248,19 +248,16 @@ HEAD `89f8584`（2026-11-27）の結果。依存は既存の `uv.lock` のまま
 
 ## 8. Phase 1 の正式な完了の条件の一覧
 
-1. **GitHub Actions での全品質検査：**
-   - **初回の CI は実施済み**：run `46031933145`、対象 `71208ad`、2138 件がすべて成功（11章）。
-   - **現在の製品のコード**（`aae033a` 以後、2340 件）は、**まだ CI で検証していない**。
-   - `main`（`d0b8635`）にオーナーが承認した CI の定義があり、手動の dispatch ができる構成である。
-   - **次回の CI の実行には、オーナーの別の承認が要る。**
-   - 対象の候補：この文書を含むコミット（製品のコードは `aae033a` と同一。完全な SHA は最終報告に記す）。
-   - 次回の CI が成功するまで、この項目は「現在のコードでは未完了」とする。
+1. **GitHub Actions での全品質検査：** **済み**
+   - 初回の CI：run `46031933145`、対象 `71208ad`、2138 件（11章）。
+   - **最終の CI：run `46082898611`、対象 `93435c82e06a168794cf68c6ecf1fc598815d426`、2340 件がすべて成功**（19章）。
+   - この後の文書の更新のコミットは、CI の対象ではない（製品のコードと試験は同一）。
 2. **Phase 1 の Technical Gate と Safety Gate の確認**（ROADMAP の Phase 1）：
    - Technical Gate（状態遷移、Journal、復旧の不変条件の試験の合格、障害の注入を含む）：Claude Code の環境では成功。独立した環境での全件の成功は、まだない（1.2）。CI で確かめる。
    - Safety Gate（外部への通信 0 件、Permit のない副作用 0 件、認証情報が存在しないこと）：import の契約、試験の中の通信の遮断、ネットワークのない環境での全試験の成功、Permit の試験（A.I2、A.I13）、秘密情報の検査で確かめた範囲。OS のレベルの遮断は Phase 1 の範囲では主張しない。オーナーがこの範囲で合格と認めるかを決める。
 3. **独立に実行できなかった試験の扱い：**
    - `e724b2a` の版：Codex の環境で成功しなかった 345 件と特権の5件は、初回の CI（`71208ad`）ですべて成功した（11章）。
-   - `aae033a` の版：Codex の環境で成功しなかった 381 件と特権の5件（1.3）は、**まだ条件に合う環境で独立に確かめていない**。次回の CI で確かめる。
+   - `aae033a` の版：Codex の環境で成功しなかった 381 件と特権の5件（1.3）は、最終の CI（`93435c8`、製品のコードと試験は `aae033a` と同一）で成功した（19章）。通常の試験は全 2335 件、特権は全5件が成功しており、その中に含まれる。
    - Codex 自身の環境での再実行は、条件に合う環境で行う場合だけ意味がある（9章）。
 4. **包括的なセキュリティ監査：** 行われていない。Phase 1 の完了の前に行うか、どの範囲を後の Phase の Gate で行うかをオーナーが決める（5.1）。CI の成功は監査の代わりにならない。
 5. **A.I6、A.I12、A.I17 の承認：** **済み**（2026-11-27、条件付きの延期。D9〜D11）。条件の実装と検証は13章の計画のとおりで、まだ済んでいない。
@@ -425,4 +422,103 @@ HEAD `89f8584`（2026-11-27）の結果。依存は既存の `uv.lock` のまま
 
 - **P-5（A.I17 の実装と安全性の試験）**の受入の試験（最新の P-4 の5章の10項目）は、Phase 2 で**信頼しないコードを実行する前に**合格が必要。
 - **P-3（A.I12 の利用者への通知の改善）は未実装**のまま（13.2）。
+
+## 19. 最終の CI の記録（2026-11-27）
+
+| 項目 | 内容 |
+|---|---|
+| CI の対象 | `impl/phase-1-foundation` の **`93435c82e06a168794cf68c6ecf1fc598815d426`**（起動の前に、手元とリモートのブランチの HEAD がこの SHA と一致することを確認） |
+| 独立レビューの対象との差 | `aae033a` との差は文書と `ci.yml` のコメントだけ（`src`、`tests`、`tools`、`pyproject.toml`、`uv.lock` に差分なし） |
+| CI の定義 | ブランチの `ci.yml` は、`main`（`d0b8635`）の承認済みの定義とコメント以外の行が同一。トリガーは `workflow_dispatch` だけ、`ubuntu-24.04`、Action は完全な SHA で固定、uv はハッシュで固定、`uv.lock` のとおり、`contents: read`、`persist-credentials: false` |
+| 起動 | `workflow_dispatch` を**1回だけ**（オーナーの承認による。起動の前の実行の履歴は1件、起動の後は2件。自動の再実行なし） |
+| Workflow Run | ID **`46082898611`**、run number 2、attempt 1。https://github.com/ken1700-mizui/agent-core/actions/runs/46082898611 （ジョブ `140785747282`） |
+| `head_sha` と取り出した SHA | run の `head_sha` = `93435c8…`。ジョブの記録：`git rev-parse HEAD` = `93435c8…`、`GITHUB_SHA` = `93435c8…`、ref `refs/heads/impl/phase-1-foundation`。**一致** |
+| 結論 | **success**（2026-11-27T23:30:47Z〜23:33:33Z、run の時間 166 秒） |
+| runner | GitHub-hosted の標準の runner。ラベル `ubuntu-24.04`、イメージ `ubuntu24` 20261122.23.1、カーネル `Linux 7.0.0-1020-azure x86_64`、利用者 `runner`（uid 1001） |
+| 道具 | Python 3.12.16（`setup-python`）、uv 0.11.32（ハッシュ検査付きの wheel）。依存は 23 を解決、21 を導入 |
+| 課金 | 使用量の API で **billable UBUNTU 0 ms**（ジョブ 1、duration 0 ms）。リポジトリは公開で、標準の runner は無料（3章の出典）。成果物なし。公開の設定と課金の設定は変えていない |
+
+| # | 検査 | 結果 |
+|---|---|---|
+| 1 | 秘密情報の検査（`--mode commit --rev HEAD`） | 成功 |
+| 2 | `uv lock --check` | 成功（23 packages を解決） |
+| 3 | `uv sync --locked --offline --check` | 成功（21 packages を確認、変更なし） |
+| 4 | ruff check | 成功（All checks passed） |
+| 5 | ruff format --check | 成功（179 files already formatted） |
+| 6 | mypy strict | 成功（179 source files に問題なし） |
+| 7 | import-linter | 成功（5 kept、0 broken） |
+| 8 | pytest（通常、`runner` の利用者） | **2335 passed、5 deselected**（失敗 0、エラー 0、スキップ 0） |
+| 8' | pytest（特権、root） | **5 passed、2335 deselected** |
+| | 合計 | **2340 件のすべてが成功**。除外は、それぞれの手順で相手の区分だけ。未実行 0、スキップ 0 |
+
+- **Codex の環境で成功しなかった 381 件と、未実行だった特権の5件：** 条件に合う Linux の環境（`/` が root の所有、runner の利用者は uid 1001）で、すべて成功した（全件が成功しており、その中に含まれる）。試験の削除と、製品の安全性の検査の緩和はしていない。
+- **区別：**
+  - CI で検証した SHA は `93435c8` である。
+  - この記録を加えた文書の更新のコミット（この章を含む）は、CI の対象ではない。
+
+## 20. Phase 1 の最終受入の評価（Claude Code の評価。合格の判断はオーナー）
+
+正本：承認済みの `docs/design/phase-0/ROADMAP.md`（Phase 1 の Technical Gate と Safety Gate）、`PHASE_1_IMPLEMENTATION_PLAN.md`。証拠は、最終の CI（19章、`93435c8`）と、Codex の最終独立品質レビュー（1.3、`aae033a`、CONDITIONAL_PASS）。
+
+| 評価の対象 | 主な試験（すべて最終の CI で成功） | 独立レビューの証拠 | 評価 |
+|---|---|---|---|
+| 状態遷移 | `test_runtime_state_machine.py`、`test_runtime_tables.py`、`test_runtime_consistency.py`、`test_p7_*`（索引、組み立て、M4） | 設計の適合を確認 | 条件を満たす |
+| Journal と台帳の整合 | `test_sqlite_journal.py`、`test_journal_processes.py`、`test_qr02_qr03_consistency.py`、`test_journal_identity.py`、`test_journal_streaming_checks.py` | Journal の重点の試験 120 件が成功 | 条件を満たす |
+| 異常終了と復旧 | `test_wp12_*.py`（SIGKILL を含む）、`test_wp13_integration.py`、`test_qr01_reconcile.py`、`test_wp10_cli_process.py` | 設計の適合を確認 | 条件を満たす |
+| 承認、Permit、Receipt | `test_permits.py`、`test_permit_processes.py`、`test_wp09_*.py`、`test_wp15_*.py` | 設計の適合を確認 | 条件を満たす |
+| 予算と費用の保留 | `test_budget_ledger.py`、`test_cost_rules.py`、`test_wp09_binding.py`、`test_wp12_recovery.py` | 設計の適合を確認 | 条件を満たす（`_totals` の性能は未解決、17章） |
+| 外部通信を行わない構成 | `test_import_contracts.py`、`test_network_guard.py`、`test_no_process_execution.py`、import-linter の5つの契約 | import-linter が成功 | 条件を満たす（Python の経路の範囲。OS のレベルの遮断は主張しない） |
+| 合成のデータ専用の条件 | `test_p6_synthetic_only.py`、`test_wp14_*.py` | 設計の適合を確認 | 条件を満たす |
+| ファイル操作の制限 | `test_wp08_*.py`（特権の5件を含む） | 独立の確認なし（環境の不適合）。CI で成功 | 条件を満たす（ADR-0008 の範囲） |
+| 運用の制限 | `test_p2_capacity.py`、`test_p2_cli_limits.py`、`test_p2_remaining.py` | 設計の適合を確認 | 条件を満たす（暫定の上限。17章の主張しないこと） |
+| 性能の改善 | `test_p7_*.py`、`test_journal_identity.py`（性能の値は `P-7_RESULTS_STAGE2.md` の計測） | — | 登録した基準を満たす（Step の作成と終わりの追記。全経路と 100万件は未検証） |
+| 旧形式との互換性 | `test_p6_compatibility.py`、`test_p6_start_failure.py`、`test_p2_remaining.py`（旧ホーム） | 設計の適合を確認 | 条件を満たす |
+
+| Gate | ROADMAP の条件 | 評価 |
+|---|---|---|
+| **Technical Gate** | 状態遷移、Journal、復旧の不変条件の試験の合格（障害の注入を含む） | **条件を満たす**（最終の CI で 2340 件がすべて成功。障害の注入と実際の SIGKILL の試験を含む） |
+| **Safety Gate** | 外部への通信 0 件、Permit のない副作用 0 件、認証情報が存在しないこと | **条件を満たす**（import の契約、通信の遮断の試験、ネットワークのない環境での全試験の成功（Claude Code の環境）、Permit の試験、秘密情報の検査。F07-1・3 は P-6 で実装し CI で成功） |
+
+**保証の範囲と、主張しないこと：**
+- 包括的なセキュリティ監査は完了していない。CI の成功と Codex の品質のレビューは、監査の代わりにならない。
+- OS のレベルの完全な隔離は主張しない（通信の遮断は Python の `socket` の経路と import の契約の範囲。OS のレベルは Phase 3A）。
+- 同じ利用者の協調しないプロセス、root、DB を持つ者の一貫した書き換えの検出は主張しない（5.1）。
+- 物理的な容量の厳密な上限と、起動の時間の制限の永続的な保証は主張しない（17章）。
+
+**未検証の事項：**
+- 許可の全経路の追記の性能（`_totals`）。
+- 100万件のイベントの性能。
+- 別の計算機での性能。
+- M6（未実装）。
+- Codex の環境での全件の独立した成功（環境の不適合。CI で代わりに確認）。
+
+## 21. 残る条件の区別（2026-11-27）
+
+**A. Phase 1 の正式な完了の条件（オーナーの判断）：**
+1. Technical Gate と Safety Gate の最終の判定（20章の評価を受け入れるか）。
+2. 包括的なセキュリティ監査の正式な範囲と実施の時期の決定（5.1）。
+3. 最終のオーナーの承認（正式な完了の宣言はオーナーが行う。この文書は宣言しない）。
+
+**B. Phase 2 の開始の前の条件（18章）：**
+- P-4 の設計の承認。
+- D.V19 の記録の形式。
+- A.I11 の Step の記録の項目。
+- Docker の Sandbox の自己診断の方針。
+- holdout の独立の管理。
+- 並行実行を入れる場合の FINAL-R05。
+
+**C. 維持する運用の条件と、後の Phase の条件：**
+- 運用の上限：
+  - Journal の暫定の上限：5万イベント、160 MiB。
+  - 起動の時間の制限：60 秒。
+  - 制限のない旧ホームでの新しい作業は禁止。
+- 未実装と、後の Phase に延期しているもの：
+  - 費用の台帳の高速化（`_totals`）は、運用の上限を上げる前に再評価する。
+  - M6 は未実装。
+  - P-3 は未実装。
+  - Snapshot は Phase 4 までの条件付きの延期（D9）。
+- Phase 2 以後の条件：
+  - P-4 の設計は承認待ち。
+  - P-5 は、Phase 2 で信頼しないコードを実行する前に実装し、検証する（最新の P-4 の5章の10項目）。
+  - Phase 3A の Technical Gate と Safety Gate は省略しない（実 API の接続の前）。
 
