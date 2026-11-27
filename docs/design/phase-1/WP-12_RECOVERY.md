@@ -179,3 +179,55 @@
 - **R05 ProjectionRepair：** 投影の値は、すべて正本から導く。tenant、Task の上限、Step の種類は Journal から。作成時刻は、台帳が最初に見た時刻の記録（`entity_times`、正本）から。正本にない値は推測せず拒否する。開くときの検査も、投影の作成時刻を正本と照合する（壊れた時刻で時間の上限が緩まない）。正本の破損は、引き続き直さずに拒否する。
 - Journal の形式を版 8 にした（`rt_steps.kind`、`entity_times`、`run_status_times`、`operation_results`）。版 7 以前は開かない（合成のデータだけなので移行は作らない）。
 
+
+## 15. 独立品質レビューの修正 QR-01〜QR-03（Codex の独立品質レビュー、FAIL の後）
+
+> 状態：**DRAFT**（再レビュー待ち）。起点 `98f5fd1`。QR-01 は `dc2da98`、QR-02・QR-03 は `d88165d`。独立品質レビューであり、包括的なセキュリティ監査ではない。
+
+### 15.1 QR-01（HIGH）結果と費用の原子的な照合
+
+- **問題：** 旧来のオーナーの操作 `Reconcile` は、結果不明（OUTCOME_UNKNOWN）の Attempt の予約を、費用だけで RECONCILED にできた。その後は `ReconcileOutcome` が `NOT_UNKNOWN` で拒否され、結果を確定する手段がなくなった。旧試験 `test_r02_a_cost_settled_apart_blocks_any_outcome` は、この問題のある動作を期待していた。
+- **修正：**
+  - `Reconcile`（費用だけ）は、Attempt の結果が確定している（COMPLETED、FAILED_DEFINITE）ときだけ受け付ける。それ以外は `OUTCOME_NOT_SETTLED` で拒否し、何も変えない。Attempt の状態は `rt_attempts`（イベントと同じトランザクションで書き、開くたびに Journal と照合する投影）から読む。
+  - `ReconcileOutcome` は、既知の下限（部分的な報告の費用）を下回る費用を `BELOW_LOWER_BOUND` で拒否する。結果の digest は、すべての検査の後にだけ記録する。
+  - 既存の正常な費用の調整（結果が確定した Attempt の、最終でない請求の照合）は残した。確定した費用より下、下限より下は、従来どおり拒否する。
+  - 以前の版が残した「結果不明なのに費用だけ確定した」状態は、`RecoveryReport.conflicts` で報告し、`reconcile` は `COST_SETTLED_APART` で拒否する。復旧も照合も、その状態を直さない（オーナーの判断に残す）。CLI の `recovered` の出来事にも出す。
+- **試験：** `tests/unit/test_qr01_reconcile.py`（9件）、`test_wp12_cli_and_faults.py` の実際の SIGKILL（照合のトランザクションの中、確定の前。子プロセスの停止点 `during_settle`）。旧試験2件の期待値を正しい契約に変えた（`test_wp12_fixes.py` の R02、`test_budget_ledger.py` の `test_unknown_outcome_holds_until_reconciled`）。
+- **修正前の赤：** 拒否、保留の維持、下限、以前の状態の報告の4件が失敗（`DID NOT RAISE`、`AttributeError`）。原子的な確定、二重の計上の防止、トランザクションの中の障害、正常な費用の照合と下限、SIGKILL の6件は修正の前から成功した（特性確認）。
+
+### 15.2 QR-02（MEDIUM）tenant の整合
+
+- Journal のイベントの `tenant_id` を、Task・Run・Step・Attempt の tenant の正本とする。同じ実体が2つの tenant で記録されていれば `TENANT_MISMATCH`。親がない（`PARENT_MISSING`）、親と子の tenant が違う（`TENANT_MISMATCH`）も拒否する。
+- `rt_tasks`・`rt_runs` の `tenant_id` を、通常の open と読み取り専用の open の両方で照合する（以前は照合していなかった）。
+- ProjectionRepair は、Journal の連鎖そのものが矛盾していれば、投影を書き直さずに拒否する（正本の異常を隠さない）。投影の tenant の破損は Journal から直し、2回目は何もしない。
+
+### 15.3 QR-03（MEDIUM）追加した表の位置付けと整合
+
+| 表 | 区分 | 再導出 | 開くときに確かめること |
+|---|---|---|---|
+| `rt_tasks`、`rt_runs`、`rt_steps`、`rt_attempts` | 投影 | できる（イベントから） | 内容、tenant、親子（ProjectionRepair が書き直す） |
+| `entity_times` | 正本（台帳の時計） | できない（イベントの時刻は別の時計） | Task と Run ごとに1行、孤立した行がない、台帳の high-water 以下、Run が Task より前でない、投影の作成時刻と一致 |
+| `run_status_times` | 正本（台帳の時計） | できない | Run ごとに1行、孤立した行がない、今の Run の状態と一致、Run の作成時刻以上・high-water 以下。読み取り（`run_status_since`）も、状態が違えば拒否する |
+| `operation_results` | 正本（MAC 付きの実行報告から。報告とバイトは保存しない） | できない | 既知の Attempt のもの、digest の形式、開始が記録された Attempt（Receipt が USED、状態が DISPATCH_STARTED・COMPLETED・FAILED_DEFINITE・OUTCOME_UNKNOWN）、完了した Run の検証の証拠が名指す読み取りの結果があり、観測の digest と一致 |
+
+- **必要な結果の条件（既存の契約から導いた）：** すべての Attempt に結果の digest が要るのではない。必要なのは、完了した Run の `VerificationEvidence` が `read_attempt_id` で名指す読み取りだけ（WP15-R07 の完了の根拠）。
+- **確かめられないこと（主張しない）：** `since_ms` と `created_at_ms` の正確な値（境界と状態だけを確かめる）、`result_digest` と実際のバイトの一致（バイトも報告も保存しない）。
+- **記録の形式の変更は見送った：** `run_status_times` に状態に入ったイベントの位置（`run_seq`）を加えれば、どのイベントで状態に入ったかまで照合できる。しかし時刻の値そのものは再導出できず、Journal の版 9 への移行も要る。今回は境界の検査にとどめ、候補として残す。
+- ProjectionRepair は、これらの正本を推測で作らない（欠けていれば拒否し、何も書かない）。
+- **試験：** `tests/unit/test_qr02_qr03_consistency.py`（23件）。修正前は18件が失敗（`DID NOT RAISE`）。作成時刻の欠落、親の付け替え、修復の冪等性、同じ状態のイベント、整った状態の open の5件は修正の前から成功した（特性確認）。
+
+### 15.4 FINAL-R05：並行実行を入れる前に必要な Recovery API の契約
+
+今の公式の CLI の経路では、修正の必要は見つからなかった。CLI の命令は1つのプロセスの1つのセッションで順に実行される。`recover` は `session.continues` で自分の生きている Run を拒否する。別のプロセスは OS のロックで排除される。並行実行（同じ Runtime の中で複数の Run やスレッドを動かすこと）を入れる前には、次の契約が必要である（今は未実装）。
+
+1. 再入の防止を、状態機械の単位（今の `_RECOVERING`、プロセスの中だけ）から Run の単位にし、Journal に記録する所有（Lease）にする。
+2. 「生きている Run」の判定（`active`）を、メモリの中の呼び出し元の申告ではなく、Journal に記録された Lease から導く。
+3. `reconcile` と `_settle` は、今と同じく1つのトランザクションで、台帳が Attempt と予約の状態を再検査する（今の `NOT_UNKNOWN`、`OUTCOME_NOT_SETTLED` を保つ）。
+4. 復旧と、同じ Run の新しい Step の作成が競合しないこと（WP04-R03 の検査をトランザクションの中で行う）。
+5. 期限の検査（A.I17）を、明示的な復旧の時だけでなく、停止とタイムアウトの経路から呼べるようにするかを、Phase 2 の前に再評価する（6章の A.I17）。
+
+### 15.5 sqlite_ledger.py の技術的負債（今回は大きな分割をしない）
+
+- 約 3,500 行に、予算、権限（Permit・Receipt・承認・停止）、投影、完了の根拠、照合、開くときの検査、修復が集まっている。
+- **将来の分割の案：** `ledger_cost`（予約と照合）、`ledger_authority`（決定、承認、Permit、Receipt、停止）、`ledger_mirror`（投影、修復、`entity_times`・`run_status_times`）、`ledger_completion`（完了の根拠、書き込みの順序）、`ledger_consistency`（開くときの検査）。
+- **原子性を保つ条件：** 分割した後も、すべての操作は呼び出し元の1つのカーソル（同じ SQLite のトランザクション）の中で動き、モジュールが自分で接続やトランザクションを開かない。Journal の追記（`append_with_ledger`）が、`mirror`、`apply_op`、イベントの挿入を1つのトランザクションで呼ぶ順序を変えない。モジュールの間の依存は一方向にし、import-linter の契約で強制する。

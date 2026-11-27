@@ -1,12 +1,14 @@
 # WP-13 最終統合試験（Phase 1）
 
-> 文書の状態：**DRAFT**（ChatGPT のレビュー待ち。Codex の独立監査、CI、オーナーの最終承認の前）　最終更新：2026-11-26
+> 文書の状態：**DRAFT**（独立品質レビューの指摘の修正を提出、再レビュー待ち。CI、オーナーの最終承認の前）　最終更新：2026-11-27
 >
 > - 起点：`b441b03`（WP-12）。作業の前に、リモートとの一致、作業ツリーが空であること、`main`（`aa089ae`）、設計のブランチ（`e6b70c0`）、2038 件の試験と8種類の検査の成功を確かめた。
 > - 段階1：`01cc522`（WP-12・WP-15 の限定修正。記録は `WP-12_RECOVERY.md` の14章、`WP-15_AGENT_LOOP.md` の17章）。
 > - 段階2：`7846a19`（最終統合のシナリオ）。
 > - 段階3：この文書のコミット（最終の報告書と監査の準備）。
-> - **Phase 1 は「実装提出済み・最終監査待ち」。** 独立監査、CI の実行、必要な修正、オーナーの最終承認の前には、正式な完了としない。Phase 2 には進まない。
+> - 独立品質レビューの指摘の修正（7章）：QR-01 `dc2da98`、QR-02・QR-03 `d88165d`、QR-04 `e3b75bb`、記録の更新はこの版のコミット。
+> - **Phase 1 は「独立品質レビュー指摘の修正提出済み・再レビュー待ち」。** 再レビュー、CI の実行、必要な修正、オーナーの最終承認の前には、正式な完了としない。Phase 2 には進まない。
+> - Codex の独立品質レビュー（コードの品質と正しさ）は、包括的なセキュリティ監査ではない。セキュリティ監査は、まだ行われていない。
 
 ## 1. 範囲と方法
 
@@ -45,18 +47,18 @@
 | A.I3 | 有効な epoch の1つの主体だけが書く | OS のロック、owner_epoch | `test_journal_processes.py`、`test_wp10_cli_process.py` | PASS | 1つのカーネルの中（ネットワークのファイルシステムは対象外） | — |
 | A.I4 | 取り消せない Step を結果不明の後に自動で再実行しない | ループ、復旧 | `test_wp15_scenarios.py` S6、`test_wp12_*.py`、I5 | PASS | — | — |
 | A.I5 | 確定額＋予約＋未確定 ≤ 上限 | 台帳 | `test_budget_ledger.py`、`test_wp09_*.py` | PASS | 合成の XTU | — |
-| A.I6 | Snapshot と状態のハッシュの一致 | Rebuild の決定性だけ | `test_runtime_service.py`、I6 | PARTIAL | Snapshot は未実装 | 要判断 |
+| A.I6 | Snapshot と状態のハッシュの一致 | Rebuild の決定性だけ | `test_runtime_service.py`、I6 | PARTIAL | Snapshot は未実装（延期の候補。8章） | 要判断 |
 | A.I7 | 終了状態から遷移しない | 状態機械 | `test_runtime_state_machine.py` | PASS | — | — |
 | A.I8 | Safety の判定のない Step は出さない。policy_version の変化で再判定 | 台帳の PDP の再実行 | `test_wp09_*.py`、I3 | PASS | — | — |
-| A.I9 | 復旧は冪等 | `runtime/recovery.py` | `test_wp12_recovery.py`、`test_wp12_fixes.py`、I5 | PASS | 明示的な復旧の操作として | — |
+| A.I9 | 復旧は冪等 | `runtime/recovery.py` | `test_wp12_recovery.py`、`test_wp12_fixes.py`、`test_qr01_reconcile.py`、I5 | PASS | 明示的な復旧の操作として。照合の再実行で費用を二重に計上しない（QR-01） | — |
 | A.I10 | Phase 3B まで LiveProvider に届く経路がない | import の契約 | `test_import_contracts.py` | PASS | 静的な検査と実行時の遮断の範囲 | — |
-| A.I11 | Step のイベントに版の項目がそろう | イベントの型 | `test_event_versions.py` | PARTIAL | 版の項目の全体を WP-13 で個別に照合していない | — |
-| A.I12 | 承認待ちは再起動で失われず、期限切れで自動承認しない | 承認の記録、照合 | `test_wp10_cli*.py`、`test_wp12_recovery.py` | PARTIAL | 自動承認はしない（確認済み）。ただし Phase 1 では会話の記録がプロセスの中だけで、承認待ちの Run は再起動の後に再開できず、復旧で中止される | **要判断** |
+| A.I11 | Step のイベントに版の項目がそろう（A の2章：`run_id`、`seq`、`prev_hash`、`schema_version`、`epoch`、`runtime_version`、`provider_kind`、`model_id`、`context_hash`、`tool_id@version`、`policy_version`） | イベントの型（`_EventFields`）、`ActionDescriptor` | `test_event_versions.py`、`test_event_hash.py` | PARTIAL | **保証する：** すべてのイベント（Step のものを含む）が型で `run_id`・`run_seq`、ハッシュの連鎖、`schema_version`、`engine`（Runtime の版）、`policy_version`、`owner_epoch` を持つ。**保証しない：** Runtime のイベントの `access_epoch` と `revocation_gen` は固定の 0（実際の値は台帳が持つ）。`provider_kind`、`model_id`、`context_hash`、`tool_id@version` は Step のイベントではなく、台帳に記録した `ActionDescriptor`（action_hash に結び付く）にある。すべての Step のイベントで全項目を照合する試験はない | — |
+| A.I12 | 承認待ちは再起動で失われず、期限切れで自動承認しない | 承認の記録、照合 | `test_wp10_cli*.py`、`test_wp12_recovery.py` | PARTIAL | 自動承認はしない（確認済み）。ただし Phase 1 では会話の記録がプロセスの中だけで、承認待ちの Run は再起動の後に再開できず、復旧で中止される（延期の候補。8章） | **要判断** |
 | A.I13 | 有効な Permit のない外部操作はない | 実行のゲート | `test_permits.py`、`test_wp09_execution.py` | PASS | 外部操作は Phase 1 にない（合成） | — |
 | A.I14 | Rebuild に副作用の接続口がない | `rebuild_with_head` | `test_runtime_service.py`、I6 | PASS | — | — |
 | A.I15 | 承認時と実行時の引数のハッシュが一致 | action_hash の結び付け | `test_wp09_binding.py`、`test_wp08_write.py` | PASS | — | — |
-| A.I16 | 結果不明があれば COMPLETED・CANCELLED にしない | 状態機械、台帳 | `test_wp12_fixes.py` R03、`test_wp15_r06.py` | PASS | — | — |
-| A.I17 | CANCELLING と RECOVERING の期限 | `recovery.py` | `test_wp12_recovery.py`、`test_wp12_fixes.py` R04 | PARTIAL | 明示的な復旧の時だけ検査（常時の監視は Phase 4）。期限の値は未承認 | 要判断 |
+| A.I16 | 結果不明があれば COMPLETED・CANCELLED にしない | 状態機械、台帳 | `test_wp12_fixes.py` R03、`test_wp15_r06.py`、`test_qr01_reconcile.py`、`test_qr04_ordering.py` | PASS | 結果不明の費用を単独で確定しない（QR-01）。結果不明を経た書き込みでは完了しない（QR-04） | — |
+| A.I17 | CANCELLING と RECOVERING の期限 | `recovery.py` | `test_wp12_recovery.py`、`test_wp12_fixes.py` R04、`test_qr02_qr03_consistency.py` | PARTIAL | 明示的な復旧の時だけ検査。期限の値は未承認。状態に入った時刻の記録は開くときと読むときに照合する（QR-03）（延期の候補。8章） | 要判断 |
 | A.I18 | 書き込むプロセスは1つ、異常終了でロックは残らない | `runtime_lock.py` | `test_journal_processes.py`、`test_wp10_cli_process.py` | PASS | — | — |
 
 ### 3.2 C1（Safety）
@@ -79,7 +81,8 @@
 | C1.S15 | 再開はオーナーの操作 | PARTIAL | `ResumeScope`（`test_wp10_cli.py`）。11.3 の確認の全体は未照合 |
 | C1.S16 | ファイルはワークスペースのルートの内側 | PASS | `test_wp08_*.py`（ADR-0008 の範囲） |
 | C1.S17 | ポリシーの変更はオーナーの認証された経路 | PASS | `test_safety.py`、I3 |
-| C1.S18、S19、S21、S24、S25 | Sandbox へのコピー・反映、Gateway、プロセスの分離、MCP | DEFERRED | Phase 3A 以降 |
+| C1.S19 | ホストへの反映は検査を通った普通のファイルだけ、全体として原子的、安全なファイル操作の手段がなければ拒否 | PARTIAL | **Phase 1 の File Broker に当たる部分：** 安全なパスの解決（ADR-0008 の `dir_fd`）ができなければ開く前に拒否する、普通のファイルだけ（リンク、特殊なファイルを拒否）、1つのファイルの CREATE・REPLACE を一時ファイルと `link`・`rename` で行う（`test_wp08_*.py`）。**当たらない部分（DEFERRED）：** コンテナの停止の後の検査と、複数のファイルの全体としての原子的な反映（Sandbox は Phase 3A） |
+| C1.S18、S21、S24、S25 | Sandbox へのコピー、Gateway、プロセスの分離、MCP | DEFERRED | Phase 3A 以降 |
 | C1.S20 | Permit の消費の検査 | PASS | `test_permits.py` |
 | C1.S22 | 停止の状態のファイルを先に書く | DEFERRED | Phase 1 は台帳の中の停止の記録（別ファイルではない） |
 | C1.S23 | manifest_hash・artifact_hash の変化で再審査 | PASS | `test_tool_registry.py`、`test_wp08_files.py` |
@@ -112,7 +115,7 @@
 | D.V10、V11、V13、V16、V17 | PASS | `test_budget_ledger.py`、`test_cost_rules.py` |
 | D.V12 | PASS | 実 API の経路がない（import の契約） |
 | D.V14 | PARTIAL | 価格表は `status: test` だけ |
-| D.V19 | NOT_TESTED | 安全の違反と通常の拒否の分けた記録を、個別に試していない |
+| D.V19 | NOT_TESTED | 設計：安全の違反と通常の認可の拒否を分けて記録し、タスクの結果と安全の結果を別の項目にする。今あるもの：拒否の理由の符号（`PermitReason` など）、監査の判定（ALLOW・DENY）、ループの結果（状態と `TerminationReason`、`ABORTED_SAFETY`）。**未検証：** 「安全の違反」の区分が通常の拒否と別に記録されること、タスクの結果と安全の結果が別の項目であることを確かめる試験はない。評価（Phase 2）の前に、記録の形式と試験が要る |
 | D.V1〜V9、V15、V18、V20、V21 | DEFERRED | 評価（Phase 2 以降） |
 
 ### 3.5 E（統合）
@@ -123,7 +126,7 @@
 | E.Z6 | PASS | ゲートの未実行の報告、Receipt の状態による未実行の証明（`test_wp12_fixes.py`） |
 | E.Z7、Z8、Z9、Z37、Z42、Z43 | PASS | `test_budget_ledger.py`、`test_wp09_*.py` |
 | E.Z11 | PASS | Task の上限は Run をまたいで残る（`test_wp12_recovery.py`、I4） |
-| E.Z13、Z15 | PASS | 検証が完了を決め、モデルの主張や証拠の作成だけでは完了しない（`test_wp15_r06.py`、`test_wp12_fixes.py` R07） |
+| E.Z13、Z15 | PASS | 検証が完了を決め、モデルの主張や証拠の作成だけでは完了しない（`test_wp15_r06.py`、`test_wp12_fixes.py` R07）。書き込みと検証の読み取りの順序は Journal で証明し、証明できなければ完了しない（QR-04、`test_qr04_ordering.py`。同じ Run の書き込みの範囲） |
 | E.Z14 | PASS | `test_replay_provider.py` |
 | E.Z17 | PARTIAL | Journal と台帳は同じ DB の1つのトランザクション。ファイルと DB の間は原子的でない（ADR-0008、I5 の rename の後の停止で確かめた範囲） |
 | E.Z32 | PASS | 結果不明の読み取りも未実行とみなさない（`test_wp12_*.py`） |
@@ -131,19 +134,34 @@
 | E.Z38、Z39 | PASS | 外部操作と通信の経路がない（import の契約） |
 | E.Z4、Z12、Z24 | PARTIAL | プロセスの起動と通信はない。上限の値はオーナーの決定を待つ |
 | E.Z10、Z16、Z18〜Z23、Z25〜Z31、Z34〜Z36、Z40、Z41、Z44〜Z46 | DEFERRED | 実 API、削除、暗号、復元、外部の作業領域、評価の各 Phase |
-| E.Z1、Z5 | NOT_TESTED | この報告では個別に追跡していない（P1 の呼び名、送信の Lease） |
+| E.Z1 | NOT_TESTED（構成の照合では不一致なし） | 設計：P1 を Runtime Core と呼び、Engine の Orchestration（サブエージェント）と区別する。Phase 1 の構成：P1 は `agent_core` の Runtime と、合成の根 `agent_core_cli` を1つのプロセスで動かす。Orchestration とサブエージェントのコードはない。WP-08・WP-09 の文書の「P1」はこの意味で使っている。用語の整合は文書とコードの照合で確かめた。試験で確かめる性質ではない |
+| E.Z5 | PARTIAL | 設計：ack の後、または送信の Lease が切れた後は、まだ始まっていない操作が古い `revocation_gen` で始まらない。**Phase 1 の部分（PASS）：** 同じプロセスの PEP で、失効の後の消費と開始を拒否する（`test_permits.py`、`test_wp09_execution.py` の失効、`test_wp09_restart.py` の `revocation_gen` が戻らないこと）。**後の Phase（DEFERRED）：** ack、送信の Lease、別のプロセスの PEP（Phase 3A 以降） |
 
 ### 3.6 Phase 1 の完了を妨げうる事項と、後に残せる事項
 
 - **妨げうる（オーナーと監査の判断が必要）：**
   1. CI が未実行（WP-01。6章）。
-  2. A.I12：承認待ちの Run は、再起動の後に再開できない（会話の記録の永続化は Phase 4 の予定）。設計の文言との差。
-  3. A.I17：期限の検査は明示的な復旧の時だけ。期限の運用の値は未承認。
-  4. A.I6：Snapshot は未実装（Rebuild の決定性だけ）。
-  5. Codex の独立監査（AUDIT-02〜04 を含む）が済んでいない。
+  2. A.I12、A.I17、A.I6：設計の文言との差。それぞれ別の延期の候補として、オーナーの承認を待つ（8章。一括して Phase 4 に送らない）。
+  3. 独立品質レビュー（FAIL、HIGH 1・MEDIUM 3）の指摘の修正の再レビューが済んでいない（7章）。
+  4. 包括的なセキュリティ監査は行われていない。AUDIT-02〜04、A-P6 は残っている。
 - **後に残せる（DEFERRED、各 Phase の範囲）：** Sandbox と OS の隔離（3A）、Gateway と外部通信、実 API（3B 以降）、評価（2）、記憶と要約、削除と復元（4）、鍵付きのハッシュ（実データの前）、外部の作業領域への反映。
 
+### 3.7 追加した台帳の表の区分（QR-03）
+
+投影（`rt_*`）、正本（`entity_times`、`run_status_times`、`operation_results`）、それぞれで確かめることと確かめられないことは、`WP-12_RECOVERY.md` の 15.3 にまとめた。
+
 ## 4. 品質検査と追加の検証
+
+### 4.0 独立品質レビューの修正の後（HEAD `e3b75bb` の時点、2026-11-27）
+
+| 検査 | 結果 |
+|---|---|
+| 8種類の検査 | すべて成功（2126 件） |
+| 全試験の連続2回の実行 | 2回とも 2126 件が成功 |
+| ネットワークのない環境（`unshare -n`。外への接続は "Network is unreachable"） | 2126 件が成功 |
+| 一般ユーザー（`nobody`）での全試験（`setpriv`、別の作業ツリー） | 2118 件が成功、**8件が失敗**。原因はすべて試験の準備に必要な権限：WP-08 の5件は別の利用者への `chown` と文字デバイスの `mknod`（root だけができる）、秘密情報の検査の3件は Git の "dubious ownership"（作業ツリーの Git の管理情報が root の所有）。製品のコードの失敗ではない。**ただし CI は root でない利用者で動くため、WP-08 の5件は CI でも失敗しうる（WP-01 の残っている課題に加えた。試験の無効化や省略はしていない）** |
+
+以下の 4章の表は、最初の提出（`7846a19`）の時点の結果である。
 
 | 検査 | 結果 |
 |---|---|
@@ -163,6 +181,7 @@
 - **手動の実行で実装ブランチを検証できるか：** `workflow_dispatch` は、ワークフローの定義がそのブランチにあれば、そのブランチを選んで実行できる（GitHub の仕様の一般的な理解。この環境では実行していないので、実際の動作は未確認）。
 - **CI と手元の差：** CI は `uv sync --locked` で依存をネットワークから入れる（手元は `--offline` でキャッシュから）。CI は root でない利用者で動く（`test_wp08_nonroot.py` は root でないときの分岐を持つ）。手元は Linux のコンテナ（uid 0）。Python は CI が `setup-python`、手元はシステムの 3.12。
 - **ネットワークの制限：** CI では、依存の導入の後のすべての手順が `uv run --locked --offline` で、試験の中では Python の `socket` を遮断する。OS のレベルの遮断（手元の `unshare -n` のようなもの）は CI では行っていない。
+- **root でない利用者で失敗する試験：** WP-08 の5件（`test_wp08_read.py`・`test_wp08_write.py` の `char-device`、`test_wp08_workspace.py` の `other-owner`・`directory-of-another-user`）は、準備に root の権限（`mknod`、別の利用者への `chown`）を使う。CI の前に、権限がなくても同じ振る舞いを確かめる準備の方法を決める必要がある（オーナーの判断なしに試験を省略しない）。
 - **今回、GitHub Actions は実行していない。CI が未実行のまま、Phase 1 の正式な完了は宣言しない。**
 
 ## 6. 未検証の事項
@@ -173,3 +192,29 @@
 - 実行報告の永続化（プロセスの中だけ）。実際のプロバイダーの照会。
 - E.Z1、Z5、D.V19、A.I11 の個別の照合。
 - GitHub Actions の SHA、無料の利用枠。
+
+## 7. 独立品質レビューの指摘の修正（QR-01〜QR-04）
+
+Codex の独立品質レビューの判定は FAIL（CRITICAL 0、HIGH 1、MEDIUM 3、LOW 0）。指摘の4件を限定して修正した。試験を先に書き、修正の前の失敗を確かめた。
+
+| 指摘 | 重要度 | 修正 | 試験（件数） | 修正の前 | 記録 |
+|---|---|---|---|---|---|
+| QR-01 結果と費用の原子的な照合 | HIGH | 結果不明の Attempt の費用だけの照合を拒否、下限の検査、以前の版の状態を報告して直さない | `test_qr01_reconcile.py`（9）、`test_wp12_cli_and_faults.py` の SIGKILL（1）。旧試験2件の期待値を変えた | 4件が失敗、6件は特性確認 | `WP-12_RECOVERY.md` 15.1 |
+| QR-02 tenant の整合 | MEDIUM | Journal の tenant を正本とし、投影と親子を通常と読み取り専用の open で照合、矛盾した Journal を修復しない | `test_qr02_qr03_consistency.py`（23 のうち 5） | 3件が失敗、2件は特性確認 | 15.2 |
+| QR-03 追加した表の整合 | MEDIUM | 区分の明文化、存在・孤立・時刻・状態・結果の検査、読み取りの拒否、推測しない | 同（23 のうち 18） | 15件が失敗、3件は特性確認 | 15.3 |
+| QR-04 書き込みと完了の検証の順序 | MEDIUM | 決定の順ではなく Journal の位置で順序を証明、証明できなければ完了しない | `test_qr04_ordering.py`（14） | ループの2件が失敗、規則の10件は import で失敗、2件は特性確認 | `WP-15_AGENT_LOOP.md` 18章 |
+
+- 試験は 2079 件から 2126 件（47 件の追加）。
+- 既存の部分的な試験を、すべての経路の証明としては扱わない。例えば QR-04 の規則は同じ Run の書き込みについてだけで、別の Run や外部の書き込み元の順序は扱わない。
+- FINAL-R05（並行実行の前に必要な Recovery API の契約）は `WP-12_RECOVERY.md` の 15.4 に残した。今の公式の CLI の経路では、修正の必要は見つからなかった（1つのプロセスの1つのセッションで命令を順に実行し、自分の生きている Run は `RUN_ACTIVE` で拒否する）。
+- `sqlite_ledger.py` に責務が集まっていることを技術的負債として記録した（15.5）。今回は大きな分割をしていない。
+
+## 8. 設計との差の延期の候補（オーナーの承認待ち。今回は承認も変更もしない）
+
+3項目は、それぞれ別の条件で扱う。一括して Phase 4 に送らない。
+
+| 項目 | 今の状態 | 延期するときの条件と影響 |
+|---|---|---|
+| A.I6 Snapshot | Rebuild は Journal の全体から決定的に行う。Snapshot はない | 容量：Journal が大きくなっても Rebuild に必要な記憶域は Journal の大きさに比例する。起動時間：開くたびに全体の検証と Rebuild をするため、イベントの数に比例して延びる（Phase 1 の合成のデータの量では測っていない。性能の主張はしない）。条件：Rebuild が状態のハッシュで照合できること（今は決定性の試験だけ）、Snapshot を入れるときは Snapshot と Journal の頭の一致を開くときに検査すること |
+| A.I12 承認待ちの Run の再開 | 会話の記録はプロセスの中だけ。承認待ちの Run は再起動の後に再開できず、復旧で中止（FAILED）になる | 作業の喪失：承認待ちまでのモデルの呼び出しと、その費用は失われる（費用は記録に残り、二重に計上しない）。安全な停止：自動承認はせず、承認は無効になり、操作は実行されない（試験で確認済み）。条件：会話の記録の永続化と、再開の時の Context の検証 |
+| A.I17 常時の期限の監視 | 期限は明示的な復旧の時だけ検査する | **Phase 2 の開始の前に再評価する：** タイムアウトと停止の処理との関係（長い実行で RECOVERING や CANCELLING のままになる時間）。それまでは、オーナーが `recover` を実行した時にだけ期限切れを `escalated` として報告する |
