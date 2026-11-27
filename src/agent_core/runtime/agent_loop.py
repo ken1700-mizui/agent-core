@@ -635,6 +635,18 @@ class AgentLoop:
             raise _Stop(self._outcome(session, run_id, "CAPACITY_LIMITED")) from None
         return self._deps.sm.set_step_status(step, StepStatus.IN_PROGRESS)
 
+    def _start_attempt(
+        self, run_id: RunId, session: _Session, step: Step, schema_ref: str
+    ) -> Attempt:
+        try:
+            return self._pipeline.start(step, schema_ref)
+        except CapacityLimitedError:
+            # P-2: no new Attempt at the limit. Its Step is ended (nothing ran) and
+            # the Run waits as it is; the owner can stop it.
+            current = self._deps.sm.state.steps[step.step_id]
+            self._deps.sm.set_step_status(current, StepStatus.CANCELLED)
+            raise _Stop(self._outcome(session, run_id, "CAPACITY_LIMITED")) from None
+
     def _end_step(self, step: Step, attempt: Attempt) -> None:
         current = self._deps.sm.state.attempts[attempt.attempt_id]
         status = {
@@ -770,7 +782,7 @@ class AgentLoop:
         except ContextError as exc:
             raise self._unsafe(session, run_id, "CONTEXT_INVALID", _name(exc)) from None
         step = self._new_step(run_id, session, StepKind.MODEL_CALL)
-        attempt = self._pipeline.start(step, sha256_digest(b"model-request-v1"))
+        attempt = self._start_attempt(run_id, session, step, sha256_digest(b"model-request-v1"))
         try:
             result = build_context(
                 inputs=inputs,
@@ -913,7 +925,7 @@ class AgentLoop:
             return
         run = deps.sm.state.runs[run_id]
         step = self._new_step(run_id, session, StepKind.TOOL_CALL)
-        attempt = self._pipeline.start(step, registration.manifest.manifest_hash)
+        attempt = self._start_attempt(run_id, session, step, registration.manifest.manifest_hash)
         try:
             proposal = deps.registry.propose(
                 tool_id=use.name,
@@ -1047,7 +1059,7 @@ class AgentLoop:
             return None
         run = deps.sm.state.runs[run_id]
         step = self._new_step(run_id, session, StepKind.VERIFICATION)
-        attempt = self._pipeline.start(step, registration.manifest.manifest_hash)
+        attempt = self._start_attempt(run_id, session, step, registration.manifest.manifest_hash)
         canonical = canonical_json({"path": path}).decode()
         try:
             policy = deps.ledger.policy(str(config.tenant_id))

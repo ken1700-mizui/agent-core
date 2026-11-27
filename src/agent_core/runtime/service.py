@@ -349,6 +349,7 @@ class RuntimeStateMachine:
 
     @_exclusive
     def create_attempt(self, step: Step) -> Attempt:
+        self._admit(NewWork.ATTEMPT)
         attempt = Attempt(
             attempt_id=self._ids.new(AttemptId),
             step_id=step.step_id,

@@ -48,6 +48,7 @@ from agent_core_cli.environment import (
     Hooks,
     Session,
     Snapshot,
+    apply_provisional_limits,
     init_home,
     open_session,
     open_snapshot,
@@ -134,6 +135,17 @@ def _parser(out: TextIO, err: TextIO) -> _Parser:
         cmd.add_argument("--home", required=True, type=Path, help="the synthetic home directory")
         if name != "init":
             cmd.add_argument("--json", action="store_true", help="fixed JSON lines")
+    limits = sub.add_parser(
+        "limits",
+        help="P-2: add the provisional operating limits to an existing home (explicit)",
+        out=out,
+        err=err,
+        allow_abbrev=False,
+    )
+    limits.add_argument("--home", required=True, type=Path, help="the synthetic home directory")
+    limits.add_argument(
+        "--apply-provisional", action="store_true", required=True, help="write them once"
+    )
     return parser
 
 
@@ -162,6 +174,10 @@ def main(
         if args.command == "init":
             init_home(home, clock=the_clock)
             stdout.write("initialized a synthetic home\n")
+            return EXIT_OK
+        if args.command == "limits":
+            apply_provisional_limits(home)
+            stdout.write("added the provisional limits; they apply from the next start\n")
             return EXIT_OK
         if args.command in ("status", "recovery"):
             opened: Session | Snapshot = open_snapshot(home, clock=the_clock)

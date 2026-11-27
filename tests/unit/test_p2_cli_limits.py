@@ -93,6 +93,7 @@ def home(tmp_path: Path) -> _Home:
 
 
 def test_without_limits_the_usage_is_shown_and_nothing_is_limited(home: _Home) -> None:
+    home.configure(None)  # an older home without limits (a new home has them: P-2)
     capacity = home.status()["capacity"]
     assert capacity["level"] == "NORMAL"
     assert capacity["limits"] is None

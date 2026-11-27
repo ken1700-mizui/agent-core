@@ -69,7 +69,7 @@ from agent_core.safety.approval import OwnerApprovalChannel
 from agent_core.safety.workspace import manifest_digest, manifest_key
 from agent_core.tool.registry import ToolRegistry
 from agent_core.types.base import FrozenModel
-from agent_core.types.capacity import CapacityLevel, CapacityLimits, NewWork
+from agent_core.types.capacity import CapacityLevel, CapacityLimits, CapacityUsage, NewWork
 from agent_core.types.context import SyntheticTexts
 from agent_core.types.cost import BudgetScopeType, CounterKind
 from agent_core.types.errors import (
@@ -118,17 +118,34 @@ from agent_core.types.safety import (
 )
 from agent_core.types.tools import ToolEffectClass, ToolRegistration
 from agent_core.types.transitions import Termination, TerminationReason
-from agent_core.types.values import Digest, EngineName, EngineVersion, sha256_digest
+from agent_core.types.values import Count, Digest, EngineName, EngineVersion, sha256_digest
 from agent_core_cli import demo
 
 KEY_FILE: Final = "owner.key"
 SEQ_FILE: Final = "owner.seq"
 CONFIG_FILE: Final = "config.json"
 JOURNAL_FILE: Final = "journal.db"
+# P-2: the last session's start-up time (replaced atomically at each start; an
+# older home without it is valid).
+STARTUP_FILE: Final = "startup.json"
 AREA_DIR: Final = "area"
 ENGINE: Final = EngineVersion(engine=EngineName.RUNTIME, version="0.1.0")
 _FILE_FLAGS: Final = os.O_NOFOLLOW | os.O_CLOEXEC
 
+
+# P-2: the owner's provisional operating limits (approved 2026-11-27, to be
+# re-evaluated after the performance work). A new home starts with them; an
+# existing home gets them only by the owner's explicit ``limits --apply-provisional``.
+PROVISIONAL_LIMITS: Final = CapacityLimits(
+    warning_events=30_000,
+    limit_events=50_000,
+    warning_bytes=100_663_296,
+    limit_bytes=167_772_160,
+    reserve_events=200,
+    reserve_bytes=1_048_576,
+    warning_startup_ms=30_000,
+    limit_startup_ms=60_000,
+)
 
 # P-2: the events a start writes before its loop runs (the Task, the Run and its
 # attachment, QUEUED, RUNNING); admitted together with the reserve.
@@ -215,6 +232,17 @@ class Home:
     def replace(self, name: str, data: bytes) -> None:
         replace_private_file(self.fd, name, data, tag=secrets.token_hex(8))
 
+    def read_optional(self, name: str, limit: int = MAX_FILE) -> bytes | None:
+        """The file, or None when it does not exist (any other problem is unsafe)."""
+        try:
+            return read_private_file(self.fd, name, limit=limit)
+        except LookupError as exc:
+            if exc.args and exc.args[0] == "MISSING":
+                return None
+            raise CliError("HOME_UNSAFE") from None
+        except OSError:
+            raise CliError("HOME_UNSAFE") from None
+
     def require_ready(self) -> None:
         """A home whose init did not finish is never opened (and never deleted)."""
         if self.read(READY_FILE) != READY_CONTENT:
@@ -252,6 +280,59 @@ class _ConfigFile(FrozenModel):
     # P-2: the journal's operating limits. Missing: no limit (only the usage is
     # shown); malformed or out of order: a malformed file (HOME_UNSAFE).
     limits: CapacityLimits | None = None
+
+
+class _StartupRecord(FrozenModel):
+    version: Literal[1]
+    startup_ms: Count
+    events: Count
+    recorded_at_ms: Count
+
+
+def read_startup_record(home: Home) -> _StartupRecord | None:
+    data = home.read_optional(STARTUP_FILE)
+    if data is None:
+        return None
+    try:
+        return _StartupRecord.model_validate(_strict_json(data))
+    except (ValueError, TypeError, UnicodeDecodeError):
+        raise CliError("HOME_UNSAFE") from None
+
+
+def _record_startup(home: Home, startup_ms: int, events: int, now_ms: int) -> None:
+    record = _StartupRecord(version=1, startup_ms=startup_ms, events=events, recorded_at_ms=now_ms)
+    home.replace(STARTUP_FILE, json.dumps(record.model_dump(mode="json"), sort_keys=True).encode())
+
+
+class _HomeCapacity:
+    """P-2: the journal's usage plus the start-up time this view knows: the one
+    measured in this process (a session) or the last recorded (a read-only view)."""
+
+    def __init__(self, journal: SqliteJournal) -> None:
+        self.journal = journal
+        self.startup_ms: int | None = None
+
+    def capacity_usage(self) -> CapacityUsage:
+        usage = self.journal.capacity_usage()
+        return usage.model_copy(update={"startup_ms": self.startup_ms})
+
+
+def apply_provisional_limits(path: Path) -> CapacityLimits:
+    """P-2: the owner's explicit adoption of the provisional limits in an existing
+    home. Refused if the home already has limits (never overwritten). Takes effect
+    at the next start; nothing else in the configuration changes."""
+    h = Home(path)
+    try:
+        h.require_ready()
+        config = HomeConfig.load(h)  # the profile and the rest must already be valid
+        if config.limits is not None:
+            raise CliError("LIMITS_ALREADY_SET")
+        data = _strict_json(h.read(CONFIG_FILE))
+        data["limits"] = PROVISIONAL_LIMITS.model_dump(mode="json")
+        h.replace(CONFIG_FILE, json.dumps(data, sort_keys=True).encode())
+    finally:
+        h.close()
+    return PROVISIONAL_LIMITS
 
 
 def _load_keys(home: Home) -> LedgerKeys:
@@ -420,6 +501,7 @@ def init_home(home: Path, *, clock: Clock) -> None:
                     "tenant_id": str(config.tenant_id),
                     "owner_id": str(config.owner_id),
                     "workspace_ref": config.workspace_ref,
+                    "limits": PROVISIONAL_LIMITS.model_dump(mode="json"),
                 },
                 sort_keys=True,
             ).encode(),
@@ -500,8 +582,10 @@ class Session:
     runs: dict[RunId, _RunEntry] = field(default_factory=dict)
     current: RunId | None = None
     closed: bool = False
-    # P-2: how long opening the journal and the Rebuild took in this process.
+    # P-2: how long opening the journal and the Rebuild took in this process
+    # (also recorded in the home as the last start-up time).
     startup_ms: int | None = None
+    recorded_startup_ms: int | None = None
 
     # -------------------------------------------------------- lifecycle
 
@@ -884,8 +968,9 @@ class Snapshot:
     journal: SqliteJournal
     sm: RuntimeStateMachine
     config: HomeConfig
-    # P-2: a read-only view records no start-up time.
+    # P-2: a read-only view measures no start-up time; it shows the last recorded.
     startup_ms: int | None = None
+    recorded_startup_ms: int | None = None
 
     def continues(self, run_id: RunId) -> bool:
         return False
@@ -913,7 +998,7 @@ def _checked_home(home: Path) -> tuple[Home, LedgerKeys, HomeConfig]:
 
 
 def _load_state(
-    journal: SqliteJournal, clock: Clock, config: HomeConfig
+    journal: SqliteJournal, clock: Clock, config: HomeConfig, probe: _HomeCapacity
 ) -> tuple[IdGenerator, RuntimeStateMachine]:
     ids = IdGenerator(demo.SITE, clock, OsRandomSource())
     sm = RuntimeStateMachine.load(
@@ -925,7 +1010,7 @@ def _load_state(
         engine=ENGINE,
         policy_version=demo.POLICY_VERSION,
         profile=config.profile,
-        capacity=CapacityGate(config.limits, journal),
+        capacity=CapacityGate(config.limits, probe),
     )
     return ids, sm
 
@@ -934,15 +1019,23 @@ def open_snapshot(home: Path, *, clock: Clock) -> Snapshot:
     """Read the home's state without taking ownership (``status``)."""
     h, keys, config = _checked_home(home)
     try:
+        record = read_startup_record(h)
         journal = SqliteJournal.open_read_only(home / JOURNAL_FILE, clock=clock, keys=keys)
     finally:
         h.close()
     try:
-        _, sm = _load_state(journal, clock, config)
+        probe = _HomeCapacity(journal)
+        probe.startup_ms = None if record is None else record.startup_ms
+        _, sm = _load_state(journal, clock, config, probe)
     except BaseException:
         journal.close()
         raise
-    return Snapshot(journal=journal, sm=sm, config=config)
+    return Snapshot(
+        journal=journal,
+        sm=sm,
+        config=config,
+        recorded_startup_ms=None if record is None else record.startup_ms,
+    )
 
 
 def open_session(
@@ -964,8 +1057,13 @@ def open_session(
         raise
     try:
         sequence = OwnerSequence(h, journal.last_owner_seq())
-        ids, sm = _load_state(journal, clock, config)
+        probe = _HomeCapacity(journal)
+        ids, sm = _load_state(journal, clock, config, probe)
         startup_ms = monotonic() - opened_at
+        # P-2: the start-up time limits new work in this session; it is recorded
+        # (atomically) as the home's last start-up time.
+        probe.startup_ms = startup_ms
+        _record_startup(h, startup_ms, journal.capacity_usage().events, clock.now_ms())
         gate = SyntheticExecutionGate(
             runtime=sm,
             ledger=journal,
@@ -997,6 +1095,7 @@ def open_session(
             report_key=keys.permit,
             broker=broker,
             startup_ms=startup_ms,
+            recorded_startup_ms=startup_ms,
         )
         if session.hooks.files_wrapper is not None:
             session.files = session.hooks.files_wrapper(broker, session)

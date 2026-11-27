@@ -152,13 +152,14 @@ def capacity(session: View) -> dict[str, Any]:
     start-up time of this process (None for a read-only view)."""
     gate = session.sm.capacity
     limits = None if gate is None else gate.limits
-    usage = session.journal.capacity_usage()
+    usage = session.journal.capacity_usage() if gate is None else gate.usage()
     return {
         "level": capacity_level(limits, usage).value,
         "events": usage.events,
         "bytes": usage.bytes,
         "limits": None if limits is None else limits.model_dump(mode="json"),
         "startup_ms": session.startup_ms,
+        "recorded_startup_ms": session.recorded_startup_ms,
     }
 
 
