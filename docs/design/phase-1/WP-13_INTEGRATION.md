@@ -173,16 +173,31 @@
 
 障害試験の内訳：例外の注入（同じプロセス）は `test_wp12_recovery.py`、`test_wp12_fixes.py`、`test_wp12_cli_and_faults.py` の COMMIT の結果不明。実際のプロセスの停止（SIGKILL、SIGINT）は `test_wp10_cli_process.py`、`test_wp12_cli_and_faults.py`、`test_wp13_integration.py`、`test_journal_processes.py`、`test_permit_processes.py`、WP-08 の子プロセスの試験。
 
-## 5. WP-01 の CI の残っている課題
+## 5. WP-01 の CI の残っている課題（2026-11-27 に更新）
 
-- **今の定義（`.github/workflows/ci.yml`）：** 手動の実行（`workflow_dispatch`）だけ。権限は `contents: read`。`ubuntu-24.04`、`timeout-minutes: 15`、uv 0.11.32、Python 3.12。手順は手元の8種類と同じ順序（秘密情報、`uv lock --check`、`uv sync --locked`、`--offline --check`、ruff、ruff format、mypy、import-linter、pytest）。
-- **依存する Action：** `actions/checkout@v4`、`actions/setup-python@v5`（タグで参照）。完全なコミット SHA への固定の準備として、固定すべき2つを特定した。**正式なリリースと SHA の対応は、外部の照会をしていないため確かめていない。推測で書かない（未確認）。**
-- **無料の利用枠：** 確認に必要な情報は、リポジトリの公開・非公開の別、アカウントの種類（Free・Pro など）、月の Linux の分数の残り、ストレージ、`ubuntu-24.04` の分数の倍率、支払いの上限（spending limit）の設定。**いずれも未確認**（外部の照会をしていない）。
-- **手動の実行で実装ブランチを検証できるか：** `workflow_dispatch` は、ワークフローの定義がそのブランチにあれば、そのブランチを選んで実行できる（GitHub の仕様の一般的な理解。この環境では実行していないので、実際の動作は未確認）。
-- **CI と手元の差：** CI は `uv sync --locked` で依存をネットワークから入れる（手元は `--offline` でキャッシュから）。CI は root でない利用者で動く（`test_wp08_nonroot.py` は root でないときの分岐を持つ）。手元は Linux のコンテナ（uid 0）。Python は CI が `setup-python`、手元はシステムの 3.12。
-- **ネットワークの制限：** CI では、依存の導入の後のすべての手順が `uv run --locked --offline` で、試験の中では Python の `socket` を遮断する。OS のレベルの遮断（手元の `unshare -n` のようなもの）は CI では行っていない。
-- **root でない利用者で失敗する試験：** WP-08 の5件（`test_wp08_read.py`・`test_wp08_write.py` の `char-device`、`test_wp08_workspace.py` の `other-owner`・`directory-of-another-user`）は、準備に root の権限（`mknod`、別の利用者への `chown`）を使う。CI の前に、権限がなくても同じ振る舞いを確かめる準備の方法を決める必要がある（オーナーの判断なしに試験を省略しない）。
-- **今回、GitHub Actions は実行していない。CI が未実行のまま、Phase 1 の正式な完了は宣言しない。**
+GitHub Actions は実行していない。CI が未実行のまま、Phase 1 の正式な完了は宣言しない。
+
+| 項目 | 今の状態 | 残っていること |
+|---|---|---|
+| 起動 | `workflow_dispatch` だけ。権限は `contents: read`、`persist-credentials: false`。`ubuntu-24.04`、15分 | — |
+| 8種類の検査 | 手元と同じ順序：秘密情報（標準ライブラリだけ、依存の取得の前）、`uv lock --check`、`uv sync --locked`、`uv sync --locked --offline --check`、ruff check、ruff format --check、mypy、import-linter、pytest | — |
+| 一般ユーザーで動く試験 | `pytest -m "not privileged"` を runner の利用者で実行（9章） | 実際の runner で通るかは未確認 |
+| 特権の要る試験 | 別の手順で、root として `-m privileged`（`sudo` と `.venv` の Python）。1件も選ばれなければ pytest が 5 で終わり、手順は失敗する | **runner の `sudo` がパスワードなしで使えるかは未確認**（GitHub の一般的な説明の理解。この環境では確かめていない） |
+| uv.lock との一致 | `uv lock --check`、`uv sync --locked`、`--offline --check`。uv 自体は `pip install uv==0.11.32`（ハッシュの固定なし） | uv の導入の取得物のハッシュの固定（供給網の課題） |
+| Action の SHA の固定 | `actions/checkout@v4`、`actions/setup-python@v5` をタグで参照 | **正式な SHA は外部で確かめていない。推測で書かない。** 確認の後に完全な SHA に固定する |
+| `workflow_dispatch` と既定のブランチ | 既定のブランチは `main`（空の初期コミットだけ。ワークフローの定義がない） | **以前の版の「実装ブランチを選んで実行できる」は不正確だった可能性がある。** `workflow_dispatch` のワークフローは、定義が既定のブランチにあるときだけ起動できる、というのが GitHub の一般的な説明の理解（未確認）。そうなら、今の構成では CI を起動できない。`main` と既定のブランチは、オーナーの承認なしに変えない |
+| 無料の利用枠と課金の防止 | 未確認 | リポジトリの公開・非公開、アカウントの種類、月の Linux の分数の残りと倍率、ストレージ、支払いの上限（spending limit）の設定 |
+| ネットワーク | 依存の取得（uv、`uv sync --locked`）だけが外部に接続する。以降は `--offline`、試験の中は Python の `socket` を遮断 | OS のレベルの遮断（`unshare -n` など）は CI に入れていない（runner で使えるか未確認） |
+| 環境と対象の SHA の記録 | 新しい手順で、コミット（`git rev-parse HEAD`、`GITHUB_SHA`、`GITHUB_REF`）、runner の OS とイメージ、カーネル、利用者、Python と uv の版を、ジョブの要約（`GITHUB_STEP_SUMMARY`）に書く | 実行の後に、その記録を STATUS.md に写す |
+
+**外部の確認とオーナーの承認が要る事項：**
+
+1. Action の正式な SHA（外部の照会の許可が要る）。
+2. `workflow_dispatch` と既定のブランチの関係の確認（GitHub の公式の説明）。
+3. 2 が正しければ、CI をどう起動するかのオーナーの決定（`main` へのワークフローの追加、既定のブランチの変更などは、いずれもオーナーの承認が要る。今回は行わない）。
+4. 無料の利用枠と支払いの上限の確認（オーナーのアカウントの設定）。
+5. runner の `sudo` の確認（特権の試験の手順）。
+6. 初回の CI の実行の許可。
 
 ## 6. 未検証の事項
 
@@ -218,3 +233,51 @@ Codex の独立品質レビューの判定は FAIL（CRITICAL 0、HIGH 1、MEDIU
 | A.I6 Snapshot | Rebuild は Journal の全体から決定的に行う。Snapshot はない | 容量：Journal が大きくなっても Rebuild に必要な記憶域は Journal の大きさに比例する。起動時間：開くたびに全体の検証と Rebuild をするため、イベントの数に比例して延びる（Phase 1 の合成のデータの量では測っていない。性能の主張はしない）。条件：Rebuild が状態のハッシュで照合できること（今は決定性の試験だけ）、Snapshot を入れるときは Snapshot と Journal の頭の一致を開くときに検査すること |
 | A.I12 承認待ちの Run の再開 | 会話の記録はプロセスの中だけ。承認待ちの Run は再起動の後に再開できず、復旧で中止（FAILED）になる | 作業の喪失：承認待ちまでのモデルの呼び出しと、その費用は失われる（費用は記録に残り、二重に計上しない）。安全な停止：自動承認はせず、承認は無効になり、操作は実行されない（試験で確認済み）。条件：会話の記録の永続化と、再開の時の Context の検証 |
 | A.I17 常時の期限の監視 | 期限は明示的な復旧の時だけ検査する | **Phase 2 の開始の前に再評価する：** タイムアウトと停止の処理との関係（長い実行で RECOVERING や CANCELLING のままになる時間）。それまでは、オーナーが `recover` を実行した時にだけ期限切れを `escalated` として報告する |
+
+## 9. 一般ユーザーでの試験と特権の試験（2026-11-27）
+
+### 9.1 失敗した8件の分類
+
+| 試験 | 失敗の原因 | 分類 |
+|---|---|---|
+| `test_wp08_read.py` の `char-device`、`test_wp08_write.py` の `char-device` | 準備で文字デバイスを作る（`mknod`、`CAP_MKNOD` が要る） | 試験の準備が特権に依存（製品の問題ではない） |
+| `test_wp08_workspace.py` の `other-owner`（ルート、親のディレクトリ）、`directory-of-another-user`（たどる途中） | 準備で別の利用者にファイルを渡す（`chown`、`CAP_CHOWN` が要る） | 同上 |
+| `test_secret_scan.py` の `test_this_repository_has_no_findings`（3つの方式） | 検査の対象の作業ツリーの Git の管理情報が root の所有で、Git が "dubious ownership" で拒否した | 実行環境の問題。試験は検査の対象の作業ツリーをそのまま使い、準備の誤りはない。利用者が所有する clone では成功した（9.3） |
+
+製品のコードの問題は見つからなかった。製品のファイルの検査と権限の検査は変えていない。Git の安全検査も無効にしていない。
+
+### 9.2 特権の試験の管理
+
+- `tests/support/privileged.py` の印 `privileged(reason)` で、特権の要る5件を区別した。理由は印に書く（`CAP_MKNOD`、`CAP_CHOWN`）。
+- **省略しない：** root でないときに選ばれると、`PRIVILEGED_NOT_RUN` で失敗する（`tests/conftest.py`）。成功として数えない。一般ユーザーの実行では `-m "not privileged"` で明示的に除外する（pytest は「deselected」と報告する）。
+- **保証を失わない：** root で `-m privileged` を別に実行する。試験の期待値と内容は変えていない。
+- 一般ユーザーでも、所有者の比較そのものは確かめる：`test_the_walk_compares_each_owner_without_privilege`（実効 uid を別の利用者のものに見せ、自分のディレクトリを別の利用者のものとして、たどる途中の拒否を確かめる）。これは特権の試験の代わりではなく追加である。文字デバイスの拒否は、一般ユーザーでは FIFO とソケットの拒否で、同じ「普通のファイルでない」の分岐を確かめる。
+- 一覧は `pytest --collect-only -m privileged` で出せる（今は5件）。
+
+### 9.3 再検証の結果（HEAD `de79193`）
+
+| 実行 | 利用者・環境 | 件数 | 結果 |
+|---|---|---|---|
+| 8種類の検査 | root、手元 | 2134 | すべて成功 |
+| 全試験の連続2回 | root | 2134 | 2回とも成功 |
+| CI の順序の検査 | `nobody`、`nobody` が所有する clone | — | 秘密情報（commit・index・worktree）、`uv lock --check`、ruff、ruff format、mypy、import-linter が成功。`uv sync --locked --offline --check` は、環境（`.venv`）が root の作業ツリーにあるため `nobody` では実行していない（root で成功） |
+| 全試験（`-m` なし） | `nobody` | 2134 | 2129 が成功、特権の5件は `PRIVILEGED_NOT_RUN`（失敗として報告。成功に数えない） |
+| `-m "not privileged"` | `nobody` | 2129（5件は除外） | すべて成功（秘密情報の検査の自己検査の3件を含む） |
+| `-m privileged` | root（同じ clone） | 5（2129 件は除外） | すべて成功 |
+| ネットワークのない環境（`unshare -n`） | `nobody`、`-m "not privileged"` | 2129 | すべて成功（外への接続は "Network is unreachable"） |
+| ネットワークのない環境（`unshare -n`） | root、全試験 | 2134 | すべて成功 |
+
+- 試験の数：2126 から 2134（印の試験5件、一般ユーザーでの所有者の比較1件、QR-04 の2件）。
+
+### 9.4 QR-04 の確認
+
+- `_write_order_reasons` は、過去の書き込みが互いに重なることそのものは拒否しない。拒否するのは、**最後の書き込みを証明できないとき**（最後に終わった書き込みが、ほかの書き込みと重なるとき）だけである。前の書き込みどうしが重なっていても、その後に始まって検証の前に終わった書き込みがあれば、それが最後と証明でき、完了の根拠になる。
+- 以前の記録（`WP-15_AGENT_LOOP.md` の18章の「2つの書き込みの重なり」、報告書の13章の「重なり」、コミット `e3b75bb` の説明の "two overlapping writes ... refuse"）は、この区別があいまいだった。文書を正しい範囲に直した。コードの変更は不要だった。
+- 回帰試験を2件加えた（重なる前の書き込みがあっても最後が証明できる場合は成功、最後の書き込みが重なる場合は拒否）。修正の前から成功する特性確認である。
+- 今の Runtime は WP04-R03 により Run の Attempt を直列にしか動かさないため、同じ Run の書き込みが重なることは実際には起こらない。規則は、この制約に頼らずに順序を証明する。
+
+### 9.5 独立再レビューが要る範囲
+
+- `tests/conftest.py` の `pytest_runtest_setup`、`tests/support/privileged.py`、印を付けた5件、`test_the_walk_compares_each_owner_without_privilege`。
+- `.github/workflows/ci.yml` の新しい手順（記録、一般ユーザーの試験、root の試験）。
+- QR-04 の説明の訂正と、追加した2件の試験。

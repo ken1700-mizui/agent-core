@@ -11,7 +11,7 @@ Agent Core は、オーナー自身が使うための、専用の AI エージ�
 
 ## 今の状態
 
-- **Phase 1 は「独立品質レビュー指摘の修正提出済み・再レビュー待ち」**である。正式な完了ではない（再レビュー、CI の実行、包括的なセキュリティ監査、必要な修正、オーナーの最終承認の後に完了とする）。
+- **Phase 1 は「非root の試験と CI の準備の限定修正を提出・独立再レビュー待ち」**である。正式な完了ではない（再レビュー、CI の実行、包括的なセキュリティ監査、必要な修正、オーナーの最終承認の後に完了とする）。
 - WP-01〜WP-15 を実装した（設計の記録は `docs/design/phase-1/`、実装の報告は `docs/reviews/PHASE_1_IMPLEMENTATION_REPORT.md`）。WP-01 の CI は、まだ GitHub Actions で実行していない。
 - Phase 1 は、合成のデータだけを使う。実モデル、実 API、認証情報、外部への通信は使わない（費用は 0 ドル）。
 
@@ -76,6 +76,16 @@ PYTHONPATH=src uv run --locked --offline lint-imports
 
 ```bash
 uv run --locked --offline pytest
+```
+
+- root でない利用者では、特権の要る試験（`privileged` の印。準備に `mknod` や別の利用者への `chown` を使う）を除いて実行し、特権の試験は root で別に実行する。root でないときに特権の試験を選ぶと `PRIVILEGED_NOT_RUN` で失敗する（省略しない）。
+
+```bash
+uv run --locked --offline pytest -m "not privileged"
+```
+
+```bash
+sudo .venv/bin/python -m pytest -p no:cacheprovider -m privileged
 ```
 
 **コミットの前**には、ステージした内容（次のコミットに入るもの）を検査する（`AGENTS.md` の 4.9）。
