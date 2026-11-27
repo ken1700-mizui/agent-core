@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Protocol
 
 from agent_core.types.errors import (
     DuplicateEntityError,
@@ -242,17 +242,6 @@ class RuntimeState:
         items = dict(getattr(self, name))
         items[key] = value
         return self._replace(**{name: _frozen(items)})
-
-    def _counted(self, run_id: RunId, delta: int) -> RuntimeState:
-        count = self.unresolved_attempts.get(run_id, 0) + delta
-        if count < 0:
-            raise StateIndexError("the unresolved attempt count of a run is below zero")
-        items = dict(self.unresolved_attempts)
-        if count:
-            items[run_id] = count
-        else:
-            items.pop(run_id, None)
-        return self._replace(unresolved_attempts=_frozen(items))
 
     def run_settled(self, run_id: RunId) -> bool:
         """No Attempt of the Run is unresolved (answered by the M1 index)."""
@@ -637,30 +626,134 @@ def plan_attempt_status(
 
 # ---------------------------------------------------------------- applying
 
+# The tables of ``RuntimeState`` whose entries ``_install`` adds to an ordered tuple.
+_ORDERED = frozenset({"run_steps", "step_attempts"})
 
-def _install(state: RuntimeState, transition: Transition) -> RuntimeState:
+
+class _Writer(Protocol):
+    """Where ``_install`` writes: the one place the entity tables change.
+
+    ``_CopyOnWrite`` is the live path (a new immutable state per transition);
+    ``_Builder`` is the Rebuild's private, in-place one (P-7 M2). Both are
+    written by the same ``_install`` after the same ``_replan`` checks.
+    """
+
+    def current(self, name: str) -> Mapping[Any, Any]: ...
+
+    def put(self, name: str, key: Any, value: Any) -> None: ...
+
+    def append(self, name: str, key: Any, value: Any) -> None: ...
+
+    def drop(self, name: str, key: Any) -> None: ...
+
+
+class _CopyOnWrite:
+    """Copies a table of ``base`` the first time it is written, never ``base``."""
+
+    def __init__(self, base: RuntimeState) -> None:
+        self._base = base
+        self._tables: dict[str, dict[Any, Any]] = {}
+
+    def current(self, name: str) -> Mapping[Any, Any]:
+        table = self._tables.get(name)
+        return table if table is not None else getattr(self._base, name)
+
+    def _own(self, name: str) -> dict[Any, Any]:
+        if name not in self._tables:
+            self._tables[name] = dict(getattr(self._base, name))
+        return self._tables[name]
+
+    def put(self, name: str, key: Any, value: Any) -> None:
+        self._own(name)[key] = value
+
+    def append(self, name: str, key: Any, value: Any) -> None:
+        table = self._own(name)
+        table[key] = (*table.get(key, ()), value)
+
+    def drop(self, name: str, key: Any) -> None:
+        self._own(name).pop(key, None)
+
+    def result(self) -> RuntimeState:
+        if not self._tables:
+            return self._base
+        return self._base._replace(**{n: _frozen(t) for n, t in self._tables.items()})
+
+
+class _Builder:
+    """The Rebuild's private state (P-7 M2): plain dictionaries written in place.
+
+    ``view`` is a ``RuntimeState`` over read-only views of those dictionaries, so
+    the ``plan_*`` checks read the state as it is built. Ordered tables hold
+    lists while building. ``freeze`` turns them into tuples and returns the
+    immutable state once; the builder is unusable afterwards. Nothing of it
+    leaves the Rebuild: on any failure it is dropped.
+    """
+
+    def __init__(self) -> None:
+        names = tuple(RuntimeState.__dataclass_fields__)
+        self._tables: dict[str, dict[Any, Any]] | None = {n: {} for n in names}
+        self.view = RuntimeState(**{n: MappingProxyType(t) for n, t in self._tables.items()})
+
+    def _live(self) -> dict[str, dict[Any, Any]]:
+        if self._tables is None:
+            raise StateRebuildError("the rebuild builder is already frozen")
+        return self._tables
+
+    def current(self, name: str) -> Mapping[Any, Any]:
+        return self._live()[name]
+
+    def put(self, name: str, key: Any, value: Any) -> None:
+        self._live()[name][key] = value
+
+    def append(self, name: str, key: Any, value: Any) -> None:
+        self._live()[name].setdefault(key, []).append(value)
+
+    def drop(self, name: str, key: Any) -> None:
+        self._live()[name].pop(key, None)
+
+    def freeze(self) -> RuntimeState:
+        tables = self._live()
+        self._tables = None
+        for name in _ORDERED:
+            table = tables[name]
+            for key, items in table.items():
+                table[key] = tuple(items)
+        return RuntimeState(**{n: _frozen(t) for n, t in tables.items()})
+
+
+def _count(writer: _Writer, run_id: RunId, delta: int) -> None:
+    count = writer.current("unresolved_attempts").get(run_id, 0) + delta
+    if count < 0:
+        raise StateIndexError("the unresolved attempt count of a run is below zero")
+    if count:
+        writer.put("unresolved_attempts", run_id, count)
+    else:
+        writer.drop("unresolved_attempts", run_id)
+
+
+def _install(writer: _Writer, transition: Transition) -> None:
     if isinstance(transition, TaskTransition):
-        return state._with("tasks", transition.after.task_id, transition.after)
+        writer.put("tasks", transition.after.task_id, transition.after)
+        return
     if isinstance(transition, RunTransition):
-        return state._with("runs", transition.after.run_id, transition.after)
+        writer.put("runs", transition.after.run_id, transition.after)
+        return
     if isinstance(transition, StepTransition):
         step = transition.after
-        state = state._with("steps", step.step_id, step)
+        writer.put("steps", step.step_id, step)
         if transition.action is EntityAction.CREATE:
-            ordered = (*state.run_steps.get(step.run_id, ()), step.step_id)
-            state = state._with("run_steps", step.run_id, ordered)
-        return state
+            writer.append("run_steps", step.run_id, step.step_id)
+        return
     attempt = transition.after
-    previous = state.attempts.get(attempt.attempt_id)
+    previous = writer.current("attempts").get(attempt.attempt_id)
     was_open = previous is not None and previous.state not in FINAL_ATTEMPT_STATES
     now_open = attempt.state not in FINAL_ATTEMPT_STATES
     if was_open != now_open:
-        state = state._counted(state.steps[attempt.step_id].run_id, 1 if now_open else -1)
-    state = state._with("attempts", attempt.attempt_id, attempt)
+        run_id = writer.current("steps")[attempt.step_id].run_id
+        _count(writer, run_id, 1 if now_open else -1)
+    writer.put("attempts", attempt.attempt_id, attempt)
     if transition.action is EntityAction.CREATE:
-        ordered_attempts = (*state.step_attempts.get(attempt.step_id, ()), attempt.attempt_id)
-        state = state._with("step_attempts", attempt.step_id, ordered_attempts)
-    return state
+        writer.append("step_attempts", attempt.step_id, attempt.attempt_id)
 
 
 def _replan(state: RuntimeState, transition: Transition) -> Transition:
@@ -697,11 +790,17 @@ def _replan(state: RuntimeState, transition: Transition) -> Transition:
     )
 
 
-def apply_transition(state: RuntimeState, transition: Transition) -> RuntimeState:
-    """Re-plan ``transition`` against ``state``; it must match exactly."""
+def _checked(state: RuntimeState, transition: Transition) -> None:
     if _replan(state, transition) != transition:
         raise TransitionPreconditionError("recorded transition does not follow the rules")
-    return _install(state, transition)
+
+
+def apply_transition(state: RuntimeState, transition: Transition) -> RuntimeState:
+    """Re-plan ``transition`` against ``state``; it must match exactly."""
+    _checked(state, transition)
+    writer = _CopyOnWrite(state)
+    _install(writer, transition)
+    return writer.result()
 
 
 def _run_of(state: RuntimeState, transition: Transition) -> RunId | None:
@@ -715,6 +814,64 @@ def _run_of(state: RuntimeState, transition: Transition) -> RunId | None:
     return None if step is None else step.run_id
 
 
+class _Fold(Protocol):
+    """A state being folded: the immutable live one or the Rebuild's builder."""
+
+    @property
+    def view(self) -> RuntimeState: ...
+
+    def transition(self, transition: Transition) -> None: ...
+
+    def set_run_seq(self, run_id: RunId, run_seq: int) -> None: ...
+
+
+class _ImmutableFold:
+    def __init__(self, state: RuntimeState) -> None:
+        self.view = state
+
+    def transition(self, transition: Transition) -> None:
+        self.view = apply_transition(self.view, transition)
+
+    def set_run_seq(self, run_id: RunId, run_seq: int) -> None:
+        writer = _CopyOnWrite(self.view)
+        writer.put("run_seqs", run_id, run_seq)
+        self.view = writer.result()
+
+
+class _BuilderFold:
+    def __init__(self) -> None:
+        self.builder = _Builder()
+
+    @property
+    def view(self) -> RuntimeState:
+        return self.builder.view
+
+    def transition(self, transition: Transition) -> None:
+        _checked(self.builder.view, transition)
+        _install(self.builder, transition)
+
+    def set_run_seq(self, run_id: RunId, run_seq: int) -> None:
+        self.builder.put("run_seqs", run_id, run_seq)
+
+
+def _fold_payload(fold: _Fold, payload: RuntimePayload) -> RunId | None:
+    runs: set[RunId] = set()
+    created: set[RunId] = set()
+    attached: set[RunId] = set()
+    for transition in payload.transitions:
+        run_id = _run_of(fold.view, transition)
+        if run_id is not None:
+            runs.add(run_id)
+        if isinstance(transition, RunTransition) and transition.action is EntityAction.CREATE:
+            created.add(transition.after.run_id)
+        if isinstance(transition, TaskTransition) and transition.action is TaskAction.ATTACH_RUN:
+            attached.add(transition.after.runs[-1])
+        fold.transition(transition)
+    _require(len(runs) <= 1, "one event covers at most one run")
+    _require(created == attached, "a run is created and attached in the same event")
+    return next(iter(runs), None)
+
+
 def apply_payload(
     state: RuntimeState, payload: RuntimePayload
 ) -> tuple[RuntimeState, RunId | None]:
@@ -723,35 +880,22 @@ def apply_payload(
     A created step's ``run_seq`` is checked by ``plan_step_create`` against the
     run's next position; ``apply_event`` checks that the event has that position.
     """
-    runs: set[RunId] = set()
-    created: set[RunId] = set()
-    attached: set[RunId] = set()
-    for transition in payload.transitions:
-        run_id = _run_of(state, transition)
-        if run_id is not None:
-            runs.add(run_id)
-        if isinstance(transition, RunTransition) and transition.action is EntityAction.CREATE:
-            created.add(transition.after.run_id)
-        if isinstance(transition, TaskTransition) and transition.action is TaskAction.ATTACH_RUN:
-            attached.add(transition.after.runs[-1])
-        state = apply_transition(state, transition)
-    _require(len(runs) <= 1, "one event covers at most one run")
-    _require(created == attached, "a run is created and attached in the same event")
-    return state, next(iter(runs), None)
+    fold = _ImmutableFold(state)
+    run_id = _fold_payload(fold, payload)
+    return fold.view, run_id
 
 
-def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
-    """Fold one stored journal event. Anything unknown or inconsistent is an error."""
+def _fold_event(fold: _Fold, event: Event) -> None:
     try:
         if event.type != RUNTIME_EVENT_TYPE:
             raise StateRebuildError("unknown event type")
         if event.schema_version != RUNTIME_EVENT_SCHEMA_VERSION or event.payload is None:
             raise StateRebuildError("runtime events need schema_version 3 and a payload")
         if event.run_id is not None:
-            expected = state.run_seqs.get(event.run_id, 0) + 1
+            expected = fold.view.run_seqs.get(event.run_id, 0) + 1
             if event.run_seq != expected:
                 raise StateRebuildError("run_seq is not the next position of the run")
-        new_state, run_id = apply_payload(state, event.payload)
+        run_id = _fold_payload(fold, event.payload)
         if run_id != event.run_id:
             raise StateRebuildError("event run_id does not match its transitions")
         for transition in event.payload.transitions:
@@ -764,8 +908,14 @@ def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
     except StateTransitionError as exc:
         raise StateRebuildError(f"invalid transition in event: {exc.code}") from exc
     if event.run_id is not None and event.run_seq is not None:
-        new_state = new_state._with("run_seqs", event.run_id, event.run_seq)
-    return new_state
+        fold.set_run_seq(event.run_id, event.run_seq)
+
+
+def apply_event(state: RuntimeState, event: Event) -> RuntimeState:
+    """Fold one stored journal event. Anything unknown or inconsistent is an error."""
+    fold = _ImmutableFold(state)
+    _fold_event(fold, event)
+    return fold.view
 
 
 def rebuild(events: Iterable[Event]) -> RuntimeState:
@@ -781,8 +931,12 @@ def rebuild_with_head(events: Iterable[Event]) -> tuple[RuntimeState, Event | No
     hash). Returns the state, the last event and its hash (the head the state
     was built from). Starting from a later position needs a verified snapshot:
     a separate contract, not provided before WP-12.
+
+    P-7 M2: the events are folded into a private builder by the same checks
+    and ``_install`` as ``apply_event``; the immutable state is made once at the
+    end and its derived indexes are checked. On any failure nothing is returned.
     """
-    state = RuntimeState.empty()
+    fold = _BuilderFold()
     tenant = None
     expected_seq = 1
     previous: Event | None = None
@@ -796,8 +950,9 @@ def rebuild_with_head(events: Iterable[Event]) -> tuple[RuntimeState, Event | No
             raise StateRebuildError("a full rebuild starts at tenant_seq 1 without gaps")
         if event.prev_hash != previous_hash:
             raise StateRebuildError("hash chain broken")
-        state = apply_event(state, event)
+        _fold_event(fold, event)
         previous, previous_hash = event, event_hash(event)
         expected_seq += 1
+    state = fold.builder.freeze()
     check_indexes(state)
     return state, previous, previous_hash

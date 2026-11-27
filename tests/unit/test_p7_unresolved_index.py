@@ -176,15 +176,10 @@ def test_a_rebuild_checks_the_index_it_built(
     events = _events(st.journal)
     real = smod._install
 
-    def skew(state: RuntimeState, transition: Any) -> RuntimeState:
-        out = real(state, transition)
-        if out.unresolved_attempts:
-            return out._replace(
-                unresolved_attempts=smod._frozen(
-                    {k: v + 1 for k, v in out.unresolved_attempts.items()}
-                )
-            )
-        return out
+    def skew(writer: Any, transition: Any) -> None:
+        real(writer, transition)
+        for run_id, count in dict(writer.current("unresolved_attempts")).items():
+            writer.put("unresolved_attempts", run_id, count + 1)
 
     monkeypatch.setattr(smod, "_install", skew)
     with pytest.raises((StateIndexError, StateRebuildError)):
