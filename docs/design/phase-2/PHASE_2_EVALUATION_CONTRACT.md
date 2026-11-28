@@ -1,6 +1,6 @@
 # Phase 2 評価の契約（D.V19 の記録の形式、A.I11 の Step の記録、公平な比較、統計）
 
-> 文書の状態：**DRAFT**（設計案）　作成：2026-11-28　改訂：2026-11-28（オーナーの設計の審査 CONDITIONAL_PASS への対応）
+> 文書の状態：**DRAFT**（設計案）　作成：2026-11-28　改訂：2026-11-28（オーナーの設計の審査 CONDITIONAL_PASS への対応。D16 の補強：2.5、3.2.4、7.8）
 >
 > - オーナーの承認（D15）：D.V19 の拡張の項目（`unresolved`、`grading_status`、`limits_hit`）の追加の方針、Journal v4 による provenance の記録の方針、実験を複数のホームに分ける方針、Task Catalog の作り方（dev と validation）。この改訂の最終の受入は承認待ち。
 >
@@ -100,6 +100,22 @@ TrialRecord {
 
 - 分類の規則の版のハッシュ（`classification_rules_hash`）を ExperimentSpec の `spec_hash` に含める。固定の後に変えた実行は拒否する（D.V1）。
 
+### 2.5 費用の記録の方式（D16 の補強。二重の計上を防ぐ）
+
+2.4 の4つの区分を、それぞれ独立に記録すると、同じ XTU が2つの区分に入りうる（例：やり直しの試行が有効なら、その費用は「確定」と「やり直し」の両方に当たる）。そこで、**費用の確定の状態**と**試行の分類**を別々の属性にし、4つの区分は記録ではなく**派生の集計**とする。
+
+| 属性 | 値 | 持つもの |
+|---|---|---|
+| 費用の確定の状態（settlement） | `SETTLED`（確定）、`HELD_UNKNOWN`（保留。予約の単位） | 試行の費用 `TrialCost { settled_xtu, held[ {reservation_ref, xtu} ] }` |
+| 試行の有効性（validity） | `VALID`、`INVALID`（`task_outcome = INVALID_ENV`） | TrialRecord の `task_outcome` から導く |
+| やり直しか（is_retry） | `retry_of` の有無 | TrialRecord |
+
+- **予算に足し合わせる値は、確定の状態の2つだけ：** 実験の支出 ＝ Σ `settled_xtu`、保留 ＝ Σ `held`。1つの XTU は、どちらか一方にだけ入る（分割）。
+- 4つの区分は、この分割の上の**見方**：`settled_xtu`（有効な試行の確定）、`held_unknown_xtu`（全試行の保留）、`invalid_trial_xtu`（無効な試行の確定と保留）、`retry_xtu`（やり直しの試行の確定と保留。**有効・無効の区分の部分集合で、合計に足さない**）。報告では「足せる値」と「内訳（足さない）」を分けて示す。
+- **後からの照合：** 保留が確定したら、TrialRecord を書き換えず、Results Store に照合の記録 `CostReconciliation { trial_id, reservation_ref, settled_xtu, released_xtu }` を追記する（`settled_xtu + released_xtu` ＝ 保留の額。保留の額を超える確定は拒否し、調べる）。`(trial_id, reservation_ref)` ごとに1回だけ。集計は試行の記録と照合の記録を畳み込んで計算する。
+- 上限の見積もり ＝ 確定の合計 ＋ 保留の合計。保留を 0 と見なさない。
+- 正本は台帳（7.1）。Results Store の費用は写しで、照合のときに台帳と比べる。
+
 ## 3. A.I11：Step の記録の項目
 
 ### 3.1 3つの区分
@@ -158,6 +174,25 @@ TrialRecord {
 | 書き換えの禁止 | 過去のイベントを v4 に書き換えない。変換の仕組みは作らない |
 
 - **記録しないもの：** プロンプトの本文、ファイルの内容、モデルの出力の本文、認証情報、環境変数の値。識別子とハッシュだけ（C2、A の2章）。機密を含みうる値のハッシュは、Phase 1 の `keyed_hashes` の方式。
+
+#### 3.2.4 遷移ごとの必須の provenance（D16 の補強）
+
+provenance はイベントの `payload` の `provenance` の区画（遷移の一覧とは別の、記録の一覧）に置く。各記録は、同じイベントの中の対応する遷移を指す（対応する遷移のない記録は拒否）。遷移の型（`Task`、`Run`、`Step`、`Attempt` の状態と規則）は変えない。
+
+| 遷移 | 記録 | 評価の Run で必須の項目 | 持たないもの（作らない値） |
+|---|---|---|---|
+| Run の作成 | `RunProvenance` | `experiment_id`、`trial_id`（**評価の Run の目印**。この記録のある Run だけが評価の Run） | — |
+| Step の作成 | `StepProvenance` | `config_hash`、`task_ref`、`eval_set_version`、`grader_version`、`experiment_id`、`trial_id`（Run の記録と一致）、`strategy_refs`。`plan_ref` は計画のある Step だけ | 使用量、結果、時間 |
+| モデルの呼び出し（`MODEL_CALL` の Step の Attempt が `CONTENT_FIXED` になる遷移） | `AttemptProvenance`（`call = MODEL`） | `model_profile_ref`、`context_hash`、`prompt_template_ref` | ツールの版、Sandbox の設定 |
+| ツールの実行（`TOOL_CALL`・`VERIFICATION` の Step の Attempt が `CONTENT_FIXED` になる遷移） | `AttemptProvenance`（`call = TOOL`） | `tool_ref`。Sandbox で動くツールだけ `sandbox_profile_hash` と `image_digest`（両方そろえる） | モデルの参照 |
+| 正常な完了・確定した失敗（`COMPLETED`、`FAILED_DEFINITE`。`OUTCOME_UNKNOWN` からでない） | `OutcomeProvenance`（`result = COMPLETED`・`FAILED_DEFINITE`） | `wall_ms`（単調な時計で計った値）。`exit_ref`・`verification_ref` はあるときだけ | 使用量と XTU（台帳にある） |
+| 実行の前の中止（`ABORTED_BEFORE_DISPATCH`） | `OutcomeProvenance`（`result = ABORTED_BEFORE_DISPATCH`） | なし（記録そのものが必須） | `wall_ms`、`exit_ref`、`verification_ref`（実行していないので、ない） |
+| 結果不明（`OUTCOME_UNKNOWN`） | `OutcomeProvenance`（`result = OUTCOME_UNKNOWN`） | なし（記録そのものが必須） | `wall_ms`、`exit_ref`、`verification_ref`（確定していない） |
+| 後からの照合（`OUTCOME_UNKNOWN` から `COMPLETED`・`FAILED_DEFINITE`） | `OutcomeProvenance`（`result = RECONCILED_COMPLETED`・`RECONCILED_FAILED`） | なし | `wall_ms`（実際の処理の時間は計っていない）。`exit_ref` は外部の記録があるときだけ |
+
+- **評価でない Run**（`RunProvenance` のない Run）：provenance は任意。あれば上の規則で検査する。
+- **評価の Run で必須の記録が欠けた場合：** 書き込みの側（Runtime）は、そのコマンドを拒否し、何も書かない（`PROVENANCE_REQUIRED`）。読み取りの側では、Journal を開くこと、Rebuild、Recovery、状態の確認は provenance に依らずに続け、provenance の索引がその Run を「不完全」と示す。評価の側は不完全な Run の試行を使わない（実装の不具合として報告する）。
+- **v3 と v4：** 新しいイベントは v4 だけで書く。v3 のイベントに provenance の区画はない（あれば拒否）。1つの Journal の中で v3 の後に v4 が続いてよく、v4 の後の v3 は拒否する（Rebuild）。
 
 ## 4. 公平な比較（D の4章）
 
@@ -234,7 +269,7 @@ TrialRecord {
 1. **切り替えるのは試行と試行の間だけ。** 次の試行を始める前に、今のホームの残りの容量（イベント、バイト）が `trial_event_cap` と見込みのバイトに余裕を足した量より小さければ、切り替える。**200 イベント・1 MiB の見込みだけで、試行全体が上限の内に収まるとは保証しない**。試行がホームの上限に当たらないことは、`trial_event_cap`（試行の側の上限）と、切り替えの判断（ホームの側の残り）の組み合わせで保つ。
 2. **閉じる前の確認：** 今のホームの予約を確かめる。保留の残る予約（結果不明）があれば、照合を先に試みる（証拠があれば確定）。確定できない保留は**引き継ぐ**（7.4）。保留を解放しない。
 3. **締めの記録（Closing Statement）：** 今のホームの台帳に、署名付きの締めの操作を書く：`{experiment_id, home_id, 確定の費用の合計, 保留の一覧（reservation_id と額）, 無効な試行の費用, やり直しの費用, Journal の head（tenant_seq、head_hash）, 前のホームの締めのハッシュ}`。このハッシュを `closing_hash` とする。締めた後のホームでは、その実験の新しい試行を始めない（台帳が拒否する）。
-4. **開始の記録（Opening Statement）：** 新しいホームの台帳に、署名付きの開始の操作を書く：`{experiment_id, 前のホームの closing_hash, 引き継いだ確定の費用の合計, 引き継いだ保留の一覧}`。新しいホームの実験の範囲の上限は、7.2 の式で決まる。**引き継いだ保留は、新しいホームの台帳に「引き継ぎの保留」として置き**、残りの予算から引いたままにする。
+4. **開始の記録（Opening Statement）：** 新しいホームの台帳に、署名付きの開始の操作を書く：`{experiment_id, 前のホームの closing_hash, 引き継いだ確定の費用の合計, 引き継いだ保留の一覧}`。新しいホームの実験の範囲の上限は、7.2 の式で決まる。**引き継いだ保留は、新しいホームの残りの予算から引いたままにする**（新しいホームに予約を作り直さない。二重の差し引きを防ぐ方式は 7.8）。
 5. **ホームの連鎖：** 各ホームの開始の記録が前のホームの締めのハッシュを持つので、ホームの列はハッシュの連鎖になる。Experiment Registry は、ホームごとに**後継は1つだけ**であることを記録し、2つ目の後継を拒否する。
 
 ### 7.4 引き継いだ保留の照合（未解決のホームを放置しない）
@@ -257,13 +292,30 @@ TrialRecord {
 ### 7.6 運用の上限と費用の上限の目的を失わないために
 
 - 新しいホームは、運用の上限（P-2）と費用の上限を**そのまま引き継ぐ**：運用の上限は新しいホームの設定（`init` の暫定の値）、費用の上限は 7.2 の式。ホームを切り替えても、実験全体の XTU の上限は増えない。
-- ホームの数にも上限を置く（ExperimentSpec。例：実験の上限 ÷ 試行の最小の費用から決まる数）。ホームを増やし続けて上限を避けることをしない。
+- ホームの数にも上限を置く（ExperimentSpec の `max_homes`。決め方は 7.8：費用ではなくイベントの数から決める）。ホームを増やし続けて上限を避けることをしない。
 - ホームの切り替えは、Snapshot（A.I6、Phase 4）の代わりではない。
 
 ### 7.7 実装の範囲（Phase 2）
 
 - 台帳の新しい操作（締め、開始、引き継ぎの保留の調整）と、実験の範囲（`BudgetScopeType` の追加）は、**台帳の形式の変更**。WP2-08 で互換性の試験（以前の版の DB を開ける、新しい操作のない DB は実験の範囲を使えない）とともに作る。
 - 試験：ホームの切り替えで上限が増えない、保留が残る、調整が1回だけ、締めと開始の間の異常終了、後継の重複の拒否、Results Store と台帳の食い違いの検出。
+
+### 7.8 複数のホームの予算の管理の補強（D16。設計だけ。実装は WP2-08）
+
+7.3〜7.6 の方式の、次の問題を直す。単一のエージェント・直列の実行の前提を使う（同時に2つの Runner が動かないことは、実験ごとの OS のロックで保つ）。Phase 3A の独立の予算の台帳は前倒ししない。
+
+| 問題 | 方式 |
+|---|---|
+| 締めと開始の間の異常終了 | 締めの記録に、**後継のホームの ID を先に書く**（`successor_home_id ＝ H(experiment_id, closing の本文)` で決まる値）。再開のとき、Registry の今のホームに締めがあれば、その `successor_home_id` のホームを探す。なければ作り、開始の記録がなければ書く。同じ締めからは同じ ID と同じ開始の記録の内容になる（やり直しても同じ結果） |
+| 開始の記録と Registry の更新の間の異常終了 | Registry は予算の正本ではない。再開のとき、Registry の今のホームに締めがあり、その後継に、その `closing_hash` を指す正しい開始の記録があれば、Registry を後継に進める（前に進めるだけ。戻さない） |
+| 同じ締めから複数の後継 | 後継の ID は締めの中に固定される。開始の記録は `closing_hash` と自分の `home_id` を持ち、`home_id ≠ successor_home_id` の開始の記録は無効。Registry は `closing_hash` に一意の制約を置き、2つ目の後継を拒否する |
+| 引き継ぎの保留の二重の差し引き | 保留は**元のホームの台帳にだけ**ある（予約として）。新しいホームの台帳には、開始の記録の中の数値（`prior_settled_xtu`、`carried_held_xtu`）として置き、**新しい予約は作らない**。新しいホームの実験の範囲の上限 ＝ `experiment_cap_xtu − prior_settled_xtu − carried_held_xtu`。新しいホームの台帳の予約は、この上限の内でだけ。1つの XTU は、1つのホームの1つの予約か、開始の記録の1つの数値のどちらかにだけ現れる（7.3 の4の「新しいホームの台帳に引き継ぎの保留として置く」を、この意味に改める） |
+| 古いホームでの照合の結果の引き継ぎ | 古いホームを照合の経路だけで開き（新しい試行は拒否したまま）、そこで確定する（古いホームの台帳が正本）。その結果（確定の額、解放の額、古いホームの照合の記録のハッシュ）を、**今のホーム**に署名付きの記録 `CarriedHoldResolved { origin_home_id, reservation_id, settled_xtu, released_xtu, origin_ref }` として書く。今のホームの上限は `released_xtu` だけ増え、確定の合計は `settled_xtu` だけ増える。`(origin_home_id, reservation_id)` ごとに1回だけ |
+| 複数回のホームの移行の後の照合 | 引き継ぎの保留は、**元のホーム**（`origin_home_id`）の ID で持ち続ける（途中のホームの ID にしない）。次の開始の記録は、まだ解決していない保留だけを `origin_home_id` 付きで引き継ぐ。照合は常に元のホームで行い、解決の記録は常に今のホームに書く。過去の開始の記録の一覧と解決の記録から、どの保留が解決済みかが決まり、2回目の解決は拒否する |
+| 実験全体の予算と費用の整合 | 各ホームの開始の記録で `prior_settled_xtu + carried_held_xtu + 上限 ＝ experiment_cap_xtu` を確かめる。実験の終わりに、確かめの道具で、ホームの連鎖のすべての台帳から「確定の合計」と「未解決の保留」を計算し直し、最後のホームの値と Results Store の写しと比べる。食い違えば、実験を完了にしない |
+| XTU の費用が 0 の試行がある場合のホームの数の上限 | ホームの数の上限を費用から決めない（費用 0 の試行で割れない）。**イベントの数**から決める：`必要なホームの数 ＝ ceil(予定の試行の数 × trial_event_cap ÷ events_per_home)`。予定の試行の数 ＝ タスク × 構成 × 繰り返し ＋ やり直しの上限。ExperimentSpec を固定するときに、`max_homes` がこの値以上であることを確かめる（足りなければ固定を拒否）。費用 0 の試行もイベントの上限で必ず止まるので、ホームの数は有限になる |
+
+- WP2-01 の型との整合：`ExperimentSpec` は `experiment_cap_xtu`、`trial_cap_xtu`、`trial_event_cap`、`events_per_home`、`max_homes`、`max_retries` を持ち、固定のときに上の式を確かめる。`TrialRecord` の `journal_ref.home_id` で、試行のホームを示す。台帳の新しい操作（締め、開始、解決）は WP2-08。
 
 ## 8. validation と holdout の独立の管理（改訂）
 
