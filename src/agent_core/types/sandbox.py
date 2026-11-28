@@ -19,6 +19,7 @@ from pydantic import Field, model_validator
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.ids import AttemptId, PermitId, ReceiptId, RequestId
+from agent_core.types.sandbox_io import OutputFile
 from agent_core.types.values import Count, Digest, Epoch
 
 # Candidate values (sandbox design 7.3); not guarantees until tested.
@@ -160,6 +161,9 @@ class CollectResult(FrozenModel):
     output_ref: Digest
     wall_ms: Count
     containment: Containment
+    # S-R04 (D20): the files the sandbox produced (untrusted; limited by P2 and
+    # checked again by P1). Empty when the backend copies nothing out.
+    outputs: tuple[OutputFile, ...] = ()
 
 
 class ReapRequest(FrozenModel):

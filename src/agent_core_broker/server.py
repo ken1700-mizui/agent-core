@@ -63,6 +63,7 @@ from agent_core.types.sandbox import (
     StopRequest,
     StopResult,
 )
+from agent_core.types.sandbox_io import DEFAULT_LIMITS, OutputFile, check_limits
 from agent_core.types.supervisor import DsHealth, Registration
 from agent_core_broker.record import ExecutionRecord, ExecutionRecordError
 from agent_core_supervisor.client import DsUnavailableError, SupervisorPort
@@ -543,7 +544,18 @@ class Broker:
             output_ref=found["output_ref"],
             wall_ms=found["wall_ms"],
             containment=self._containment(body.receipt_id, record),
+            outputs=self._outputs(body.receipt_id),
         )
+
+    def _outputs(self, receipt_id: ReceiptId) -> tuple[OutputFile, ...]:
+        """S-R04: P2's own limits on what is copied out (P1 checks again)."""
+        outputs_of = getattr(self.sandbox, "outputs_of", None)
+        found = () if outputs_of is None else tuple(outputs_of(receipt_id))
+        try:
+            check_limits(found, DEFAULT_LIMITS)
+        except ValueError as exc:
+            raise _RefusedError(ipc.RefusalCode.SANDBOX_FAILURE) from exc
+        return found
 
     def _reap(self, body: ReapRequest, record: ExecutionRecord) -> ReapResult:
         self._known(body.receipt_id, body.attempt_id, record)

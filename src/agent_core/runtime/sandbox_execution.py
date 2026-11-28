@@ -43,11 +43,17 @@ from typing import NamedTuple
 
 from agent_core.ports.sandbox import SandboxPort
 from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
+from agent_core.runtime.sandbox_io import (
+    SandboxIoError,
+    UntrustedOutputs,
+    check_outputs,
+    require_input_matches,
+)
 from agent_core.types.errors import AgentCoreError, SandboxUnavailableError
 from agent_core.types.ids import RequestId
 from agent_core.types.model import CostStatus, Usage, UsageStatus
 from agent_core.types.provenance import OutcomeKind, OutcomeProvenanceFields
-from agent_core.types.records import Attempt
+from agent_core.types.records import Attempt, AttemptState
 from agent_core.types.safety import ActionContent, DispatchAuthorization, ToolContent
 from agent_core.types.sandbox import (
     MAX_DEADLINE_MS,
@@ -63,6 +69,7 @@ from agent_core.types.sandbox import (
     StatusRequest,
     StopRequest,
 )
+from agent_core.types.sandbox_io import InputBundle, OutputFile
 from agent_core.types.serialization import StrictJsonError, parse_strict_json
 from agent_core.types.tools import ToolRegistration
 from agent_core.types.transitions import AbortReason
@@ -101,6 +108,10 @@ class SandboxOperationResult(NamedTuple):
     attempt: Attempt
     # Set when P2 could not reap after the outcome was recorded.
     reap_error: str | None
+    # S-R04: the checked, untrusted outputs of a finished run (never applied
+    # here), or why they were refused (the run's outcome stands either way).
+    outputs: UntrustedOutputs | None = None
+    outputs_error: str | None = None
 
 
 class SandboxOutcomeUnknownError(SandboxUnavailableError):
@@ -158,6 +169,7 @@ def run_sandbox_operation(
     stopped: Callable[[], bool] = lambda: False,
     p1_margin_ms: int = 5_000,
     admission: Callable[[], None],
+    input_bundle: InputBundle | None = None,
 ) -> SandboxOperationResult:
     """P1's sandbox monitor (WP2-04) is the poll loop: one ``wait`` per sandbox
     cycle, until nothing runs, the owner stops (``stopped``), or P1's own limit
@@ -172,6 +184,12 @@ def run_sandbox_operation(
     if program is None or (expected is not None and expected != program):
         aborted = gate.abort_not_dispatched(attempt, AbortReason.ARTIFACT_MISMATCH)
         return SandboxOperationResult(aborted, None)
+    if input_bundle is not None:
+        try:  # S-R04: the bundle read through WP-08 is the approved workspace_ref
+            require_input_matches(input_bundle, program.workspace_ref)
+        except SandboxIoError:
+            aborted = gate.abort_not_dispatched(attempt, AbortReason.ARTIFACT_MISMATCH)
+            return SandboxOperationResult(aborted, None)
     try:
         admission()  # S-R03 (required, D19): the monitor's liveness, before any start
     except AgentCoreError:
@@ -194,6 +212,7 @@ def run_sandbox_operation(
         return SandboxOperationResult(aborted, None)
 
     measured: dict[str, int | str] = {}
+    copied: dict[str, tuple[OutputFile, ...]] = {}
 
     def run(authorization: DispatchAuthorization) -> SyntheticResult:
         receipt = authorization.receipt
@@ -271,6 +290,7 @@ def run_sandbox_operation(
                     "no evidence that effects stayed inside", sent=True
                 )
             measured["wall_ms"] = collected.wall_ms
+            copied["outputs"] = collected.outputs
             measured["exit_ref"] = sha256_digest(
                 f"exit:{collected.exit_code}:{collected.output_ref}".encode()
             )
@@ -313,4 +333,12 @@ def run_sandbox_operation(
         )
     except SandboxUnavailableError as exc:
         reap_error = f"{exc.code}: {exc}"  # a never-started Receipt cannot be reaped
-    return SandboxOperationResult(done, reap_error)
+    outputs: UntrustedOutputs | None = None
+    outputs_error: str | None = None
+    produced = copied.get("outputs", ())
+    if done.state is AttemptState.COMPLETED and produced:
+        try:  # S-R04: P1 checks again; refused outputs are never reflected
+            outputs = check_outputs(produced)
+        except SandboxIoError as exc:
+            outputs_error = str(exc)
+    return SandboxOperationResult(done, reap_error, outputs, outputs_error)

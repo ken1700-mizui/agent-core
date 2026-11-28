@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 
 from agent_core.types.ids import ReceiptId
 from agent_core.types.sandbox import Containment, SandboxState
+from agent_core.types.sandbox_io import OutputFile
 from agent_core.types.values import sha256_digest
 from agent_core_broker.backend import Observation
 
@@ -71,6 +72,11 @@ class FakeSandbox:
     runs: dict[ReceiptId, int] = field(default_factory=dict)
     refuse_next_program: bool = False
     start_delay_s: float = 0.0
+    # S-R04: what a test's program "wrote" (copied out by collect).
+    outputs: dict[ReceiptId, tuple[OutputFile, ...]] = field(default_factory=dict)
+
+    def outputs_of(self, receipt_id: ReceiptId) -> tuple[OutputFile, ...]:
+        return self.outputs.get(receipt_id, ())
 
     def target_of(self, receipt_id: ReceiptId) -> str:
         """The cgroup name the Deadline Supervisor registers for this start."""

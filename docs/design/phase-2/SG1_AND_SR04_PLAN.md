@@ -39,6 +39,25 @@
 
 **SG-1 の条件に入れる：** 信頼しないコードが作業ツリーを読む、または書く前に、この実装と試験が要る。
 
+### 1.5 D20 の実装（2026-11-28）
+
+| 部品 | 場所 | 状態 |
+|---|---|---|
+| 入力の束と出力のファイルの型。パス、件数、大きさの上限、内容とハッシュの一致 | `src/agent_core/types/sandbox_io.py` | 実装 |
+| 入力の束の作成。完了した WP-08 の読み取りだけから作り、承認された `workspace_ref` と照合する（違えば実行の前に中止）。出力の確認（D4）。WP-08 の書き込みの提案 | `src/agent_core/runtime/sandbox_io.py`、`run_sandbox_operation(input_bundle=...)` | 実装 |
+| P2 の、置かれた束の確認。通常のファイルだけ（リンクなし）、大きさ、ハッシュ、`workspace_ref` | `src/agent_core_broker/bundle.py` | 実装 |
+| P2 の取り出しの上限（P1 がもう一度確かめる）。取り出しは `CollectResult.outputs` | `Broker._outputs`、`FakeSandbox.outputs` | 実装。**Docker の tmpfs からの取り出しは未実装**（E-5 の前の作業） |
+| 束の P2 への受け渡し（staging のファイル）と、Docker の読みだけのボリュームへの展開 | — | **未実装**（`DockerSandbox.stage_input` との接続は E-5 の前の作業） |
+| 反映 | 既存の WP-08 の経路だけ（書き込みの道具は取り消せない変更で、承認が要る） | 試験で確かめた |
+
+試験：`tests/unit/test_sr04_sandbox_io.py`（24 件）。確かめたことは次のとおり。
+- 上限、パス、内容のハッシュ。
+- 承認なしでは書かれないこと。承認された内容と違うバイトの拒否（FAILED_DEFINITE）。提案の後に変わったファイルの REPLACE の拒否（前後で同じ内容）。
+- 反映の途中の障害：OUTCOME_UNKNOWN と保留。
+- P2 の上限を超える取り出し：実行の後なので OUTCOME_UNKNOWN と保留。再実行しない。
+
+合成の固定のデータだけを使い、信頼しないコードは実行していない。
+
 ## 2. CI の実行の計画（E-5 の案。実行も設定の変更もしていない）
 
 | 項目 | 計画 |
