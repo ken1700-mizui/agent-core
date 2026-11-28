@@ -302,7 +302,7 @@ def test_a_start_refused_by_the_client_is_definitely_not_run(tmp_path: Path) -> 
     broker.close()
 
 
-# ---------------------------------------------------------------- D20: the whole path with the Deadline Supervisor
+# ---------------------------------------------------------- D20: the whole path (heartbeat + supervisor)
 
 
 def _monitored(tmp_path: Path) -> tuple[Any, Any, Any]:
@@ -323,7 +323,7 @@ def test_the_formal_path_checks_the_heartbeat_and_the_supervisor(tmp_path: Path)
     done = sw.run_with(st, broker, attempt, client=client, admission=admission)
     assert done.attempt.state is A.COMPLETED
     # registered before the start, released after the reap
-    assert broker.ds.view(attempt.receipt_id).state is TargetState.RELEASED
+    assert bw.ds_of(broker).view(attempt.receipt_id).state is TargetState.RELEASED
     broker.close()
 
 
@@ -331,12 +331,12 @@ def test_a_supervisor_refusal_ends_the_attempt_not_run_and_it_is_not_retried(
     tmp_path: Path,
 ) -> None:
     st, broker, (admission, client) = _monitored(tmp_path)
-    broker.ds_cgroups.reason = "no cgroup v2"
+    bw.cgroups_of(broker).reason = "no cgroup v2"
     attempt = sw.consumed(st)
     done = sw.run_with(st, broker, attempt, client=client, admission=admission)
     assert done.attempt.state is A.FAILED_DEFINITE  # DEADLINE_UNAVAILABLE: before acceptance
     assert attempt.receipt_id not in broker.sandbox.runs
-    broker.ds_cgroups.reason = None
+    bw.cgroups_of(broker).reason = None
     with pytest.raises(Exception):  # noqa: B017,PT011 (the Receipt is used: never run again)
         sw.run_with(st, broker, attempt, client=client, admission=admission)
     assert attempt.receipt_id not in broker.sandbox.runs
@@ -352,7 +352,7 @@ def test_without_a_trusted_heartbeat_nothing_reaches_p2_or_the_supervisor(tmp_pa
     attempt = sw.consumed(st)
     done = sw.run_with(st, broker, attempt, client=client, admission=admission)
     assert done.attempt.state is A.ABORTED_BEFORE_DISPATCH
-    assert broker.ds.status().active == 0
+    assert bw.ds_of(broker).status().active == 0
     broker.close()
 
 
@@ -363,7 +363,7 @@ def test_the_supervisor_stops_a_run_that_p1_and_p2_abandoned(tmp_path: Path) -> 
     start = bw.start_request(program="hang", deadline_ms=1_000, grace_ms=0)
     assert bw.make_client(broker).start(start).status.value == "STARTED"
     # P1 and P2 do nothing more; the supervisor alone, on its boot clock
-    ds = broker.ds
+    ds = bw.ds_of(broker)
     for _ in range(200):  # at most 10 s; the deadline is 1 s plus the 1 s margin
         if ds.view(start.receipt_id).state is TargetState.KILLED:
             break

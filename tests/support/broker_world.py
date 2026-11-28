@@ -153,3 +153,12 @@ def start_request(
     }
     values.update(overrides)
     return StartRequest(**values)
+
+
+def ds_of(broker: Broker) -> Any:
+    """The broker's test Deadline Supervisor (``make_broker``)."""
+    return broker.ds  # type: ignore[attr-defined]
+
+
+def cgroups_of(broker: Broker) -> Any:
+    return broker.ds_cgroups  # type: ignore[attr-defined]
