@@ -44,8 +44,9 @@ def test_fixture_bytes_are_unchanged() -> None:
 
 
 def test_versions_in_use() -> None:
-    assert RUNTIME_EVENT_SCHEMA_VERSION == 3
-    assert frozenset({1, 3}) == SUPPORTED_EVENT_SCHEMA_VERSIONS
+    # WP2-01 (D16, O-4): new runtime events are written as v4; v1 and v3 stay readable.
+    assert RUNTIME_EVENT_SCHEMA_VERSION == 4
+    assert frozenset({1, 3, 4}) == SUPPORTED_EVENT_SCHEMA_VERSIONS
 
 
 @pytest.mark.parametrize("index", range(5))
@@ -91,12 +92,13 @@ def test_journal_with_version_2_events_is_refused_unchanged(tmp_path: Path) -> N
     assert path.read_bytes() == before
 
 
-def test_current_runtime_writes_version_3_with_the_cancel_intent() -> None:
+def test_current_runtime_writes_version_4_with_the_cancel_intent() -> None:
+    # WP2-01 (D16, O-4): written as v4 (before WP2-01: v3); the Run shape is unchanged.
     journal = InMemoryJournal()
     sm = w.machine(journal)
     w.running_run(sm)
     events = journal.read_tenant(b.TENANT, after_tenant_seq=0, limit=100)
-    assert {e.schema_version for e in events} == {3}
+    assert {e.schema_version for e in events} == {4}
     assert all(
         "cancel_requested" in t.after.model_dump()
         for e in events

@@ -284,6 +284,14 @@ class StateRebuildError(AgentCoreError):
     fatal = True
 
 
+class ProvenanceRequiredError(AgentCoreError):
+    """WP2-01: an evaluation Run's command lacks provenance its transition needs,
+    or the provenance does not match the Run, Step or call (Journal v4, contract
+    3.2.4). Raised before anything is written."""
+
+    code = "PROVENANCE_REQUIRED"
+
+
 class StateIndexError(AgentCoreError):
     """P-7 M1: a derived index of the runtime state does not match the entities it
     is derived from. The state is not used; the runtime must be rebuilt from the

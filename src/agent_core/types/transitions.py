@@ -14,19 +14,35 @@ verifier that can confirm a real permit, approval or reservation until WP-09.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from agent_core.types.base import FrozenModel
 from agent_core.types.criteria import CriterionCheck
 from agent_core.types.ids import AttemptId, PermitId, ReceiptId, ReservationId
-from agent_core.types.records import Attempt, Run, Step, Task
+from agent_core.types.provenance import (
+    AttemptProvenance,
+    OutcomeKind,
+    OutcomeProvenance,
+    Provenance,
+    RunProvenance,
+    StepProvenance,
+)
+from agent_core.types.records import Attempt, AttemptState, Run, Step, Task
 from agent_core.types.values import Digest, PolicyVersion
 
 RUNTIME_EVENT_TYPE = "runtime.transition"
+# The version new runtime events are written in (WP2-01: 4, with provenance).
 # Version 2 is retired (see agent_core.types.events).
-RUNTIME_EVENT_SCHEMA_VERSION = 3
+RUNTIME_EVENT_SCHEMA_VERSION = 4
+# Runtime event versions that are read. 3 has no provenance; 4 may have it.
+READABLE_RUNTIME_SCHEMA_VERSIONS = frozenset({3, 4})
 
 
 class AbortReason(StrEnum):
@@ -308,5 +324,86 @@ Transition = Annotated[
 ]
 
 
+def outcome_kind(transition: AttemptTransition) -> OutcomeKind | None:
+    """The result stage of an attempt transition, or None when it is no result."""
+    if transition.before is None or transition.before.state is transition.after.state:
+        return None
+    state = transition.after.state
+    if state is AttemptState.ABORTED_BEFORE_DISPATCH:
+        return OutcomeKind.ABORTED_BEFORE_DISPATCH
+    if state is AttemptState.OUTCOME_UNKNOWN:
+        return OutcomeKind.OUTCOME_UNKNOWN
+    if state not in (AttemptState.COMPLETED, AttemptState.FAILED_DEFINITE):
+        return None
+    completed = state is AttemptState.COMPLETED
+    if isinstance(transition.evidence, ReconciliationEvidence):
+        return OutcomeKind.RECONCILED_COMPLETED if completed else OutcomeKind.RECONCILED_FAILED
+    return OutcomeKind.COMPLETED if completed else OutcomeKind.FAILED_DEFINITE
+
+
+def fixes_content(transition: AttemptTransition) -> bool:
+    return (
+        transition.before is not None
+        and transition.before.state is not AttemptState.CONTENT_FIXED
+        and transition.after.state is AttemptState.CONTENT_FIXED
+    )
+
+
+def _record_key(record: Provenance) -> tuple[str, str]:
+    if isinstance(record, RunProvenance):
+        return record.stage, str(record.run_id)
+    if isinstance(record, StepProvenance):
+        return record.stage, str(record.step_id)
+    return record.stage, str(record.attempt_id)
+
+
+def _matches(record: Provenance, transitions: tuple[Transition, ...]) -> bool:
+    for t in transitions:
+        if isinstance(record, RunProvenance):
+            if (
+                isinstance(t, RunTransition)
+                and t.action is EntityAction.CREATE
+                and t.after.run_id == record.run_id
+            ):
+                return True
+        elif isinstance(record, StepProvenance):
+            if (
+                isinstance(t, StepTransition)
+                and t.action is EntityAction.CREATE
+                and t.after.step_id == record.step_id
+            ):
+                return True
+        elif isinstance(t, AttemptTransition) and t.after.attempt_id == record.attempt_id:
+            if isinstance(record, AttemptProvenance) and fixes_content(t):
+                return True
+            if isinstance(record, OutcomeProvenance):
+                kind = outcome_kind(t)
+                if kind is not None and kind is not record.result:
+                    raise ValueError("an outcome record names the transition's result")
+                if kind is not None:
+                    return True
+    return False
+
+
 class RuntimePayload(FrozenModel):
     transitions: Annotated[tuple[Transition, ...], Field(min_length=1)]
+    # WP2-01 (Journal v4): provenance of transitions of this payload. Empty in v3,
+    # and then absent from the serialized form, so v3 bytes and hashes are unchanged.
+    provenance: tuple[Provenance, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_provenance(self, handler: SerializerFunctionWrapHandler) -> Any:
+        data = handler(self)
+        if not self.provenance and isinstance(data, dict):
+            data.pop("provenance", None)
+        return data
+
+    @model_validator(mode="after")
+    def _records_match_transitions(self) -> Self:
+        keys = [_record_key(r) for r in self.provenance]
+        if len(set(keys)) != len(keys):
+            raise ValueError("one provenance record per transition and stage, recorded once")
+        for record in self.provenance:
+            if not _matches(record, self.transitions):
+                raise ValueError("a provenance record has no matching transition in its event")
+        return self

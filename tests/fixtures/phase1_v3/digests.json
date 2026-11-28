@@ -1,0 +1,26 @@
+{
+ "digests": {
+  "late": {
+   "events": 21,
+   "ledger": "3e29da18ee8695977816d45a2358ba23e0c64f331a9182ab2327378a0db1513f",
+   "semantic": "afa593831820e4990363dd4b22381d5fcff3fc9947dad55696911b200b659e31"
+  },
+  "recovery": {
+   "events": 20,
+   "ledger": "4455cfea25c4441b8a56fe6185c6ea3682397a189653be2b181ca00089024a2f",
+   "semantic": "f37990bcdac44baf955d46a0331d8188fa3c9260078b0ff8f5aa3ae8ae246f45"
+  },
+  "stop": {
+   "events": 15,
+   "ledger": "266bf035430e58de5ce673a628cdc71d0941cce28cbced011f9adf1216223288",
+   "semantic": "3f309379055502ac29e563a1652fef862b2c872e3f54d73f9367d0edfb2a2edc"
+  },
+  "unknown": {
+   "events": 20,
+   "ledger": "26c1fd52d7aa5ab1820c871891bd3905d5250a25b0b630a8c66887d7e63819d9",
+   "semantic": "2a608ba672134a88b192fe26bb0a1a17a8631122c105b259d47febc74d29a51c"
+  }
+ },
+ "generated_by": "92c18c4756f1b927a27f72deced90b96d0595d44",
+ "tool": "tools/perf/state_identity.py generate/digest"
+}

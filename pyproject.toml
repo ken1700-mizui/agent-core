@@ -146,6 +146,24 @@ source_modules = ["agent_core.**"]
 forbidden_modules = ["agent_core_cli"]
 
 [[tool.importlinter.contracts]]
+id = "evaluation-records-off-the-agent-path"
+name = "WP2-01: the agent path never imports the evaluation store or ports (D.V4, D.V8)"
+type = "forbidden"
+# The agent under evaluation cannot write or classify evaluation records. Only
+# the evaluation side (WP2-12 controller, graders) composes them.
+source_modules = [
+    "agent_core.runtime",
+    "agent_core.tool",
+    "agent_core.safety",
+    "agent_core.cost",
+    "agent_core.context",
+    "agent_core.identity",
+    "agent_core.observability",
+    "agent_core_cli",
+]
+forbidden_modules = ["agent_core.adapters.sqlite_results", "agent_core.ports.evaluation"]
+
+[[tool.importlinter.contracts]]
 id = "phase1-no-network-or-process"
 name = "Phase 1: agent_core and its CLI have no network, provider SDK or process-spawning code path"
 type = "forbidden"

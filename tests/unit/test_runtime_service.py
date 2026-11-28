@@ -260,4 +260,5 @@ def test_runtime_events_survive_the_sqlite_journal_verification(tmp_path: Path) 
         versions = {row[0] for row in conn.execute("SELECT body FROM events")}
     finally:
         conn.close()
-    assert all('"schema_version":3' in body for body in versions)
+    # WP2-01 (D16, O-4): runtime events are stored as v4 (before WP2-01: v3).
+    assert all('"schema_version":4' in body for body in versions)

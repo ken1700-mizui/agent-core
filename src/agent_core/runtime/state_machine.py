@@ -56,7 +56,7 @@ from agent_core.types.records import (
     TaskStatus,
 )
 from agent_core.types.transitions import (
-    RUNTIME_EVENT_SCHEMA_VERSION,
+    READABLE_RUNTIME_SCHEMA_VERSIONS,
     RUNTIME_EVENT_TYPE,
     AbortEvidence,
     ApprovalEvidence,
@@ -1034,8 +1034,8 @@ def _fold_event(fold: _Fold, event: Event) -> None:
     try:
         if event.type != RUNTIME_EVENT_TYPE:
             raise StateRebuildError("unknown event type")
-        if event.schema_version != RUNTIME_EVENT_SCHEMA_VERSION or event.payload is None:
-            raise StateRebuildError("runtime events need schema_version 3 and a payload")
+        if event.schema_version not in READABLE_RUNTIME_SCHEMA_VERSIONS or event.payload is None:
+            raise StateRebuildError("runtime events need schema_version 3 or 4 and a payload")
         if event.run_id is not None:
             expected = fold.view.run_seqs.get(event.run_id, 0) + 1
             if event.run_seq != expected:
@@ -1095,6 +1095,9 @@ def rebuild_with_head(events: Iterable[Event]) -> tuple[RuntimeState, Event | No
             raise StateRebuildError("a full rebuild starts at tenant_seq 1 without gaps")
         if event.prev_hash != previous_hash:
             raise StateRebuildError("hash chain broken")
+        if previous is not None and event.schema_version < previous.schema_version:
+            # WP2-01: v3 may be followed by v4 (an upgraded home); never back.
+            raise StateRebuildError("event schema version goes back to an earlier version")
         _fold_event(fold, event)
         previous, previous_hash = event, event_hash(event)
         expected_seq += 1

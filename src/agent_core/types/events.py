@@ -11,7 +11,10 @@ Versions (``schema_version``):
   Only synthetic development data was ever written in it.
 - 3: adds ``payload``: a typed ``RuntimePayload`` of state transitions (WP-04
   with WP04-R04: Run carries ``cancel_requested``). Required in version 3.
-  Still no content body or secret.
+  Still no content body or secret. Never carries provenance.
+- 4: WP2-01 (Journal v4). Same payload, which may also carry ``provenance``
+  records (``agent_core.types.provenance``). Required payload. Written by the
+  runtime from WP2-01 on. A v3 event's bytes and hash are unchanged by v4.
 
 Unknown versions are rejected. Readers never reinterpret one version as another.
 """
@@ -45,7 +48,7 @@ from agent_core.types.values import (
 )
 
 # Event schema versions this code can read. Unknown versions are rejected.
-SUPPORTED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({1, 3})
+SUPPORTED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({1, 3, 4})
 # Versions that existed but can no longer be read (see the module docstring).
 RETIRED_EVENT_SCHEMA_VERSIONS: frozenset[int] = frozenset({2})
 
@@ -83,7 +86,7 @@ class _EventFields(ImmutableRecord):
     keyed_hashes: tuple[KeyedHash, ...]
     # A 2 lists ``ts``; it records time for people and never orders events.
     recorded_at_ms: TimestampMs
-    # Typed runtime metadata (schema_version 3 only). Absent in version 1, and then
+    # Typed runtime metadata (schema_version 3 and 4). Absent in version 1, and then
     # also absent from the serialized form, so version 1 bytes and hashes are unchanged.
     payload: RuntimePayload | None = None
 
@@ -98,8 +101,10 @@ class _EventFields(ImmutableRecord):
     def _payload_matches_version(self) -> Self:
         if self.schema_version == 1 and self.payload is not None:
             raise _invalid("payload_not_allowed", "schema_version 1 events carry no payload")
-        if self.schema_version == 3 and self.payload is None:
-            raise _invalid("payload_required", "schema_version 3 events carry a payload")
+        if self.schema_version in (3, 4) and self.payload is None:
+            raise _invalid("payload_required", "schema_version 3 and 4 events carry a payload")
+        if self.schema_version == 3 and self.payload is not None and self.payload.provenance:
+            raise _invalid("provenance_not_allowed", "schema_version 3 events carry no provenance")
         return self
 
     @field_validator("schema_version", mode="plain")

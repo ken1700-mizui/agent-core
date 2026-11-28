@@ -5,7 +5,10 @@ Order of every command:
 1. Plan the transitions with the pure state machine (edge, preconditions,
    evidence consistency). Nothing is written if this fails.
 2. Ask the ``EvidenceVerifier`` port to confirm every piece of evidence.
-3. Append one runtime event (``schema_version`` 2) to the Journal.
+3. Append one runtime event (``schema_version`` 4, WP2-01) to the Journal.
+   Before that, the provenance rules of evaluation Runs are checked
+   (``agent_core.runtime.provenance``); a command that lacks what its
+   transition needs is refused with nothing written.
 4. Only after the Journal returned the stored event, fold that stored event
    into the state (the same ``apply_event`` used by ``rebuild``). If the append
    fails, the state is unchanged and no snapshot is returned.
@@ -25,6 +28,7 @@ from agent_core.ports.clock import Clock
 from agent_core.ports.evidence import EvidenceVerifier
 from agent_core.ports.journal import HeadExpectation, JournalHead, JournalPort
 from agent_core.runtime.capacity import CapacityGate
+from agent_core.runtime.provenance import ProvenanceIndex
 from agent_core.runtime.state_machine import (
     RuntimeState,
     apply_event,
@@ -48,6 +52,7 @@ from agent_core.types.errors import (
     JournalClosedError,
     JournalHeadMismatchError,
     JournalStorageError,
+    ProvenanceRequiredError,
     RunTenantMismatchError,
     RuntimeReentryError,
     RuntimeReloadRequiredError,
@@ -63,6 +68,17 @@ from agent_core.types.events import Event, EventDraft
 from agent_core.types.ids import AttemptId, EventId, RunGrantId, RunId, StepId, TaskId, TenantId
 from agent_core.types.ledger import LedgerOp
 from agent_core.types.profile import require_phase1_profile
+from agent_core.types.provenance import (
+    AttemptProvenance,
+    AttemptProvenanceFields,
+    OutcomeProvenance,
+    OutcomeProvenanceFields,
+    Provenance,
+    RunProvenance,
+    RunProvenanceFields,
+    StepProvenance,
+    StepProvenanceFields,
+)
 from agent_core.types.records import (
     Attempt,
     AttemptState,
@@ -170,8 +186,12 @@ class RuntimeStateMachine:
         state: RuntimeState,
         head: HeadExpectation,
         capacity: CapacityGate | None = None,
+        provenance: ProvenanceIndex | None = None,
     ) -> None:
         self._journal = journal
+        # WP2-01: derived index of the journal's provenance (which Runs are
+        # evaluation Runs). Built by ``load``; never part of the state.
+        self._provenance = provenance if provenance is not None else ProvenanceIndex()
         # P-2: the admission of new work (None: no limit, as before P-2).
         self._capacity = capacity
         self._ids = ids
@@ -218,7 +238,10 @@ class RuntimeStateMachine:
         """
         require_phase1_profile(profile)
         heads: list[JournalHead | None] = []
-        state, last, last_hash = rebuild_with_head(_read_pages(journal, tenant_id, heads))
+        index = ProvenanceIndex()
+        state, last, last_hash = rebuild_with_head(
+            index.tee(_read_pages(journal, tenant_id, heads))
+        )
         head = heads[-1]
         expected = HeadExpectation(
             tenant_seq=0 if last is None else last.tenant_seq, head_hash=last_hash
@@ -236,7 +259,13 @@ class RuntimeStateMachine:
             state=state,
             head=expected,
             capacity=capacity,
+            provenance=index,
         )
+
+    @property
+    def provenance(self) -> ProvenanceIndex:
+        """WP2-01: the provenance index of this runtime's journal (read only)."""
+        return self._provenance
 
     @property
     def capacity(self) -> CapacityGate | None:
@@ -293,8 +322,16 @@ class RuntimeStateMachine:
     # ------------------------------------------------------------ runs
 
     @_exclusive
-    def start_run(self, task: Task, *, run_grant_ref: RunGrantId) -> Run:
-        """Create the next Run of ``task``; the Task's budget and caps carry over unchanged."""
+    def start_run(
+        self,
+        task: Task,
+        *,
+        run_grant_ref: RunGrantId,
+        provenance: RunProvenanceFields | None = None,
+    ) -> Run:
+        """Create the next Run of ``task``; the Task's budget and caps carry over unchanged.
+
+        ``provenance`` makes it an evaluation Run (WP2-01)."""
         self._admit(NewWork.RUN)
         transitions: list[Transition] = []
         state = self._state
@@ -314,7 +351,8 @@ class RuntimeStateMachine:
         transitions.append(plan_run_create(state, run))
         state = apply_transition(state, transitions[-1])
         transitions.append(plan_task_attach(state, state.tasks[task.task_id], run.run_id))
-        self._commit(tuple(transitions))
+        records = () if provenance is None else (RunProvenance.bind(provenance, run.run_id),)
+        self._commit(tuple(transitions), provenance=records)
         return self._state.runs[run.run_id]
 
     @_exclusive
@@ -328,7 +366,9 @@ class RuntimeStateMachine:
     # ------------------------------------------------------------ steps
 
     @_exclusive
-    def create_step(self, run: Run, kind: StepKind) -> Step:
+    def create_step(
+        self, run: Run, kind: StepKind, *, provenance: StepProvenanceFields | None = None
+    ) -> Step:
         self._admit(NewWork.STEP)
         step = Step(
             step_id=self._ids.new(StepId),
@@ -337,7 +377,8 @@ class RuntimeStateMachine:
             kind=kind,
             status=StepStatus.PLANNED,
         )
-        self._commit((plan_step_create(self._state, step),))
+        records = () if provenance is None else (StepProvenance.bind(provenance, step.step_id),)
+        self._commit((plan_step_create(self._state, step),), provenance=records)
         return self._state.steps[step.step_id]
 
     @_exclusive
@@ -371,10 +412,19 @@ class RuntimeStateMachine:
         evidence: AttemptEvidence | None = None,
         *,
         ledger: tuple[LedgerOp, ...] = (),
+        provenance: AttemptProvenanceFields | OutcomeProvenanceFields | None = None,
     ) -> Attempt:
-        """``ledger`` operations are applied in the same journal transaction (WP-09)."""
+        """``ledger`` operations are applied in the same journal transaction (WP-09).
+
+        ``provenance``: the content record at ``CONTENT_FIXED`` or the result
+        record of a live result (WP2-01, contract 3.2.4)."""
         transition = plan_attempt_status(self._state, attempt, target, evidence)
-        self._commit((transition,), ledger=ledger)
+        records: tuple[Provenance, ...] = ()
+        if isinstance(provenance, AttemptProvenanceFields):
+            records = (AttemptProvenance.bind(provenance, attempt.attempt_id),)
+        elif isinstance(provenance, OutcomeProvenanceFields):
+            records = (OutcomeProvenance.bind(provenance, attempt.attempt_id),)
+        self._commit((transition,), ledger=ledger, provenance=records)
         self._late = transition.late
         return self._state.attempts[attempt.attempt_id]
 
@@ -387,8 +437,31 @@ class RuntimeStateMachine:
                 if evidence is not None and transition.before is not None:
                     self._verifier.verify(evidence, subject=transition.before)
 
+    def _payload(
+        self, transitions: tuple[Transition, ...], records: tuple[Provenance, ...]
+    ) -> RuntimePayload:
+        """The payload with its provenance, checked against the rules of
+        evaluation Runs (WP2-01). Refused before anything is written."""
+        try:
+            payload = RuntimePayload(transitions=transitions, provenance=records)
+            markers = self._provenance.markers(payload)
+            if markers:
+                payload = RuntimePayload(transitions=transitions, provenance=records + markers)
+        except ValueError as exc:
+            if not records:
+                raise
+            raise ProvenanceRequiredError("the provenance does not match its transition") from exc
+        problems = self._provenance.check(payload)
+        if problems:
+            raise ProvenanceRequiredError(problems[0])
+        return payload
+
     def _commit(
-        self, transitions: tuple[Transition, ...], *, ledger: tuple[LedgerOp, ...] = ()
+        self,
+        transitions: tuple[Transition, ...],
+        *,
+        ledger: tuple[LedgerOp, ...] = (),
+        provenance: tuple[Provenance, ...] = (),
     ) -> Event:
         if self._reload_required:
             raise RuntimeReloadRequiredError("reload the runtime from the journal")
@@ -397,7 +470,7 @@ class RuntimeStateMachine:
         # The state and head the transitions were planned from (fixed at the
         # start of the command, before any evidence is checked).
         base_state, expected = self._base
-        payload = RuntimePayload(transitions=transitions)
+        payload = self._payload(transitions, provenance)
         # Dry run of the whole payload on the planning state (no I/O, no change).
         try:
             _, run_id = apply_payload(base_state, payload)
@@ -458,4 +531,6 @@ class RuntimeStateMachine:
             self._reload_required = True
             raise
         self._head = HeadExpectation(tenant_seq=event.tenant_seq, head_hash=event_hash(event))
+        if event.payload is not None:
+            self._provenance.add(event.payload, v4=True)
         return event

@@ -45,7 +45,7 @@ class SiteRole(StrEnum):
 
 
 class IdKind(StrEnum):
-    """ID prefixes used in Phase 1. Further kinds are added by the WP that needs them."""
+    """ID prefixes. Further kinds are added by the WP that needs them."""
 
     TASK = "tsk"
     RUN = "run"
@@ -64,6 +64,10 @@ class IdKind(StrEnum):
     USER = "usr"
     EXPERIMENT = "exp"
     PEP_INSTANCE = "pep"
+    # Phase 2 (WP2-01, WP2-02).
+    TRIAL = "trl"
+    HOME = "hom"
+    BROKER_INSTANCE = "brk"
 
 
 def _check_int(value: object, maximum: int, what: str) -> int:
@@ -267,6 +271,27 @@ class PepInstanceId(EntityId):
     KIND = IdKind.PEP_INSTANCE
 
 
+class TrialId(EntityId):
+    """One evaluation trial (D 3.4)."""
+
+    __slots__ = ()
+    KIND = IdKind.TRIAL
+
+
+class HomeId(EntityId):
+    """One Agent Core home (journal and ledger) of a multi-home experiment (7.8)."""
+
+    __slots__ = ()
+    KIND = IdKind.HOME
+
+
+class BrokerInstanceId(EntityId):
+    """One start of the P2 broker (WP2-02); a restart gets a new one."""
+
+    __slots__ = ()
+    KIND = IdKind.BROKER_INSTANCE
+
+
 _ID_TYPES: dict[str, type[EntityId]] = {
     t.KIND.value: t
     for t in (
@@ -287,6 +312,9 @@ _ID_TYPES: dict[str, type[EntityId]] = {
         UserId,
         ExperimentId,
         PepInstanceId,
+        TrialId,
+        HomeId,
+        BrokerInstanceId,
     )
 }
 _KINDS = frozenset(_ID_TYPES)
