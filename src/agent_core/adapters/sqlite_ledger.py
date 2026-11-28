@@ -620,6 +620,34 @@ def _elapsed_reasons(cur: sqlite3.Cursor, run_id: str, task_id: str, now_ms: int
     return reasons
 
 
+def _experiment_counters(
+    cur: sqlite3.Cursor, experiment_id: str, counters: list[CounterKind]
+) -> list[str]:
+    """WP2-08: an experiment's work units are capped in each home (a closed home
+    sets the cap to the units used, so even a zero-XTU trial is refused there).
+    The work-unit cap is required (fail closed); the other counters are
+    enforced at the experiment level only where the owner set a cap."""
+    exceeded: list[str] = []
+    scope = BudgetScopeType.EXPERIMENT
+    for counter in counters:
+        cap = _counter_cap(cur, scope, experiment_id, counter, None)
+        if cap is None:
+            if counter is CounterKind.WORK_UNITS:
+                raise BudgetCapMissingError("EXPERIMENT_WORK_UNITS")
+            continue
+        used = checked_add(_used(cur, scope, experiment_id, counter), 1)
+        if used > cap:
+            exceeded.append(counter.value)
+            continue
+        cur.execute(
+            "INSERT INTO counter_usage (scope_type, scope_id, counter, used) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT (scope_type, scope_id, counter) "
+            "DO UPDATE SET used = excluded.used",
+            (scope.value, experiment_id, counter.value, used),
+        )
+    return exceeded
+
+
 def _check_counters(cur: sqlite3.Cursor, row: dict[str, Any], now_ms: int) -> None:
     kind = ActionKind(row["action_kind"])
     counters = [
@@ -652,6 +680,8 @@ def _check_counters(cur: sqlite3.Cursor, row: dict[str, Any], now_ms: int) -> No
                 "DO UPDATE SET used = excluded.used",
                 (scope.value, scope_id, counter.value, used),
             )
+    if row["experiment_id"] is not None:
+        exceeded += _experiment_counters(cur, row["experiment_id"], counters)
     exceeded += _elapsed_reasons(cur, row["run_id"], row["task_id"], now_ms)
     if exceeded:
         raise CounterCapExceededError(*dict.fromkeys(exceeded))
@@ -1253,6 +1283,17 @@ def scope_usage(cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str) -> Sc
         spent_micro=spent,
         blocked=blocked is not None,
     )
+
+
+def read_held(
+    cur: sqlite3.Cursor, kind: BudgetScopeType, scope_id: str
+) -> tuple[tuple[str, int], ...]:
+    rows = cur.execute(
+        "SELECT reservation_id, hold_micro FROM reservations "  # noqa: S608
+        f"WHERE {_SCOPE_COLUMNS[kind]} = ? AND hold_micro > 0 ORDER BY reservation_id",
+        (scope_id,),
+    ).fetchall()
+    return tuple((str(r[0]), int(r[1])) for r in rows)
 
 
 def read_counter(

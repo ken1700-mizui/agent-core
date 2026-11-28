@@ -64,7 +64,7 @@ from support import safety_world as s
 from support import tool_world as tw
 
 PERIOD = "synthetic-2026-11"
-CounterScope = Literal[BudgetScopeType.RUN, BudgetScopeType.TASK]
+CounterScope = Literal[BudgetScopeType.RUN, BudgetScopeType.TASK, BudgetScopeType.EXPERIMENT]
 A = AttemptState
 
 
@@ -187,8 +187,12 @@ def caps(
     **levels: int,
 ) -> None:
     """Every budget level, the enforced counters, the run window and the Run grant.
-    ``skip_task=True`` leaves the Task scope without an owner cap."""
+    ``skip_task=True`` leaves the Task scope without an owner cap.
+    ``skip_experiment=True`` leaves the experiment's caps to the home chain
+    (WP2-08); ``skip_experiment_counter=True`` leaves only its work-unit cap out."""
     skip_task = bool(levels.pop("skip_task", 0))
+    skip_experiment = bool(levels.pop("skip_experiment", 0))
+    skip_experiment_counter = bool(levels.pop("skip_experiment_counter", 0))
     ids = {
         BudgetScopeType.STEP: str(scopes.step_id),
         BudgetScopeType.RUN: str(scopes.run_id),
@@ -199,7 +203,7 @@ def caps(
     }
     if skip_task:
         del ids[BudgetScopeType.TASK]
-    if scopes.experiment_id is not None:
+    if scopes.experiment_id is not None and not skip_experiment:
         ids[BudgetScopeType.EXPERIMENT] = str(scopes.experiment_id)
     ops: list[LedgerOp] = [
         SetBudgetCap(
@@ -229,6 +233,16 @@ def caps(
                     cap=levels.get(counter.value.lower(), 100),
                 )
             )
+    if scopes.experiment_id is not None and not (skip_experiment or skip_experiment_counter):
+        ops.append(
+            SetCounterCap(
+                op="set_counter_cap",
+                scope_type=BudgetScopeType.EXPERIMENT,
+                scope_id=str(scopes.experiment_id),
+                counter=CounterKind.WORK_UNITS,
+                cap=levels.get("experiment_work_units", 1_000),
+            )
+        )
     ops.append(SetRunWindow(op="set_run_window", run_id=scopes.run_id, max_elapsed_ms=3_600_000))
     if scopes.run_id not in st.grants:
         at = AttemptRef(

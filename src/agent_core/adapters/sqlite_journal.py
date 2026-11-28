@@ -544,6 +544,13 @@ class SqliteJournal:
         with self._read_transaction(self._require_open()) as cur:
             return sqlite_ledger.scope_usage(cur, BudgetScopeType(scope_type), str(scope_id))
 
+    def held_reservations(
+        self, scope_type: BudgetScopeType, scope_id: str
+    ) -> tuple[tuple[str, int], ...]:
+        """(reservation_id, hold) of every reservation of a scope that still holds."""
+        with self._read_transaction(self._require_open()) as cur:
+            return sqlite_ledger.read_held(cur, BudgetScopeType(scope_type), str(scope_id))
+
     def counter(
         self, scope_type: BudgetScopeType, scope_id: str, counter: CounterKind
     ) -> CounterView | None:

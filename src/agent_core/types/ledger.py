@@ -290,8 +290,10 @@ class SetStepCapDefault(FrozenModel):
 
 
 class SetCounterCap(FrozenModel):
+    """WP2-08 widened the scope to the experiment (its work-unit cap per home)."""
+
     op: Literal["set_counter_cap"]
-    scope_type: Literal[BudgetScopeType.RUN, BudgetScopeType.TASK]
+    scope_type: Literal[BudgetScopeType.RUN, BudgetScopeType.TASK, BudgetScopeType.EXPERIMENT]
     scope_id: Annotated[str, Field(min_length=1, max_length=128)]
     counter: CounterKind
     cap: Count
