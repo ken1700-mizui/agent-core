@@ -82,6 +82,7 @@ def consumed(st: lw.Setup, name: str, **overrides: Any) -> Attempt:
 def run(st: lw.Setup, p2: Broker, attempt: Attempt, **kw: Any) -> SandboxOperationResult:
     import time
 
+    kw.setdefault("admission", bw.ADMITTED)
     return run_sandbox_operation(
         gate=lw.gate(st),
         sandbox=kw.pop("client", None) or bw.make_client(p2, epoch=st.journal.owner_epoch),

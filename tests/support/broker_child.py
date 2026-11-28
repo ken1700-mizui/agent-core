@@ -33,6 +33,7 @@ def main() -> int:
         key=key,
         p2_uid=int(os.environ.get("BROKER_CHILD_P2_UID", bw.UID)),
         owner_epoch=lambda: epoch,
+        admission=bw.ADMITTED,  # this child tests the broker and the OS users
         timeout_s=10.0,
     )
     request = json.loads(request_text)

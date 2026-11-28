@@ -25,7 +25,7 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from agent_core.types import broker_ipc as ipc
-from agent_core.types.errors import SandboxUnavailableError
+from agent_core.types.errors import AgentCoreError, SandboxUnavailableError
 from agent_core.types.ids import AttemptId, RequestId
 from agent_core.types.safety import SecretKey
 from agent_core.types.sandbox import (
@@ -81,8 +81,12 @@ class BrokerClient:
         key: SecretKey,
         p2_uid: int,
         owner_epoch: Callable[[], int],
+        admission: Callable[[], None],
         timeout_s: float = 5.0,
     ) -> None:
+        # S-R03 (D19): required, no default. Checked before a prepare or a start
+        # is sent; a refusal is a SandboxUnavailableError with sent=False.
+        self._admission = admission
         self._connect = connector
         self._key = key
         self._p2_uid = p2_uid
@@ -149,12 +153,22 @@ class BrokerClient:
             raise SandboxUnavailableError("the broker's answer names another request", sent=True)
         return result
 
+    def _admit(self) -> None:
+        try:
+            self._admission()
+        except AgentCoreError as exc:
+            raise SandboxUnavailableError(
+                "the sandbox admission refused", sent=False, refusal="SANDBOX_ADMISSION_REFUSED"
+            ) from exc
+
     def prepare(self, request: PrepareRequest) -> PrepareResult:
+        self._admit()
         return self._call(
             ipc.RequestKind.PREPARE, request, request.request_id, request.attempt_id, PrepareResult
         )
 
     def start(self, request: StartRequest) -> StartResult:
+        self._admit()
         return self._call(
             ipc.RequestKind.START, request, request.request_id, request.attempt_id, StartResult
         )

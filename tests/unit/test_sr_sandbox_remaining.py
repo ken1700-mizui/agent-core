@@ -251,3 +251,52 @@ def test_admission_refuses_the_sandbox_start(tmp_path: Path) -> None:
     )
     assert ok.attempt.state is A.COMPLETED
     broker.close()
+
+
+# ---------------------------------------------------------------- D19: admission cannot be omitted
+
+
+def test_the_sandbox_run_and_the_client_need_an_admission() -> None:
+    import inspect
+
+    from agent_core.adapters.broker_client import BrokerClient
+    from agent_core.runtime.sandbox_execution import run_sandbox_operation
+
+    for target in (run_sandbox_operation, BrokerClient.__init__):
+        parameter = inspect.signature(target).parameters["admission"]
+        assert parameter.default is inspect.Parameter.empty, target
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_the_client_refuses_a_start_before_sending_it(tmp_path: Path) -> None:
+    st, broker = sw.setup(tmp_path)
+    store = _store(tmp_path, st)
+    monitor = DeadlineMonitor(iw.deps(st), CONFIG, store)  # never cycled: no trusted beat
+    client = bw.make_client(
+        broker,
+        epoch=st.journal.owner_epoch,
+        admission=sandbox_admission(monitor, store, p2_instance=None),
+    )
+    with pytest.raises(SandboxUnavailableError) as refused:
+        client.start(bw.start_request(epoch=st.journal.owner_epoch))
+    assert refused.value.sent is False
+    assert refused.value.refusal == "SANDBOX_ADMISSION_REFUSED"
+    assert broker.sandbox.runs == {}
+    broker.close()
+
+
+def test_a_start_refused_by_the_client_is_definitely_not_run(tmp_path: Path) -> None:
+    st, broker = sw.setup(tmp_path)
+    calls = {"n": 0}
+
+    def second_call_refuses() -> None:  # the run's check passes; the client's fails
+        calls["n"] += 1
+        if calls["n"] > 2:
+            raise SandboxAdmissionError("no trusted heartbeat")
+
+    client = bw.make_client(broker, epoch=st.journal.owner_epoch, admission=second_call_refuses)
+    attempt = sw.consumed(st)
+    done = sw.run_with(st, broker, attempt, client=client, admission=second_call_refuses)
+    assert done.attempt.state is A.FAILED_DEFINITE
+    assert attempt.receipt_id not in broker.sandbox.runs
+    broker.close()

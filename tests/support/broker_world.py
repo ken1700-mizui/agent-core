@@ -94,14 +94,22 @@ def make_client(
     p2_uid: int | None = None,
     key: SecretKey = KEY,
     connector: Callable[[], socket.socket] | None = None,
+    admission: Callable[[], None] | None = None,
 ) -> BrokerClient:
+    """``admission`` defaults to ``ADMITTED`` (tests about the broker itself;
+    the heartbeat admission is tested with the real monitor)."""
     return BrokerClient(
         connector=connector if connector is not None else pair_connector(broker),
         key=key,
         p2_uid=UID if p2_uid is None else p2_uid,
         owner_epoch=lambda: epoch,
+        admission=admission if admission is not None else ADMITTED,
         timeout_s=5.0,
     )
+
+
+def ADMITTED() -> None:  # noqa: N802 (a constant-like test admission)
+    """A test-only admission that always admits. Never used by the product."""
 
 
 def start_request(

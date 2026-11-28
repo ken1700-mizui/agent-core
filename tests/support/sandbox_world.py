@@ -121,12 +121,14 @@ def run(
         expected=program,
         new_request_id=lambda: b.new_id(RequestId),
         max_polls=max_polls,
+        admission=bw.ADMITTED,
         **lw.actual(st, attempt),
     )
 
 
 def run_with(st: lw.Setup, broker: Broker, attempt: Attempt, **kw: Any) -> SandboxOperationResult:
     """``run`` with any of the runner's monitor arguments (WP2-04)."""
+    kw.setdefault("admission", bw.ADMITTED)
     return run_sandbox_operation(
         gate=lw.gate(st),
         sandbox=kw.pop("client", None) or bw.make_client(broker, epoch=st.journal.owner_epoch),

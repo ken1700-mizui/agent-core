@@ -74,6 +74,7 @@ _LIMITS = {"deadline_ms": (1, MAX_DEADLINE_MS), "grace_ms": (0, MAX_GRACE_MS)}
 # Authenticated refusals P2 gives before it records a start: nothing ran.
 PRE_ACCEPTANCE_REFUSALS = frozenset(
     {
+        "SANDBOX_ADMISSION_REFUSED",  # refused by the client before sending (D19)
         "MALFORMED",
         "AUTHENTICATION",
         "PEER",
@@ -156,7 +157,7 @@ def run_sandbox_operation(
     monotonic_ms: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000,
     stopped: Callable[[], bool] = lambda: False,
     p1_margin_ms: int = 5_000,
-    admission: Callable[[], None] | None = None,
+    admission: Callable[[], None],
 ) -> SandboxOperationResult:
     """P1's sandbox monitor (WP2-04) is the poll loop: one ``wait`` per sandbox
     cycle, until nothing runs, the owner stops (``stopped``), or P1's own limit
@@ -171,12 +172,11 @@ def run_sandbox_operation(
     if program is None or (expected is not None and expected != program):
         aborted = gate.abort_not_dispatched(attempt, AbortReason.ARTIFACT_MISMATCH)
         return SandboxOperationResult(aborted, None)
-    if admission is not None:
-        try:
-            admission()  # S-R03: the monitor's liveness, before any start
-        except AgentCoreError:
-            aborted = gate.abort_not_dispatched(attempt, AbortReason.SANDBOX_UNAVAILABLE)
-            return SandboxOperationResult(aborted, None)
+    try:
+        admission()  # S-R03 (required, D19): the monitor's liveness, before any start
+    except AgentCoreError:
+        aborted = gate.abort_not_dispatched(attempt, AbortReason.SANDBOX_UNAVAILABLE)
+        return SandboxOperationResult(aborted, None)
     try:
         prepared = sandbox.prepare(
             PrepareRequest(
