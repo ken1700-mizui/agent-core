@@ -113,7 +113,36 @@ DS の受入の条件の6項目は、Fake での契約の試験は成功した�
 
 ## 8. 全試験と品質の検査
 
-（最終の実行の結果で埋める）
+試験の対象：`6892781`（その後のコミットは文書だけ）。開始の時点の 2,762 件は、すべてそのまま残した。
+
+**区別：**
+- 失敗：0 件。
+- 選ばれない区分（既定の実行）：privileged 6、sandbox 47、simulation 34。どれも、下の別の実行で実行した。
+- 環境の条件の不足：sandbox の 47 件は、明示の開発の固定の診断のモード（DS なし）で、MAC、cgroup v2、systemd のない環境で実行した。**開発の確認であり、SG-1 でも DS の確認でもない。**
+
+| 検査 | 結果 |
+|---|---|
+| 8種類の検査（各コミットの前） | 成功。秘密情報、lock、sync、ruff、format、mypy、import-linter（**10 契約**、DS の2つを追加）、pytest |
+| 通常の試験（`nobody`、`-m "not privileged"`） | 2725 件が成功（privileged 6、sandbox 47、simulation 34 は選ばれず、未実行と表示） |
+| 特権の試験（root、`-m privileged`） | 6 件が成功 |
+| sandbox（Docker と別の OS 利用者、root） | 47 件が成功 |
+| simulation（D 16.1、事前登録） | 34 件が成功（239.4 秒。WP2-07 の結果は変わらない） |
+| ネットワークのない環境（`unshare -n`）：既定 | 2731 件が成功 |
+| ネットワークのない環境（`unshare -n`）：sandbox | 47 件が成功 |
+| 全試験（すべての区分）の1回目 | 2812 件が成功（392.1 秒） |
+| 全試験（すべての区分）の2回目 | 2812 件が成功（407.6 秒） |
+| Journal v3・v4 の互換（`test_event_versions`、`test_wp2_01_journal_v4`、`test_types_serialization`） | 103 件が成功 |
+| 予算と Recovery の回帰（`test_budget_ledger`、`test_wp12_recovery`、`test_wp2_08_experiment_budget`） | 115 件が成功 |
+
+**件数の内訳：** 2812 ＝ 2762 ＋ 50。
+- Deadline Supervisor：22。
+- S-R04：24。
+- 統合：4。
+
+**途中で起きたことと、その扱い：**
+1. **ホストの再起動：** dockerd が止まっていた。承認済みの E-1 の設定のまま、起動し直した。OS の利用者と設定は残っていた。
+2. **既存の試験の調整：** Broker に DS が入ったので、P2 の記録への I/O の障害を入れる試験2件は、同じ `os.write`・`os.fsync` を使う DS の記録を、メモリーの記録に替えた。主張は変えていない。また、P2 のプロセスの試験2件と OS の利用者の試験には、`--diagnostics-without-supervisor` を明示した。
+3. **import の契約の試験：** 写しのパッケージの一覧に、DS を加えた。
 
 ## 9. 実行していない試験
 
@@ -158,4 +187,4 @@ DS の受入の条件の6項目は、Fake での契約の試験は成功した�
 
 ## 13. 最新の HEAD
 
-（Push の後に記入）
+`impl/phase-2-evaluation`：この報告を記録したコミット（試験の対象は `6892781`）。`main`：`d0b8635`（変えていない）。Phase 1：`cfb31bf`（変えていない）。
