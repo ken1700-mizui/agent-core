@@ -35,9 +35,10 @@ def _lint_imports(config: Path, python_path: Path, cwd: Path) -> subprocess.Comp
 
 
 def _copy_real_package(tmp_path: Path) -> Path:
-    """A copy of every root package the real contracts name (WP-10 adds the CLI)."""
+    """A copy of every root package the real contracts name (WP-10 adds the CLI,
+    WP2-02 the P2 broker)."""
     src = tmp_path / "src"
-    for package in ("agent_core", "agent_core_cli"):
+    for package in ("agent_core", "agent_core_cli", "agent_core_broker"):
         shutil.copytree(
             REPO_ROOT / "src" / package,
             src / package,
@@ -368,3 +369,53 @@ def test_the_cli_has_no_network_or_process_path(
     result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
     assert result.returncode == 1
     assert f"agent_core_cli.planted -> {target}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("statement", "target"),
+    [
+        ("import sqlite3", "sqlite3"),
+        ("from agent_core.adapters import sqlite_journal", "agent_core.adapters.sqlite_journal"),
+        ("from agent_core.runtime import service", "agent_core.runtime.service"),
+        ("import subprocess", "subprocess"),
+        ("import http.client", "http"),
+    ],
+)
+def test_wp2_02_the_broker_cannot_reach_the_journal_network_or_processes(
+    tmp_path: Path, statement: str, target: str
+) -> None:
+    src = _copy_real_package(tmp_path)
+    (src / "agent_core_broker" / "leak.py").write_text(f'"""Planted."""\n\n{statement}\n')
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert f"agent_core_broker.leak -> {target}" in result.stdout
+
+
+@pytest.mark.parametrize("module", ["agent_core.runtime.leak", "agent_core.adapters.leak"])
+def test_wp2_02_only_the_broker_client_may_import_socket(tmp_path: Path, module: str) -> None:
+    src = _copy_real_package(tmp_path)
+    path = src.joinpath(*module.split(".")).with_suffix(".py")
+    path.write_text('"""Planted."""\n\nimport socket\n')
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert f"{module} -> socket" in result.stdout
+
+
+def test_wp2_02_p1_cannot_import_the_broker(tmp_path: Path) -> None:
+    src = _copy_real_package(tmp_path)
+    (src / "agent_core" / "leak.py").write_text(
+        '"""Planted."""\n\nimport agent_core_broker.server\n'
+    )
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert "agent_core.leak -> agent_core_broker" in result.stdout
+
+
+def test_wp2_01_the_agent_path_cannot_import_the_results_store(tmp_path: Path) -> None:
+    src = _copy_real_package(tmp_path)
+    (src / "agent_core" / "runtime" / "leak.py").write_text(
+        '"""Planted."""\n\nfrom agent_core.adapters import sqlite_results\n'
+    )
+    result = _lint_imports(REPO_ROOT / "pyproject.toml", src, tmp_path)
+    assert result.returncode == 1
+    assert "agent_core.runtime.leak -> agent_core.adapters.sqlite_results" in result.stdout

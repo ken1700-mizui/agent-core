@@ -57,6 +57,8 @@ class AbortReason(StrEnum):
     SAFE_FILE_ACCESS_UNAVAILABLE = "SAFE_FILE_ACCESS_UNAVAILABLE"
     WORKSPACE_BUSY = "WORKSPACE_BUSY"
     ARTIFACT_MISMATCH = "ARTIFACT_MISMATCH"
+    # WP2-02: the P2 broker could not prepare the sandbox before the start.
+    SANDBOX_UNAVAILABLE = "SANDBOX_UNAVAILABLE"
 
 
 class ReconciledOutcome(StrEnum):

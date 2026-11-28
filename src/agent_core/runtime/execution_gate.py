@@ -62,6 +62,7 @@ from agent_core.types.ledger import (
     ReportUsage,
 )
 from agent_core.types.model import CostStatus, Usage, UsageStatus
+from agent_core.types.provenance import OutcomeProvenanceFields
 from agent_core.types.records import Attempt, AttemptState
 from agent_core.types.safety import (
     ActionContent,
@@ -237,7 +238,12 @@ class SyntheticExecutionGate:
                 raise
             return self._finish(attempt, result)
 
-    def _finish(self, attempt: Attempt, result: SyntheticResult) -> Attempt:
+    def _finish(
+        self,
+        attempt: Attempt,
+        result: SyntheticResult,
+        provenance: OutcomeProvenanceFields | None = None,
+    ) -> Attempt:
         report = self.execution_report(attempt, result)
         self._usage_events += 1
         op = ReportUsage(
@@ -251,7 +257,9 @@ class SyntheticExecutionGate:
         evidence = OutcomeEvidence(
             kind="outcome", receipt_id=report.receipt_id, report_ref=reports.report_ref(report)
         )
-        return self._runtime.advance_attempt(attempt, target, evidence, ledger=(op,))
+        return self._runtime.advance_attempt(
+            attempt, target, evidence, ledger=(op,), provenance=provenance
+        )
 
     def execute(
         self,
@@ -260,9 +268,11 @@ class SyntheticExecutionGate:
         content: ActionContent,
         registration: ToolRegistration | None,
         run: Callable[[DispatchAuthorization], SyntheticResult],
+        outcome: Callable[[SyntheticResult], OutcomeProvenanceFields] | None = None,
     ) -> Attempt:
         """Claim, start, run a synthetic callback once, record the outcome. Not for
-        file operations (``execute_file``)."""
+        file operations (``execute_file``). ``outcome`` (WP2-02) gives the Journal
+        v4 record of the live result (the measured time), when there is one."""
         with self._exclusive():
             self._refuse_file_operation(attempt)
             if registration is not None and registration.manifest.effect_class not in (
@@ -274,10 +284,11 @@ class SyntheticExecutionGate:
             started, authorization = self._start(claimed)
             try:
                 result = run(authorization)
+                provenance = None if outcome is None else outcome(result)
             except BaseException:
                 self._unknown(started)
                 raise
-            return self._finish(started, result)
+            return self._finish(started, result, provenance)
 
     def execute_file(
         self,

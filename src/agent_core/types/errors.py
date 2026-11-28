@@ -292,6 +292,21 @@ class ProvenanceRequiredError(AgentCoreError):
     code = "PROVENANCE_REQUIRED"
 
 
+class SandboxUnavailableError(AgentCoreError):
+    """WP2-02: the P2 broker could not be used for a request: unreachable, no
+    answer, refused (``refusal``), unauthenticated peer or answer, or a mismatched
+    answer. ``sent`` is True once a connection was made: the request may have
+    arrived, so a ``start`` with that error has an unknown outcome."""
+
+    code = "SANDBOX_UNAVAILABLE"
+
+    def __init__(self, message: str, *, sent: bool, refusal: str | None = None) -> None:
+        detail = message if refusal is None else f"{message} ({refusal})"
+        super().__init__(detail)
+        self.sent = sent
+        self.refusal = refusal
+
+
 class StateIndexError(AgentCoreError):
     """P-7 M1: a derived index of the runtime state does not match the entities it
     is derived from. The state is not used; the runtime must be rebuilt from the

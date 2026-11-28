@@ -282,11 +282,13 @@ def fixed_attempt(
     costly: bool = False,
     model: bool = False,
     tamper: dict[str, Any] | None = None,
+    content_provenance: Any = None,
     **descriptor: Any,
 ) -> Attempt:
     """PROPOSED -> VALIDATED -> CONTENT_FIXED: the reservation ID is allocated and the
     ActionDescriptor (which contains it) is fixed (E 38.1). ``tamper`` changes the
-    fixed descriptor after it was built, keeping the original content."""
+    fixed descriptor after it was built, keeping the original content.
+    ``content_provenance`` (WP2-01): the Journal v4 record of an evaluation Run."""
     attempt = st.sm.create_attempt(step)
     attempt = st.sm.advance_attempt(attempt, A.VALIDATED, w.evidence_for(attempt, A.VALIDATED))
     rsv = b.new_id(ReservationId)
@@ -331,7 +333,11 @@ def fixed_attempt(
         kind="content_fixed", action_hash=built.action_hash(), reservation_id=rsv
     )
     return st.sm.advance_attempt(
-        attempt, A.CONTENT_FIXED, evidence, ledger=(allocate_op(attempt, rsv),)
+        attempt,
+        A.CONTENT_FIXED,
+        evidence,
+        ledger=(allocate_op(attempt, rsv),),
+        provenance=content_provenance,
     )
 
 

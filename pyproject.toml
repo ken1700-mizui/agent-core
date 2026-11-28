@@ -90,7 +90,8 @@ warn_required_dynamic_aliases = true
 # for each Engine are added by the work package that creates the modules.
 [tool.importlinter]
 # WP-10: the CLI (agent_core_cli) is the composition root, outside agent_core.
-root_packages = ["agent_core", "agent_core_cli"]
+# WP2-02: the P2 broker (agent_core_broker) is a separate process and package.
+root_packages = ["agent_core", "agent_core_cli", "agent_core_broker"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -164,10 +165,57 @@ source_modules = [
 forbidden_modules = ["agent_core.adapters.sqlite_results", "agent_core.ports.evaluation"]
 
 [[tool.importlinter.contracts]]
+id = "p1-does-not-run-p2"
+name = "WP2-02: no agent_core module imports the P2 broker (P1 talks to it over IPC only)"
+type = "forbidden"
+source_modules = ["agent_core.**", "agent_core_cli"]
+forbidden_modules = ["agent_core_broker"]
+
+[[tool.importlinter.contracts]]
+id = "p2-broker-isolation"
+name = "WP2-02: the P2 broker uses only agent_core.types: no journal, ledger, runtime, network or process"
+type = "forbidden"
+# P2 never reads or writes the Journal or the ledger (sandbox design 7.6.1). Its
+# only socket use is its AF_UNIX server. No process is spawned (fake backend).
+source_modules = ["agent_core_broker"]
+forbidden_modules = [
+    "agent_core.adapters",
+    "agent_core.runtime",
+    "agent_core.safety",
+    "agent_core.cost",
+    "agent_core.context",
+    "agent_core.tool",
+    "agent_core.identity",
+    "agent_core.observability",
+    "agent_core_cli",
+    "sqlite3",
+    "ssl",
+    "http",
+    "urllib",
+    "requests",
+    "httpx",
+    "aiohttp",
+    "socketserver",
+    "asyncio",
+    "subprocess",
+    "_posixsubprocess",
+    "multiprocessing",
+    "pty",
+    "ctypes",
+    "anthropic",
+    "openai",
+]
+
+[[tool.importlinter.contracts]]
 id = "phase1-no-network-or-process"
 name = "Phase 1: agent_core and its CLI have no network, provider SDK or process-spawning code path"
 type = "forbidden"
 source_modules = ["agent_core", "agent_core_cli"]
+# S-5 (D16, 2026-11-28): the one exception. P1's broker client opens AF_UNIX
+# stream sockets to the P2 broker and nothing else (no internet family, no name
+# resolution: tests/unit/test_wp2_02_broker.py checks its source). No other
+# module may import socket.
+ignore_imports = ["agent_core.adapters.broker_client -> socket"]
 forbidden_modules = [
     # Network (PHASE_1_IMPLEMENTATION_PLAN.md section 2, item 5)
     "socket",
