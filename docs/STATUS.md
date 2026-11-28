@@ -1,6 +1,6 @@
 # 進捗状況（進捗の正本）
 
-> 文書の状態：**DRAFT**　最終更新：2026-11-28（Phase 2 の設計の修正・開始承認の準備。D15）
+> 文書の状態：**DRAFT**　最終更新：2026-11-28（Phase 2 の開始、Batch 1-A：WP2-01・WP2-02 の実装。D16）
 >
 > この文書は、**進捗の正本**である（CP-6）。次のセッションでは、まずこの文書を読む。
 > - 予定の正本は `docs/design/phase-0/ROADMAP.md`。
@@ -11,11 +11,11 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1：正式に完了（オーナーの最終承認、2026-11-28。D12〜D14）**。記録は `docs/decisions/PHASE_1_COMPLETION.md`。Technical Gate：PASS。Safety Gate：定められた保証の範囲の内で PASS。最終の CI で検証した SHA は `93435c82e06a168794cf68c6ecf1fc598815d426`（run `46082898611`、2340 件がすべて成功）。Codex の独立品質レビュー（`aae033a`）の判定は CONDITIONAL_PASS（別の結果として保持）。暫定の運用の上限を維持（D13）。包括的なセキュリティ監査は Phase 3A の終わり、Phase 3B の実 API の接続の前（D14）。**Phase 2：設計の修正を記録（DRAFT）。設計の方針の判断を D15 として記録（承認済み・条件付き・承認待ちを区別）。Phase 2 の製品のコードの開始（O-1）、修正した設計の最終の受入、Docker のデーモンの起動、信頼しないコードの実行は承認されていない** |
-| 次の作業 | オーナーと ChatGPT による、修正した Phase 2 の設計の審査と最終の受入の判断を待つ。その後、Batch 1（WP2-01〜04）の開始の承認（O-1）と、環境の操作 E-1〜E-6（`PHASE_2_SANDBOX_DESIGN.md` の11章）の個別の承認を待つ。**Phase 2 の製品のコードは始めていない。** 文書（DRAFT、2026-11-28 改訂）：`docs/design/phase-2/PHASE_2_START_READINESS.md`（9章：O-1〜O-11 の判断の状況）、`PHASE_2_IMPLEMENTATION_PLAN.md`（WP2-01〜15、2.5：Batch 1〜4 と SG-1）、`PHASE_2_EVALUATION_CONTRACT.md`（2.4：分類の規則と4つの費用、3.2：Journal v4 の3段階の来歴、7：複数のホームにまたがる予算、8：validation と holdout）、`PHASE_2_SANDBOX_DESIGN.md`（7：P-4 の最終の設計（P2 の外部の停止が主）、7.6：P1–P2 の IPC の契約、7.7：P-5 の 18 項目、11：環境の操作）、`PHASE_2_AGENT_INSTRUCTIONS.md`（AI 向け、英語）。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、A.I17 は明示的な Recovery に限る（Phase 2 で P-5）、M6 は必要が生じるまで、費用の台帳の集計の高速化は上限を上げる前。Phase 3A の Gate を省略しない |
+| 今の段階 | **Phase 2：開始（オーナーの承認、2026-11-28、D16）。Batch 1-A（WP2-01・WP2-02）の実装を完了（レビュー待ち）。** WP2-01：評価の型、Experiment Registry と Results Store、Journal v4（provenance）、接続口。WP2-02：P2 Broker、型付きの AF_UNIX の IPC、偽の Sandbox、P1 の client、Phase 1 のゲートの経路との接続。**Docker は使っていない、何も実行していない。** Phase 1 は正式に完了（D12〜D14、完了の時点 `92c18c4`、タグ `phase-1-complete`）。**Phase 2 の正式な完了ではない** |
+| 次の作業 | WP2-01・02 の審査（ChatGPT）を待つ。その後、Batch 1-B（WP2-03・04）の開始の承認と、環境の操作 E-1〜E-4 の承認（案は `docs/design/phase-2/PHASE_2_ENVIRONMENT_APPROVAL_PROPOSAL.md`）。WP2-03 以後の製品のコードは始めていない。記録：`docs/design/phase-2/WP2-01_TYPES_AND_V4.md`、`WP2-02_BROKER.md`、`docs/reviews/PHASE_2_BATCH_1A_REPORT.md`。**未実行：** P1 と P2 を別の OS 利用者で動かす試験（E-2 の後）、Docker での P-5 の確認。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、A.I17 は明示的な Recovery に限る（Phase 2 で P-5）、M6 は必要が生じるまで、費用の台帳の集計の高速化は上限を上げる前。複数のホームの台帳の操作は WP2-08 |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
-| 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。Phase 1 の実装：`impl/phase-1-foundation`（Phase 1 の完了の時点は `92c18c4`。変えない）。**Phase 2：`impl/phase-2-evaluation`（`cfb31bf` から作成、2026-11-28、D15）**。タグ `phase-1-complete`（注釈付き、`92c18c4`）：手元で作成済み。**リモートへの Push はセッションの proxy に HTTP 403 で拒否された（再試行していない）。オーナーによる Push か作成が要る**。`main` は `d0b8635`（変えていない） |
-| 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
+| 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。Phase 1 の実装：`impl/phase-1-foundation`（Phase 1 の完了の時点は `92c18c4`。変えない）。**Phase 2：`impl/phase-2-evaluation`（`cfb31bf` から作成、2026-11-28、D15。WP2-01・02 を実装、D16）**。タグ `phase-1-complete`（注釈付き、`92c18c4`）：手元で作成済み。**リモートへの Push はセッションの proxy に HTTP 403 で拒否された（再試行していない）。オーナーによる Push か作成が要る**。`main` は `d0b8635`（変えていない） |
+| 禁止事項（変わらない） | 承認されていない WP の実装（WP2-03 以後）、Docker の起動、OS の利用者の作成、信頼しないコードの実行、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
 | 参照する資料 | `AGENTS.md`、`docs/decisions/OWNER_DECISIONS.md`、`docs/decisions/PHASE_1_APPROVAL.md`、`ROADMAP.md`、`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`docs/reviews/PHASE_0_REVIEW.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md`、`docs/reviews/CODEX_PHASE_0_AUDIT.md` |
 
 ## 2. 作業単位の進捗
@@ -82,6 +82,13 @@
   - 手元の環境（root）では `unshare -rn` が動いた。しかし、GitHub Actions の上で使えるかは確かめていないため、CI には入れていない（未確認）。
 - AUDIT-01：WP-09 で、Phase 1 の合成の範囲での実装と試験を記録した（`WP-09_SAFETY_COST.md` の8章）。WP-09 の限定修正で、必要額の入力が信頼できることも含めて、再検証した（14.8）。実 API での検証は含まない。AUDIT-02・04（Phase 3A まで）、AUDIT-03（削除の機能の前）、A-P6 は、それぞれの必須の条件のまま残っている。
 
+### 2.2 Phase 2 の進捗
+
+| WP | 状態 | 確かめたこと | 確かめていないこと |
+|---|---|---|---|
+| WP2-01 型・契約・評価の記録・Journal v4 | 実装と試験を完了（`9578626`、レビュー待ち）。記録は `docs/design/phase-2/WP2-01_TYPES_AND_V4.md` | 費用の確定の状態と有効性を別の属性にした記録（4つの区分は派生、二重の計上なし）、後からの照合、安全の違反を集計から消さないこと、客観的な成功と安全な完了の区別。Registry の凍結と変更の拒否、dev のタスクだけ、ハッシュの連鎖。Journal v4：Phase 1 の実際の Journal（`92c18c4`）の同一性、v3 と v4 の混在、版の逆行の拒否、未知の版の拒否、**実際の Phase 1 のプログラムによる v4 の拒否**、評価の Run の必須の provenance の欠けの拒否、Recovery、読み取りだけの状態の確認 | provenance の値を Agent のループが渡す経路（WP2-12）。複数のホームの台帳の操作（WP2-08） |
+| WP2-02 P2 Broker と SandboxPort（偽の Sandbox） | 実装と試験を完了（`dd332c8`、レビュー待ち）。記録は `docs/design/phase-2/WP2-02_BROKER.md` | 型付きの IPC（MAC、大きさ、種類、ID の照合）、`SO_PEERCRED`、Receipt ごとに1回の `start`（回収・再起動・応答の消失の後も）、P2 の実行の記録（実行の前に同期）、owner_epoch の高水位、記録が使えないときの拒否、停止の要求と確認の区別、P2 の期限による停止、別のプロセスと SIGKILL と再起動、Phase 1 のゲートの経路（Permit、Receipt、報告）、import の契約（S-5） | **P1 と P2 を別の OS 利用者で動かす試験（未実行、E-2 の後）**。Docker、実際のコンテナ、実際の時間の計測 |
+
 ## 3. オーナーの方針（2026-11-26）
 
 1. Agent Core は、オーナー自身が使うための、専用の AI の基盤である。
@@ -117,6 +124,6 @@
 - `main`：`d0b8635`（空の初期コミット `aa089ae` に、オーナーの例外の承認で `.github/workflows/ci.yml` の1ファイルだけを加えた。2026-11-27）。GitHub の既定のブランチ。
 - `docs/phase-0-design`：設計資料の作業ブランチ。Draft PR #1 で、`main` への変更として提案している。マージはしない。
 - `impl/phase-1-foundation`：Phase 1 の実装のブランチ。Phase 1 の承認の記録を含む、設計のコミットから作る。Phase 1 の正式な完了の時点は `92c18c4`。
-- `impl/phase-2-evaluation`：Phase 2 のブランチ（`cfb31bf` から作成、2026-11-28）。Phase 2 の変更はこのブランチだけに入れる。現時点では文書だけ。
+- `impl/phase-2-evaluation`：Phase 2 のブランチ（`cfb31bf` から作成、2026-11-28）。Phase 2 の変更はこのブランチだけに入れる。WP2-01（`9578626`）と WP2-02（`dd332c8`）を実装した。
 - タグ `phase-1-complete`：注釈付き、`92c18c4` を指す。手元だけ（リモートへの Push は proxy の HTTP 403 で拒否）。
 - holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：作っておらず、接続もしていない。
