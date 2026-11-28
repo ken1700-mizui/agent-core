@@ -1,6 +1,6 @@
 # 進捗状況（進捗の正本）
 
-> 文書の状態：**DRAFT**　最終更新：2026-11-28（Phase 2 の設計の案）
+> 文書の状態：**DRAFT**　最終更新：2026-11-28（Phase 2 の設計の修正・開始承認の準備。D15）
 >
 > この文書は、**進捗の正本**である（CP-6）。次のセッションでは、まずこの文書を読む。
 > - 予定の正本は `docs/design/phase-0/ROADMAP.md`。
@@ -11,10 +11,10 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 1：正式に完了（オーナーの最終承認、2026-11-28。D12〜D14）**。記録は `docs/decisions/PHASE_1_COMPLETION.md`。Technical Gate：PASS。Safety Gate：定められた保証の範囲の内で PASS。最終の CI で検証した SHA は `93435c82e06a168794cf68c6ecf1fc598815d426`（run `46082898611`、2340 件がすべて成功）。Codex の独立品質レビュー（`aae033a`）の判定は CONDITIONAL_PASS（別の結果として保持）。暫定の運用の上限を維持（D13）。包括的なセキュリティ監査は Phase 3A の終わり、Phase 3B の実 API の接続の前（D14）。**Phase 2 の開始は承認されていない** |
-| 次の作業 | オーナーの判断を待つ。**Phase 2 の開始は承認されていない。** Phase 2 の設計と開始の準備の案（DRAFT、2026-11-28）：`docs/design/phase-2/PHASE_2_START_READINESS.md`（開始の前の6つの事項への推奨、オーナーの判断の事項 O-1〜O-11）、`PHASE_2_IMPLEMENTATION_PLAN.md`（WP2-01〜15、信頼しないコードの実行の前の SG-1）、`PHASE_2_EVALUATION_CONTRACT.md`（D.V19 の記録の形式、A.I11 の Step の記録）、`PHASE_2_SANDBOX_DESIGN.md`（Docker の Sandbox、自己診断、P-4 の確定案と矛盾の修正）、`PHASE_2_AGENT_INSTRUCTIONS.md`（AI 向け、英語）。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、A.I17 は明示的な Recovery に限る（Phase 2 で P-5）、M6 は必要が生じるまで、費用の台帳の集計の高速化は上限を上げる前。Phase 3A の Gate を省略しない |
+| 今の段階 | **Phase 1：正式に完了（オーナーの最終承認、2026-11-28。D12〜D14）**。記録は `docs/decisions/PHASE_1_COMPLETION.md`。Technical Gate：PASS。Safety Gate：定められた保証の範囲の内で PASS。最終の CI で検証した SHA は `93435c82e06a168794cf68c6ecf1fc598815d426`（run `46082898611`、2340 件がすべて成功）。Codex の独立品質レビュー（`aae033a`）の判定は CONDITIONAL_PASS（別の結果として保持）。暫定の運用の上限を維持（D13）。包括的なセキュリティ監査は Phase 3A の終わり、Phase 3B の実 API の接続の前（D14）。**Phase 2：設計の修正を記録（DRAFT）。設計の方針の判断を D15 として記録（承認済み・条件付き・承認待ちを区別）。Phase 2 の製品のコードの開始（O-1）、修正した設計の最終の受入、Docker のデーモンの起動、信頼しないコードの実行は承認されていない** |
+| 次の作業 | オーナーと ChatGPT による、修正した Phase 2 の設計の審査と最終の受入の判断を待つ。その後、Batch 1（WP2-01〜04）の開始の承認（O-1）と、環境の操作 E-1〜E-6（`PHASE_2_SANDBOX_DESIGN.md` の11章）の個別の承認を待つ。**Phase 2 の製品のコードは始めていない。** 文書（DRAFT、2026-11-28 改訂）：`docs/design/phase-2/PHASE_2_START_READINESS.md`（9章：O-1〜O-11 の判断の状況）、`PHASE_2_IMPLEMENTATION_PLAN.md`（WP2-01〜15、2.5：Batch 1〜4 と SG-1）、`PHASE_2_EVALUATION_CONTRACT.md`（2.4：分類の規則と4つの費用、3.2：Journal v4 の3段階の来歴、7：複数のホームにまたがる予算、8：validation と holdout）、`PHASE_2_SANDBOX_DESIGN.md`（7：P-4 の最終の設計（P2 の外部の停止が主）、7.6：P1–P2 の IPC の契約、7.7：P-5 の 18 項目、11：環境の操作）、`PHASE_2_AGENT_INSTRUCTIONS.md`（AI 向け、英語）。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、A.I17 は明示的な Recovery に限る（Phase 2 で P-5）、M6 は必要が生じるまで、費用の台帳の集計の高速化は上限を上げる前。Phase 3A の Gate を省略しない |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
-| 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
+| 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。Phase 1 の実装：`impl/phase-1-foundation`（Phase 1 の完了の時点は `92c18c4`。変えない）。**Phase 2：`impl/phase-2-evaluation`（`cfb31bf` から作成、2026-11-28、D15）**。タグ `phase-1-complete`（注釈付き、`92c18c4`）：手元で作成済み。**リモートへの Push はセッションの proxy に HTTP 403 で拒否された（再試行していない）。オーナーによる Push か作成が要る**。`main` は `d0b8635`（変えていない） |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
 | 参照する資料 | `AGENTS.md`、`docs/decisions/OWNER_DECISIONS.md`、`docs/decisions/PHASE_1_APPROVAL.md`、`ROADMAP.md`、`E_INTEGRATION.md`、`RESOLUTION_MATRIX.md`、`PHASE_1_IMPLEMENTATION_PLAN.md`、`docs/adr/`、`docs/reviews/PHASE_0_REVIEW.md`、`docs/reviews/FINAL_AUDIT_CHECKLIST.md`、`docs/reviews/CODEX_PHASE_0_AUDIT.md` |
 
@@ -116,5 +116,7 @@
 
 - `main`：`d0b8635`（空の初期コミット `aa089ae` に、オーナーの例外の承認で `.github/workflows/ci.yml` の1ファイルだけを加えた。2026-11-27）。GitHub の既定のブランチ。
 - `docs/phase-0-design`：設計資料の作業ブランチ。Draft PR #1 で、`main` への変更として提案している。マージはしない。
-- `impl/phase-1-foundation`：Phase 1 の実装のブランチ。Phase 1 の承認の記録を含む、設計のコミットから作る。
+- `impl/phase-1-foundation`：Phase 1 の実装のブランチ。Phase 1 の承認の記録を含む、設計のコミットから作る。Phase 1 の正式な完了の時点は `92c18c4`。
+- `impl/phase-2-evaluation`：Phase 2 のブランチ（`cfb31bf` から作成、2026-11-28）。Phase 2 の変更はこのブランチだけに入れる。現時点では文書だけ。
+- タグ `phase-1-complete`：注釈付き、`92c18c4` を指す。手元だけ（リモートへの Push は proxy の HTTP 403 で拒否）。
 - holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：作っておらず、接続もしていない。

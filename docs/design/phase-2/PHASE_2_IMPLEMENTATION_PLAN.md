@@ -1,6 +1,8 @@
 # Phase 2 の実装計画（Work Package）
 
-> 文書の状態：**DRAFT**（設計案。オーナーの承認の前。実装は承認の後）　作成：2026-11-28
+> 文書の状態：**DRAFT**（全体の構成と WP2-01〜15 の分割はオーナーが受け入れる方針（2026-11-28、D15）。この改訂の最終の受入と、製品のコードの実装の開始は承認されていない）　作成：2026-11-28　改訂：2026-11-28（設計の審査 CONDITIONAL_PASS への対応、Batch の計画）
+>
+> - ブランチ：`impl/phase-2-evaluation`（`cfb31bf` から作成済み。Phase 2 の変更はこのブランチだけ）
 >
 > - Phase 2：無料の評価の基盤、コーディングエージェント v1、Baseline、統計、契約テスト（ROADMAP の Phase 2、0.1、0.2）。費用は $0（D1）。Fake Provider の上で完成させる。
 > - 関連：`PHASE_2_START_READINESS.md`（開始の条件と判断の事項）、`PHASE_2_EVALUATION_CONTRACT.md`（評価の契約）、`PHASE_2_SANDBOX_DESIGN.md`（Sandbox と P-4）、`PHASE_2_AGENT_INSTRUCTIONS.md`（実装する AI への指示、英語）。
@@ -16,18 +18,18 @@ WP2-01 型・契約・評価の記録の基盤
   │              └─ ◆SG-1：Sandbox の独立した安全性の確認 ＋ オーナーの承認（信頼しないコードの実行）
   │                   ├─ WP2-09 Sandbox のツールと Tool Selection
   │                   │    └─ WP2-10 Verification と修正のループ（Sandbox のテスト）
-  │                   └─ WP2-12 Benchmark Runner と客観的な採点（WP2-11 にも依存）
+  │                   └─ WP2-12 Benchmark Runner と客観的な採点（WP2-07、08、11 にも依存）
   ├─ WP2-05 Context Engine v1 ─────────────┐
   ├─ WP2-06 Planning Engine v1 ─────────────┤（SG-1 の確認の待ちと並べて進める。直列の実装）
   ├─ WP2-07 Statistics Engine とシミュレーション ┤
   ├─ WP2-08 Cost Engine（XTU、評価の予算） ──┘
-  └─ WP2-11 Task Catalog（dev、validation）
+  └─ WP2-11 Task Catalog（dev。validation は外部の接続口だけ）
 WP2-13 Baseline A・B と Fake のモデルの方針（WP2-05、06、09、10、12 に依存）→ ◆Baseline B の独立審査
 WP2-14 FeatureComparator と契約テスト（FakeMemory を含む）
 WP2-15 最終統合試験と Technical Gate・Safety Gate
 ```
 
-**実装の順序（推奨。1つずつ直列）：** WP2-01 → 02 → 03 → 04 →（SG-1 の確認を依頼）→ 05 → 06 → 07 → 08 → 11 →（SG-1 の合格とオーナーの承認）→ 09 → 10 → 12 → 13 →（Baseline B の独立審査）→ 14 → 15
+**実装の順序（推奨。1つずつ直列）：** WP2-01 → 02 → 03 → 04 →（SG-1 の確認を依頼）→ 05 → 06 → 07 → 08 → 11 →（SG-1 の合格とオーナーの承認）→ 09 → 10 →（Baseline B の設計の審査）→ 12 → 13 →（Baseline B の実装の後の審査）→ 14 → 15。承認の単位は 2.5 の Batch
 
 - **安全の順序：** 信頼しないコードを実行する WP（WP2-09 以後）は、WP2-02〜04 と SG-1（独立した確認とオーナーの承認）の**後**にだけ始める。WP2-03・04 の試験で Sandbox の中で動かすのは、**自分たちの固定の診断のプログラムと固定の試験の筋書きだけ**（信頼しないコードではない）。
 - 候補の順序（指示の 1〜13）からの変更：Context、Planning、統計、Cost、Task Catalog を SG-1 の前に置いた（Sandbox に依存せず、SG-1 の確認を待つ間に進められるため）。Task Catalog を Benchmark Runner の前にした（Runner の試験に要るため）。
@@ -57,17 +59,17 @@ WP2-15 最終統合試験と Technical Gate・Safety Gate
 | 項目 | 内容 |
 |---|---|
 | 目的 | C1 の2.1 のプロセスの分離（P1 と P2）を、Docker なしで先に作る |
-| 実装の範囲 | `agent_core_broker` のパッケージ（P2）、AF_UNIX の IPC（`SO_PEERCRED` の確認、型付きのメッセージ、Permit の消費の記録との結び付け）、`SandboxPort` の P1 の側の client、試験用の偽の Sandbox（決定的）、import の契約の変更（AF_UNIX の client だけ） |
+| 実装の範囲 | `agent_core_broker` のパッケージ（P2、別の OS 利用者）、AF_UNIX の IPC（Sandbox の設計の7.6 の契約：両側の `SO_PEERCRED`、要求の種類の限定、`request_id`・`attempt_id` の対応、`receipt_id` ごとに最大1回の `start`、古い `owner_epoch` の拒否、要求の MAC、大きさの上限）、`SandboxPort` の P1 の側の client、試験用の偽の Sandbox（決定的）、import の契約の変更（AF_UNIX の client だけ） |
 | 実装しない範囲 | Docker の操作、コードの実行 |
 | 依存 | WP2-01 |
 | 既存コードへの影響 | `pyproject.toml` の import の契約、CLI の起動（P2 を起動する方法。オーナーの承認） |
 | 新しいインターフェース | `SandboxPort.prepare / start / status / stop(grace_ms) / collect / reap` |
-| 試験の計画 | IPC の相手の確認（別の UID を拒否）、Permit のない要求の拒否、AF_INET を開こうとすると失敗、P2 の異常終了の後の P1 の安全側の動作 |
+| 試験の計画 | IPC の契約の各項目（P-5 の G）、Receipt の MAC のない `start` の拒否、AF_INET を開こうとすると失敗、P2 が止まったときに新しい実行が拒否される（P-5 の D） |
 | 受入の条件 | 偽の Sandbox で、Phase 1 のゲートの経路（Permit、Receipt、報告）が P2 を通って動く |
 | 安全の条件 | P1 は Docker の API を持たない。P2 は Journal に書かない |
 | ロールバックの条件 | import の契約の変更が承認されない場合は、この WP を止める |
 | 保守性 | IPC のメッセージの型は1か所。P2 は小さく保つ |
-| 必要な承認 | import の契約の変更（Sandbox の設計の S-5）、P1 と P2 の OS 利用者（S-6） |
+| 必要な承認 | import の契約の変更（S-5、承認待ち）。P1 と P2 の OS 利用者は別（S-6、承認済み D15）。P2 の起動の方法（7.4.1 の条件） |
 | 変更予定のファイル | `src/agent_core_broker/`（新）、`src/agent_core/adapters/broker_client.py`（新）、`pyproject.toml`、`tests/unit/test_wp2_02_*.py` |
 
 ### WP2-03 Docker の Sandbox
@@ -93,22 +95,22 @@ WP2-15 最終統合試験と Technical Gate・Safety Gate
 | 項目 | 内容 |
 |---|---|
 | 目的 | 信頼しないコードを止める仕組み（D11、P-4 の確定案） |
-| 実装の範囲 | P1 の監視（期限の検査、停止の要求、停止の確認、生存の記録の1行）、P2 の期限の停止、PID 1 の監督、再起動の後の回収と OUTCOME_UNKNOWN |
+| 実装の範囲 | **P2 の外からの期限の停止（主な強制）**、P1 の監視（期限の検査、停止の要求、停止の確認、生存の記録の1行。古い `owner_epoch` と別の監視の実行の ID を信じない）、補助の PID 1 の監督（保護の根拠にしない）、再起動の後の回収と OUTCOME_UNKNOWN（Sandbox の設計の7章） |
 | 実装しない範囲 | Process Supervisor（Phase 3A）、監視による承認・解放・確定・再実行 |
 | 依存 | WP2-03、オーナーの承認（P-4、値） |
 | 既存コードへの影響 | `runtime/recovery.py`（期限の昇格を監視から呼ぶ。新しい遷移は作らない）、台帳（生存の記録の行。形式の変更と互換性の試験） |
 | 新しいインターフェース | `Monitor.tick(now)`（状態を持たず、記録から計算） |
-| 試験の計画 | P-4 の5章の10項目 ＋ Sandbox の設計の7.4 の A・B・C |
-| 受入の条件 | 13項目がすべて成功。保証しない範囲（Sandbox の設計の7.6）を文書に残す |
+| 試験の計画 | P-5 の **18項目**（既存の13項目 ＋ D〜H。Sandbox の設計の7.7） |
+| 受入の条件 | 18項目がすべて成功（条件に合う環境で）。障害ごとの保証の表（7.4）の各項目を「試験で確認」か「保証しない」に更新し、確かめていないものを保証済みと記録しない |
 | 安全の条件 | 停止の確認までは保留を維持し、新しい Permit を出さない |
 | ロールバックの条件 | どれかの試験に落ちたら、SG-1 に進まない |
 | 保守性 | 監視は1つの小さなモジュール。時計と Sandbox は接続口で受け取る |
-| 必要な承認 | P-4 の方針（S-1）、値（S-2） |
+| 必要な承認 | P-4 の最終の受入（基本の方針は承認済み D15）。値は試験用の候補（D15） |
 | 変更予定のファイル | `src/agent_core/runtime/monitor.py`（新）、`runtime/recovery.py`、`adapters/sqlite_ledger.py`（生存の記録）、`src/agent_core_broker/deadline.py`（新）、`tests/sandbox/test_p5_*.py` |
 
 ### ◆SG-1：Sandbox の独立した安全性の確認（WP2-04 の後、WP2-09 の前）
 
-- C1 の12.2 のうち Sandbox に関わる試験（脱出を想定した隔離、子プロセスの残り、資源の上限、設定の不備、ファイルの境界、緊急停止）と、P-5 の13項目を、**AppArmor か SELinux のある条件に合う環境**で実行する（Sandbox の設計の S-4）。
+- C1 の12.2 のうち Sandbox に関わる試験（脱出を想定した隔離、子プロセスの残り、資源の上限、設定の不備、ファイルの境界、緊急停止）と、P-5 の18項目を、**AppArmor か SELinux のある条件に合う環境**で実行する（Sandbox の設計の S-4）。
 - 開発者と独立した確認（D14：Phase 2 で信頼しないコードを実行する前に、Sandbox に関する独立した安全性の確認を別に行う）。
 - オーナーが、信頼しないコードの実行の開始を承認する。
 
@@ -171,17 +173,17 @@ WP2-15 最終統合試験と Technical Gate・Safety Gate
 | 項目 | 内容 |
 |---|---|
 | 目的 | 評価で使う XTU の予算と、予算の階層の試験（ROADMAP の Technical Gate） |
-| 実装の範囲 | 実験と試行の予算の範囲、無効な試行の費用の計上、BillingScheme のフィクスチャ、金銭以外の上限と合計、打ち切りの処理（D の12.2）、0 の扱い（12.3） |
+| 実装の範囲 | 実験と試行の予算の範囲、試行ごとのイベントの上限（`trial_event_cap`）、費用の4区分（確定、結果不明の保留、無効な試行、やり直し）、**ホームをまたぐ予算の記録**（締め、開始、引き継ぎの保留、調整。評価の契約の7章）、BillingScheme のフィクスチャ、金銭以外の上限と合計、打ち切りの処理（D の12.2）、0 の扱い（12.3） |
 | 実装しない範囲 | 実際の価格表（3A）、独立した台帳（3A）、`_totals` の高速化（上限を上げる前。D13） |
 | 依存 | WP2-01 |
 | 既存コードへの影響 | `cost/rules.py`、`adapters/sqlite_ledger.py`（新しい範囲の種類。形式の変更なら互換性の試験） |
 | 新しいインターフェース | 実験と試行の範囲（`BudgetScopeType` の追加の候補） |
-| 試験の計画 | D の16.1 の費用の試験（予約の階層、状態遷移、BillingScheme、整数の計算、金銭以外の上限、照合、打ち切り、0） |
+| 試験の計画 | D の16.1 の費用の試験（予約の階層、状態遷移、BillingScheme、整数の計算、金銭以外の上限、照合、打ち切り、0）。ホームの切り替えで上限が増えない、保留が残る、調整が1回だけ、締めと開始の間の異常終了、後継の重複の拒否、以前の版の DB を開ける |
 | 受入の条件 | 各試験の合格の目安（D の16.1） |
 | 安全の条件 | 試験用の価格表を本番のモードで使わない（D.V14） |
 | ロールバックの条件 | Phase 1 の費用の試験が変わる場合 |
 | 保守性 | 費用の規則は `cost/` に、保存は台帳に |
-| 必要な承認 | 台帳の形式の変更があれば |
+| 必要な承認 | 台帳の形式の変更（新しい操作と範囲。承認待ち） |
 | 変更予定のファイル | `src/agent_core/cost/`、`adapters/sqlite_ledger.py`、`types/cost.py`、`tests/unit/test_wp2_08_*.py` |
 
 ### WP2-09 Sandbox のツールと Tool Selection（**SG-1 の後**）
@@ -220,13 +222,13 @@ WP2-15 最終統合試験と Technical Gate・Safety Gate
 | 必要な承認 | なし |
 | 変更予定のファイル | `src/agent_core/runtime/verification.py`、`runtime/agent_loop.py`、`tests/sandbox/test_wp2_10_*.py` |
 
-### WP2-11 Task Catalog（dev と validation）
+### WP2-11 Task Catalog（dev と、validation の接続口）
 
 | 項目 | 内容 |
 |---|---|
 | 目的 | 評価に使う合成のタスクと小さなリポジトリ（D の5章、6章） |
-| 実装の範囲 | TaskSpec の形のタスク（最初は 20〜50 件。統計の検出力の保証には使わない）、始めの作業ツリー、隠しテスト、`provenance`、`contamination_notes`、版、分割（dev、validation）、`grader_version` |
-| 実装しない範囲 | holdout（D3）、実データ |
+| 実装の範囲 | **dev のタスクだけ**（Claude Code が案を作り、オーナーが承認して固定。最初は 20〜50 件。統計の検出力の保証には使わない）、始めの作業ツリー、dev の隠しテスト、`provenance`、`contamination_notes`、版、`grader_version`。validation のための**接続口だけ**（`TaskSource`：開発のリポジトリの外の場所から、評価の担当がタスクと採点の束を読ませる）と、公開してよい型と合成の試験のフィクスチャ |
+| 実装しない範囲 | validation の本体と隠しテスト（**開発のリポジトリに置かない**。オーナーか独立した担当が別の場所で作り管理する）、holdout（D3）、実データ |
 | 依存 | WP2-01 |
 | 既存コードへの影響 | Phase 1 の `SyntheticTaskDefinition` と Policy の `trusted_synthetic_tasks`（P-6）を、Task Catalog の参照に広げる |
 | 新しいインターフェース | `TaskCatalog.load(split, version)` |
@@ -235,20 +237,20 @@ WP2-15 最終統合試験と Technical Gate・Safety Gate
 | 安全の条件 | タスクの集合と採点のプログラムは AI が変えられない（D.V8）。変更はオーナーの承認と新しい版 |
 | ロールバックの条件 | 分割の重複が見つかった場合 |
 | 保守性 | タスクはデータとして置き、コードと分ける |
-| 必要な承認 | タスクの作り方（O-7）、集合の固定 |
-| 変更予定のファイル | `eval/tasks/dev/`、`eval/tasks/validation/`（新）、`src/agent_core/evaluation/catalog.py`（新） |
+| 必要な承認 | タスクの作り方（O-7、承認済み D15）、dev の集合の固定（オーナー） |
+| 変更予定のファイル | `eval/tasks/dev/`（新）、`src/agent_core/evaluation/catalog.py`、`task_source.py`（新）、`tests/fixtures/eval/`（合成の試験用。validation の内容ではない） |
 
 ### WP2-12 Benchmark Runner と客観的な採点
 
 | 項目 | 内容 |
 |---|---|
 | 目的 | 登録 → 実行 → 採点 → 記録の流れ（D の2章、7章、13章） |
-| 実装の範囲 | 無作為の順番とブロック、乱数の種の記録、試行ごとの新しい Run、別の採点用の Sandbox での隠しテスト、TrialRecord と ScoreRecord、無効な試行のやり直し（2 回まで）、評価のホームの区切り（評価の契約の7章） |
+| 実装の範囲 | 無作為の順番とブロック、乱数の種の記録、試行ごとの新しい Run、別の採点用の Sandbox での隠しテスト、TrialRecord と ScoreRecord（2.4 の分類の規則、費用の4区分）、無効な試行のやり直し（2 回まで）、ホームの連鎖（評価の契約の7章。WP2-08 の台帳の操作を使う）、外部のタスクの元（`TaskSource`）からの実行と集計だけの返却（validation） |
 | 実装しない範囲 | holdout、評価の側の別のホスト（3A）、AI による採点 |
-| 依存 | WP2-10、WP2-11、WP2-07、WP2-08 |
+| 依存 | WP2-10、WP2-11、WP2-07、WP2-08（ホームをまたぐ予算） |
 | 既存コードへの影響 | CLI に評価の命令を加える（承認） |
 | 新しいインターフェース | `BenchmarkRunner.run(experiment_spec)` |
-| 試験の計画 | 再現性（同じ仕様と種で同じ結果、D の16.1）、分類の規則（Agent の障害を `INVALID_ENV` にしない、D の16.2）、ホームの区切りでイベントが消えない |
+| 試験の計画 | 再現性（同じ仕様と種で同じ結果、D の16.1）、分類の規則（Agent の障害を `INVALID_ENV` にしない、違反のある試行が安全の集計から消えない、結果不明の費用を 0 にしない、D の16.2）、ホームの連鎖でイベントも保留も消えない、実験の上限が増えない |
 | 受入の条件 | D の16.1・16.2 の Runner に関わる試験の合格 |
 | 安全の条件 | Agent は採点と分類に触れない |
 | ロールバックの条件 | 分類の誤りが見つかった場合 |
@@ -310,13 +312,29 @@ WP2-15 最終統合試験と Technical Gate・Safety Gate
 | 必要な承認 | CI の実行、Phase 2 の完了 |
 | 変更予定のファイル | `tests/integration/`、文書 |
 
+## 2.5 Batch による承認の単位（改訂）
+
+依存関係を確かめた結果、提案の4つの Batch の中の順序を次のとおりにする。Batch の中の WP は直列に実装し、WP ごとに試験を先に書き、WP ごとにコミットする。
+
+| Batch | WP（順序） | 開始の条件 | 停止の条件（どれかに当たれば止めて報告） | 承認の事項 | 品質の検査 |
+|---|---|---|---|---|---|
+| **Batch 1**：型、契約、Broker、Sandbox、安全の条件 | WP2-01 → 02 → 03 → 04 | オーナーの Batch 1 の承認。import の契約の変更（S-5）の承認。環境の操作 E-1〜E-4（Sandbox の設計の11章）の承認（WP2-03 の前） | 既存の 2340 件のどれかが落ちる。v3 の Journal の同一性が変わる。自己診断の条件を満たせない（条件を下げない）。P-5 の18項目のどれかが条件に合う環境で落ちる | Batch 1 の開始、S-5、E-1〜E-4、P2 の起動の方法 | 8種類の検査（`sandbox` の印を除く既存の手順）＋ `sandbox` の試験を Docker の動く環境で実行（実行していないものを成功に数えない） |
+| **SG-1**（Batch 1 の後） | — | Batch 1 の完了 | 独立した確認で不合格 | 担当と環境（E-5、E-6）、確認の結果の受入、**信頼しないコードの実行の開始** | C1 の12.2 の Sandbox の試験と P-5 の18項目を、AppArmor か SELinux のある環境で |
+| **Batch 2**：Context、Planning、統計、費用、Task Catalog（**SG-1 の確認と並べて進める**） | WP2-05 → 06 → 07 → 08 → 11 | Batch 1 の完了（WP2-01 の型を使う）。Sandbox の中の実行を要しない | 既存の試験が落ちる。統計のシミュレーションが D の16.1 の範囲を満たさない（統計を直す）。台帳の形式の変更で以前の版の DB を開けない | Batch 2 の開始、台帳の形式の変更（WP2-08）、dev のタスクの集合の固定 | 8種類の検査。シミュレーションの試験（時間の長い印）を別に実行 |
+| **Batch 3**：Sandbox のツール、検証、Runner、Baseline（**SG-1 の合格とオーナーの承認の後**） | WP2-09 → 10 → 12 → 13 | SG-1 の合格、信頼しないコードの実行の承認、Batch 2 の完了、承認済みの安全の条件を満たす環境（S-4） | Sandbox の自己診断の失敗の後にツールが拒否されない。分類の規則の誤り。Baseline B を意図的に弱くする変更 | Batch 3 の開始、CLI の評価の命令、Baseline B の構成の案 | 8種類の検査 ＋ `sandbox` の試験（条件に合う環境） |
+| **Batch 4**：Baseline B の独立審査、FeatureComparator、最終統合 | Baseline B の独立審査（実装の後の2回目）→ WP2-14 → 15 | Batch 3 の完了。Baseline B の設計の段階の審査（1回目）は Batch 3 の WP2-13 の前に行う | 独立審査で妥当でない。Gate に落ちる | 審査の結果の受入、CI の実行、Phase 2 の完了 | 全試験の連続2回、一般の利用者、特権、`sandbox`、ネットワークのない環境、CI |
+
+- **SG-1 の確認中に進められる WP：** Batch 2 のすべて（Sandbox の中の実行に依らない）。Batch 3 は SG-1 の合格まで始めない。
+- **Baseline B の独立審査（O-11）：** 1回目は WP2-13 の設計の段階（Batch 3 の WP2-13 の前、構成の案）、2回目は実装の後（Batch 4 の最初）。Baseline B を意図的に弱くしない。
+- **既定の品質の検査と `sandbox` の試験：** Docker を要する試験は `sandbox` の印にし、Docker のない環境では `SANDBOX_NOT_RUN` で失敗させる（スキップしない）。既定の8種類の検査は `-m "not sandbox"` で実行し、`sandbox` の試験は Docker の動く環境で別に実行して、両方の結果を報告する。実行していない試験を成功に数えない。
+
 ## 3. Phase 2 の完了の条件（ROADMAP の Phase 2）
 
 1. **Technical Gate：**
    - 統計のシミュレーション（偽陽性の率、被覆率、検出力）の合格（D の16.1）。
    - 予算の階層の試験の合格。
    - **コーディングエージェント v1 の完成の条件**：0.1 の「Phase 2」の欄の機能が、すべて試験に合格（Context v1、Planning v1、Tool Selection、Sandbox の中のシェル、Verification と修正、Baseline B、評価の対象の構成の組み立て、Cost Engine）。
-2. **Safety Gate：** C1 の12.2 のうち Sandbox に関わる試験の合格、P-5 の13項目の合格、SG-1 の独立した確認。
+2. **Safety Gate：** C1 の12.2 のうち Sandbox に関わる試験の合格、P-5 の18項目の合格、SG-1 の独立した確認。
 3. **オーナーの承認：** Baseline B の構成の確認（独立審査を含む）。
 4. **品質：** 既存の 2340 件を含む全試験の成功、8種類の検査、CI。
 5. **主張しないこと：** Fake の上の結果を、実モデルでの性能の向上としない。Docker の標準の機能で完全な隔離が得られたとしない。

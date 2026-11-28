@@ -1,6 +1,6 @@
 # Phase 2 implementation instructions for AI agents
 
-> Status: **DRAFT** — not approved. Phase 2 implementation has **not** started and
+> Status: **DRAFT** (revised 2026-11-28 after the owner's CONDITIONAL_PASS review) — not approved. Phase 2 implementation has **not** started and
 > must not start until the owner approves it (see `PHASE_2_START_READINESS.md`, O-1).
 > Human-facing design: `PHASE_2_IMPLEMENTATION_PLAN.md`, `PHASE_2_EVALUATION_CONTRACT.md`,
 > `PHASE_2_SANDBOX_DESIGN.md` (Japanese). `AGENTS.md` still applies in full.
@@ -8,9 +8,9 @@
 ## 1. Scope and order
 
 1. Implement only the work packages the owner's current instruction authorizes
-   (WP2-01 to WP2-15), on the Phase 2 branch the owner approves
-   (proposed: `impl/phase-2-evaluation`, from `92c18c4`). Never change
-   `impl/phase-1-foundation` (the Phase 1 completion point) or `main`.
+   (WP2-01 to WP2-15, approved in Batches; see `PHASE_2_IMPLEMENTATION_PLAN.md`
+   section 2.5), on `impl/phase-2-evaluation` (created from `cfb31bf`). Never
+   change `impl/phase-1-foundation`, the `phase-1-complete` tag (`92c18c4`) or `main`.
 2. Follow the dependency order in `PHASE_2_IMPLEMENTATION_PLAN.md` section 1.
    **No work package may execute untrusted code** (anything a model, a task or a
    test fixture under evaluation produces) before WP2-02 to WP2-04 are done,
@@ -36,14 +36,33 @@
 4. Do not run untrusted code on a host without AppArmor/SELinux unless the owner
    explicitly decides otherwise (S-4).
 5. Unknown outcomes stay `OUTCOME_UNKNOWN`, keep their cost hold and are never
-   retried automatically. A stop request is not a confirmed stop.
-6. Never claim complete isolation from standard Docker features, and never
-   report Fake-provider results as real-model performance gains.
+   retried automatically. A stop request is not a confirmed stop; an operation
+   whose stop cannot be confirmed is `OUTCOME_UNKNOWN` with its hold kept.
+6. Time limits: P2's external stop (deadline held by P2 and in container labels,
+   independent of P1) is the primary enforcement; P1's monitor checks and
+   records; the in-container PID 1 supervisor is auxiliary only and is never
+   claimed as protected against untrusted code. If P2 is unavailable, refuse new
+   executions; do not claim that running ones stop.
+7. Liveness record: one overwritten ledger row; never trust a record with an
+   older `owner_epoch`, another monitor instance id, a stale time, or no row.
+8. P1-P2 IPC (`PHASE_2_SANDBOX_DESIGN.md` 7.6): `SO_PEERCRED` on both sides,
+   fixed request kinds, `request_id`/`attempt_id` correlation, at most one
+   `start` per `receipt_id` (container labels are the durable record), reject
+   requests with an older `owner_epoch`, MAC over the start request, size limits,
+   no secrets or file contents. P1 and P2 run as different OS users.
+9. Do not record a design guarantee as verified until a test in a conforming
+   environment shows it.
+10. Never claim complete isolation from standard Docker features, and never
+    report Fake-provider results as real-model performance gains. Never make
+    Baseline B deliberately weak.
 
 ## 3. Evaluation integrity
 
 1. Never change task sets, graders, scoring rules, analysis plans, margins or
    the holdout. Never read, create or connect the holdout repository (D3).
+   The development repository is public: it holds only dev tasks, public types
+   and synthetic test fixtures. Never write validation tasks or hidden
+   validation tests into it, and never connect to the validation location.
 2. Use the `task_outcome` values of D 7.1 unchanged; record safety separately
    (`violations`, `blocked_attempts`). Extension fields only as approved (O-3).
 3. The agent under evaluation never writes evaluation records, never classifies
@@ -51,7 +70,18 @@
    sandbox after the agent's run.
 4. Freeze an `ExperimentSpec` (`spec_hash`) before running it; refuse changes after.
 5. Record identifiers and hashes, never prompt bodies, file contents, model
-   output bodies or credentials (A.I11).
+   output bodies or credentials (A.I11). Journal v4 provenance: record values
+   only at the transition where they become final (Step creation, `CONTENT_FIXED`,
+   outcome transitions); never pre-record future values; never rewrite past
+   events; v3 events stay readable and their hashes unchanged.
+6. Record task outcome and safety separately; a safety violation stays in the
+   safety aggregate even when the trial is `INVALID_ENV`; never count an
+   unknown cost as settled zero; never classify an agent failure as
+   `INVALID_ENV`; track settled, held-unknown, invalid-trial and retry costs
+   separately. Classification rules are frozen in the `spec_hash`.
+7. Multi-home experiments: budgets and holds carry over through signed
+   closing/opening ledger records; switching homes never raises the experiment
+   cap or releases a hold; reconcile carried holds in their original home.
 
 ## 4. Compatibility and quality
 
@@ -63,7 +93,9 @@
    the Benchmark Runner splits work across homes instead of deleting or
    truncating any journal.
 4. Tests that need Docker use the `sandbox` marker and fail (never skip) as
-   `SANDBOX_NOT_RUN` where Docker is unavailable.
+   `SANDBOX_NOT_RUN` where Docker is unavailable. Run the default checks with
+   `-m "not sandbox"` and the sandbox suite separately in an environment with
+   Docker; report both; never count an unrun test as passed.
 5. No new dependency without an ADR and the owner's approval. Statistics use the
    standard library unless the owner approves otherwise (O-6).
 6. Run the eight quality checks before every commit; one work package per
