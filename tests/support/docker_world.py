@@ -55,6 +55,10 @@ def broker(directory: Path, *, clock: Any = None, backend: DockerSandbox | None 
         instance_id=b.new_id(BrokerInstanceId),
         clock=clock if clock is not None else bw.ManualMonotonic(),
         allowed_profiles=frozenset({PROFILE.profile_hash()}),
+        # This dev environment has no cgroup v2 and no systemd, so no Deadline
+        # Supervisor: only the fixed diagnostics run here (D17, D20). Not SG-1.
+        supervisor=None,
+        diagnostics_without_supervisor=True,
     )
 
 

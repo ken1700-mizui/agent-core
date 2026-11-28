@@ -83,6 +83,7 @@ def _broker(directory: Path, *, p1_uid: int = bw.UID) -> Iterator[subprocess.Pop
             str(directory / "exec.log"),
             "--key-file",
             str(directory / "broker.key"),
+            "--diagnostics-without-supervisor",  # dev mode (no DS here, D20)
             "--p1-uid",
             str(p1_uid),
             "--profile",
@@ -206,6 +207,7 @@ def test_only_one_broker_serves_a_socket() -> None:
                     str(d / "exec.log"),
                     "--key-file",
                     str(d / "broker.key"),
+                    "--diagnostics-without-supervisor",  # dev mode (no DS here, D20)
                     "--p1-uid",
                     str(bw.UID),
                 ],

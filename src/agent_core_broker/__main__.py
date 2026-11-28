@@ -59,6 +59,13 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--image-id", default="")
     serve.add_argument("--staging", type=Path, default=None)
     serve.add_argument("--docker-socket", type=Path, default=Path("/var/run/docker.sock"))
+    # S-R01 (D20): the Deadline Supervisor. Without it every start is refused,
+    # unless --diagnostics-without-supervisor names the dev environment's
+    # fixed-diagnostics mode (D17): never a formal path, never untrusted code.
+    serve.add_argument("--supervisor-socket", type=Path, default=None)
+    serve.add_argument("--supervisor-key-file", type=Path, default=None)
+    serve.add_argument("--supervisor-uid", type=int, default=None)
+    serve.add_argument("--diagnostics-without-supervisor", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "init":
         ExecutionRecord.create(args.record, _key(args.key_file)).close()
@@ -78,6 +85,17 @@ def main(argv: list[str] | None = None) -> int:
             f"self-diagnosis {sorted(k for k, v in diagnosis.checks.items() if not v)}", flush=True
         )
         backend, profiles = docker, frozenset({profile.profile_hash()})
+    supervisor = None
+    if args.supervisor_socket is not None:
+        if args.supervisor_key_file is None or args.supervisor_uid is None:
+            raise SystemExit("the supervisor needs --supervisor-key-file and --supervisor-uid")
+        from agent_core_supervisor.client import SupervisorClient, unix_connector
+
+        supervisor = SupervisorClient(
+            connector=unix_connector(args.supervisor_socket),
+            key=_key(args.supervisor_key_file).reveal(),
+            ds_uid=args.supervisor_uid,
+        )
     broker = Broker.open(
         record_path=args.record,
         sandbox=backend,
@@ -86,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
         instance_id=_instance(),
         clock=SystemMonotonic(),
         allowed_profiles=profiles,
+        supervisor=supervisor,
+        diagnostics_without_supervisor=args.diagnostics_without_supervisor,
     )
     if broker.record_error is None:
         for line in broker.recover_backend():

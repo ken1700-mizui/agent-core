@@ -63,7 +63,10 @@ from agent_core.types.sandbox import (
     StopRequest,
     StopResult,
 )
+from agent_core.types.supervisor import DsHealth, Registration
 from agent_core_broker.record import ExecutionRecord, ExecutionRecordError
+from agent_core_supervisor.client import DsUnavailableError, SupervisorPort
+from agent_core_supervisor.supervisor import DsRefusedError
 
 _PEERCRED = struct.Struct("3i")
 CONNECTION_TIMEOUT_S = 5.0
@@ -148,8 +151,16 @@ class Broker:
         instance_id: BrokerInstanceId,
         clock: Monotonic,
         allowed_profiles: frozenset[str],
+        supervisor: SupervisorPort | None,
+        diagnostics_without_supervisor: bool = False,
         boot: BootClock = system_boot_clock,
     ) -> None:
+        # S-R01 (D20): every start is registered with the Deadline Supervisor
+        # first. Without one, nothing starts, unless this broker was explicitly
+        # opened for the dev environment's fixed diagnostics (D17): never a
+        # formal path, never untrusted code.
+        self._supervisor = supervisor
+        self._diagnostics_only = diagnostics_without_supervisor
         self._boot = boot
         self._record = record
         self._opened = record  # closed by ``close`` even after the record broke
@@ -175,6 +186,8 @@ class Broker:
         instance_id: BrokerInstanceId,
         clock: Monotonic,
         allowed_profiles: frozenset[str],
+        supervisor: SupervisorPort | None,
+        diagnostics_without_supervisor: bool = False,
         boot: BootClock = system_boot_clock,
     ) -> Broker:
         """A broker whose record cannot be opened (missing, broken, held by another
@@ -193,6 +206,8 @@ class Broker:
             instance_id=instance_id,
             clock=clock,
             allowed_profiles=allowed_profiles,
+            supervisor=supervisor,
+            diagnostics_without_supervisor=diagnostics_without_supervisor,
             boot=boot,
         )
 
@@ -240,6 +255,7 @@ class Broker:
                 if running:
                     self.sandbox.stop(receipt, 0)
                 self.sandbox.reap(receipt)
+                self._release(receipt)
                 done.append(f"reaped {receipt} ({state.value})")
         return done
 
@@ -376,6 +392,7 @@ class Broker:
         boot = self._boot_now()
         if boot is None:
             raise _RefusedError(ipc.RefusalCode.DEADLINE_UNAVAILABLE)  # before acceptance
+        self._supervise(body)  # before acceptance: a refusal is "not run"
         record.accept(  # synced before the run
             body,
             started_ms=self._clock.monotonic_ms(),
@@ -388,6 +405,7 @@ class Broker:
         try:
             containment = self.sandbox.start(body.receipt_id, body.program_ref, body.deadline_ms)
             record.update(body.receipt_id, containment=containment.value)
+            self._report_started(body.receipt_id, record)
             state = self._observe(body.receipt_id, record)
         except Exception as exc:
             with contextlib.suppress(ExecutionRecordError):  # best effort; the reply says it
@@ -402,6 +420,51 @@ class Broker:
             status=StartStatus.STARTED,
             state=state,
         )
+
+    def _supervise(self, body: StartRequest) -> None:
+        """Register with the Deadline Supervisor and confirm the start (S-R01).
+        Any refusal or failure here is DEADLINE_UNAVAILABLE: nothing started."""
+        ds = self._supervisor
+        if ds is None:
+            if not self._diagnostics_only:
+                raise _RefusedError(ipc.RefusalCode.DEADLINE_UNAVAILABLE)
+            return
+        target_of = getattr(self.sandbox, "target_of", None)
+        if target_of is None:
+            raise _RefusedError(ipc.RefusalCode.DEADLINE_UNAVAILABLE)  # no supervised target
+        try:
+            if ds.status().health is not DsHealth.OK:
+                raise _RefusedError(ipc.RefusalCode.DEADLINE_UNAVAILABLE)
+            ds.register(
+                Registration(
+                    receipt_id=body.receipt_id,
+                    attempt_id=body.attempt_id,
+                    target=target_of(body.receipt_id),
+                    deadline_ms=body.deadline_ms,
+                    grace_ms=body.grace_ms,
+                    p2_instance=self._instance,
+                )
+            )
+            ds.confirm_start(body.receipt_id)
+        except (DsRefusedError, DsUnavailableError, ValueError) as exc:
+            raise _RefusedError(ipc.RefusalCode.DEADLINE_UNAVAILABLE) from exc
+
+    def _report_started(self, receipt_id: ReceiptId, record: ExecutionRecord) -> None:
+        """After the start: a failed report changes nothing (the supervisor
+        enforces the registered deadline either way); it is recorded."""
+        if self._supervisor is None:
+            record.update(receipt_id, supervised="dev-diagnostics-without-supervisor")
+            return
+        try:
+            self._supervisor.started(receipt_id)
+        except (DsRefusedError, DsUnavailableError) as exc:
+            record.update(receipt_id, supervisor_report=type(exc).__name__)
+
+    def _release(self, receipt_id: ReceiptId) -> None:
+        if self._supervisor is None:
+            return
+        with contextlib.suppress(DsRefusedError, DsUnavailableError):
+            self._supervisor.release(receipt_id)  # if refused, it stays enforced
 
     def _observe(self, receipt_id: ReceiptId, record: ExecutionRecord) -> SandboxState:
         """The record's state, completed with what the live backend reports."""
@@ -490,6 +553,7 @@ class Broker:
         if state is not SandboxState.REAPED:
             self.sandbox.reap(body.receipt_id)
             record.reaped(body.receipt_id)
+            self._release(body.receipt_id)
         return ReapResult(
             request_id=body.request_id, attempt_id=body.attempt_id, state=SandboxState.REAPED
         )

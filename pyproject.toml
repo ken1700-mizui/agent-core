@@ -98,7 +98,7 @@ warn_required_dynamic_aliases = true
 [tool.importlinter]
 # WP-10: the CLI (agent_core_cli) is the composition root, outside agent_core.
 # WP2-02: the P2 broker (agent_core_broker) is a separate process and package.
-root_packages = ["agent_core", "agent_core_cli", "agent_core_broker"]
+root_packages = ["agent_core", "agent_core_cli", "agent_core_broker", "agent_core_supervisor"]
 include_external_packages = true
 
 [[tool.importlinter.contracts]]
@@ -174,6 +174,29 @@ source_modules = [
     "agent_core_cli",
 ]
 forbidden_modules = ["agent_core.adapters.sqlite_results", "agent_core.ports.evaluation"]
+
+[[tool.importlinter.contracts]]
+id = "deadline-supervisor-has-no-authority"
+name = "S-R01 (D20): the Deadline Supervisor has no approval, Permit, cost, journal, retry or Docker path; P1 never talks to it"
+type = "forbidden"
+source_modules = ["agent_core_supervisor"]
+forbidden_modules = [
+    "agent_core.runtime",
+    "agent_core.adapters",
+    "agent_core.safety",
+    "agent_core.cost",
+    "agent_core.identity",
+    "agent_core.tool",
+    "agent_core_broker",
+    "agent_core_cli",
+]
+
+[[tool.importlinter.contracts]]
+id = "p1-does-not-talk-to-the-deadline-supervisor"
+name = "S-R01 (D20): only P2 talks to the Deadline Supervisor"
+type = "forbidden"
+source_modules = ["agent_core.**", "agent_core_cli"]
+forbidden_modules = ["agent_core_supervisor"]
 
 [[tool.importlinter.contracts]]
 id = "p1-does-not-run-p2"

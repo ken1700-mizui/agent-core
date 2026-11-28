@@ -166,7 +166,8 @@ def test_a_partial_last_line_is_cut_off_and_nothing_else_changes(tmp_path: Path)
 def test_a_failed_write_or_fsync_refuses_the_start_and_nothing_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    broker = bw.make_broker(tmp_path)
+    # The supervisor's record is kept in memory: the fault is P2's record only.
+    broker = bw.make_broker(tmp_path, supervisor="memory")
     client = bw.make_client(broker)
     client.start(bw.start_request())  # epoch entry written already
     start = bw.start_request()
@@ -191,7 +192,7 @@ def test_after_an_fsync_failure_a_restart_keeps_what_reached_the_disk(
 ) -> None:
     """The ACCEPTED line was written but its fsync failed: after the restart the
     Receipt counts as used (never run again), not as unseen."""
-    broker = bw.make_broker(tmp_path)
+    broker = bw.make_broker(tmp_path, supervisor="memory")  # the fault is P2's record only
     client = bw.make_client(broker)
     client.start(bw.start_request())
     start = bw.start_request()

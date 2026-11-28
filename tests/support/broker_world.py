@@ -59,22 +59,42 @@ def make_broker(
     create: bool = True,
     sandbox: FakeSandbox | None = None,
     boot: Any = None,
+    supervisor: Any = "fake",
 ) -> Broker:
+    """``supervisor="fake"`` (the default): the real Deadline Supervisor with
+    cgroups emulated over the FakeSandbox (``broker.ds``, ``broker.ds_cgroups``);
+    ``None``: no supervisor (every start refused); any other value is passed."""
+    from support import supervisor_world as dsw
+
     directory.mkdir(parents=True, exist_ok=True)
     path = record_path(directory)
     if create and not path.exists():
         ExecutionRecord.create(path, KEY).close()
     clock = clock if clock is not None else ManualMonotonic()
-    return Broker.open(
+    fake = sandbox if sandbox is not None else FakeSandbox()
+    cgroups = None
+    if supervisor in ("fake", "memory"):
+        cgroups = dsw.SandboxCgroups(fake)
+        extra = {} if boot is None else {"boot": boot}
+        supervisor = (
+            dsw.supervisor(directory / "ds", cgroups, **extra)
+            if supervisor == "fake"
+            else dsw.memory_supervisor(cgroups, **extra)
+        )
+    broker = Broker.open(
         record_path=path,
-        sandbox=sandbox if sandbox is not None else FakeSandbox(),
+        sandbox=fake,
         key=KEY,
         p1_uid=UID if p1_uid is None else p1_uid,
         instance_id=b.new_id(BrokerInstanceId),
         clock=clock,
         allowed_profiles=frozenset({PROFILE}),
+        supervisor=supervisor,
         **({} if boot is None else {"boot": boot}),
     )
+    broker.ds = supervisor  # type: ignore[attr-defined]
+    broker.ds_cgroups = cgroups  # type: ignore[attr-defined]
+    return broker
 
 
 def pair_connector(broker: Broker) -> Callable[[], socket.socket]:

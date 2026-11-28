@@ -1,0 +1,7 @@
+# TEMPLATE (D20; not applied). Parent of Agent Core sandboxes only.
+[Unit]
+Description=Agent Core sandboxes (supervised by the Deadline Supervisor)
+
+[Slice]
+# Resource limits of all sandboxes together (values to be fixed in E-6).
+TasksMax=512

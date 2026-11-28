@@ -1,0 +1,8 @@
+{
+  "userns-remap": "default",
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "cgroup-parent": "agentcore-sandbox.slice",
+  "no-new-privileges": true,
+  "icc": false,
+  "live-restore": false
+}

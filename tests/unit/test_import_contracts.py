@@ -38,7 +38,7 @@ def _copy_real_package(tmp_path: Path) -> Path:
     """A copy of every root package the real contracts name (WP-10 adds the CLI,
     WP2-02 the P2 broker)."""
     src = tmp_path / "src"
-    for package in ("agent_core", "agent_core_cli", "agent_core_broker"):
+    for package in ("agent_core", "agent_core_cli", "agent_core_broker", "agent_core_supervisor"):
         shutil.copytree(
             REPO_ROOT / "src" / package,
             src / package,

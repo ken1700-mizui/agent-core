@@ -1,6 +1,6 @@
 # Deadline Supervisor（S-R01 の最終設計案。実装しない）
 
-> 文書の状態：**DRAFT**（設計案。製品の実装、新しい OS の権限の追加はしていない）　作成：2026-11-28　承認：D19（案 B の基本の方針の受入、最終設計への補強）
+> 文書の状態：**DRAFT**（設計案。D20 で A1 の製品のコード・型・接続口・試験・設定のテンプレートを実装した（11章）。新しい OS の権限は追加していない）　作成：2026-11-28　承認：D19（案 B の基本の方針の受入、最終設計への補強）
 > 名前：**Deadline Supervisor**（DS）。Phase 3A の P3 Gateway と重ならないように、「P3」は使わない。
 > 実装には別の承認が要る。要るものは、新しい OS の利用者、systemd の単位、cgroup の委任、Docker の設定の変更。
 
@@ -64,7 +64,21 @@ REGISTERED → ATTACHED（cgroup が現れた）
 - **終わり：** KILLED、RELEASED、NOT_STARTED。
   - RELEASED：P2 が回収を報告し、DS が cgroup がないことを確かめた。
   - 記録は残し、消さない（保存の期間はオーナーが決める）。
-- 登録できるのは委任の部分木の下のパスだけ。それ以外は拒否する。
+- 登録できるのは委任の部分木の直下の、`agentcore-` で始まる1つのパスの要素だけ（`/`、`..`、ほかの名前は型で拒否）。
+
+### 3.1 操作の対象の範囲（D20 で整合を取った）
+
+| 状態 | 触れてよい対象 | 理由 |
+|---|---|---|
+| 通常（OK、UNCONFIRMED_STOP） | **登録された対象だけ**。登録されていない cgroup には、部分木の下にあっても何もしない | 未登録の対象への操作の禁止 |
+| FAIL_SAFE（記録を信頼できない） | 委任の部分木の**直下**の、Sandbox の名前（`agentcore-...`）の cgroup **すべて**。部分木の外と、ほかの名前には触れない | 記録がないので、どれが登録済みかを確かめられない。部分木は Agent Core の Sandbox だけを置く専用の場所（設定の時に確かめる、E-6）なので、そのすべてを、使い捨ての Sandbox として止める。未登録の対象の禁止の、ただ1つの例外として、範囲をこれに限る |
+
+### 3.2 開始の窓と、状態の不一致（D20）
+
+- 期限は**登録の時点**から数える。開始が遅れても、期限は延びない。
+- 開始の確認（`confirm_start`）は、登録から `start_window_ms`（10 秒）以内だけ。過ぎたら `EXPIRED_BEFORE_START` で拒否し、NOT_RUNNING にする。期限を過ぎていても同じ。
+- 開始の前に対象がすでに存在すれば、`STATE_MISMATCH` で拒否する（登録の時と、確認の時の両方）。
+- 確認なしに対象が現れた場合（REGISTERED のまま cgroup がある）：不一致として**直ちに止める**。登録された対象なので、範囲の内。
 
 ## 4. 開始の前の確認と、新しい実行の拒否の条件
 
@@ -88,7 +102,7 @@ P1 の側の確認（S-R03 の admission。D19 で省略できない）は、こ
 | P1 と P2 の両方が止まる | 同上 |
 | 中のコードが PID 1 の監督を止める | 同上。cgroup の全体を止める |
 | DS が止まる | systemd の `Restart=always`。止まっている間、新しい開始は4章で拒否される。再起動の後、記録から期限を戻す。boot ID が違う、または期限を過ぎていれば、直ちに止める |
-| DS の記録の破損 | 起動の時に MAC、連鎖、解析のどれかが失敗した場合：**FAIL_SAFE**。委任の部分木の**すべて**の cgroup を止め（Sandbox はどれも使い捨て）、オーナーが確かめて戻すまで登録を拒否する |
+| DS の記録の破損 | 起動の時に MAC、連鎖、解析、末尾の行の切れのどれかが失敗した場合：**FAIL_SAFE**（範囲は 3.1）。オーナーが確かめて記録を戻すまで、登録を拒否する |
 | 停止を確かめられない | 書き込みが失敗した、または一定の時間の後も populated が 1 の場合：KILL_UNCONFIRMED として記録し、警告する。新しい開始は拒否する。P1 の側は OUTCOME_UNKNOWN と保留のまま（Phase 1 の規則）。DS は周期ごとに止め直す |
 
 ## 6. 記録
@@ -125,3 +139,25 @@ DS の利用者だけが読み書きできるディレクトリ（0700）に置�
 3. dockerd の `--cgroup-parent` の設定。
 4. cgroup v2 の環境（E-6）。
 5. A1 が確かめられない場合の、A2 の採否。
+
+## 11. D20 の実装（環境に依存しない部分と、Fake による契約の試験）
+
+| 部品 | 場所 |
+|---|---|
+| 型（登録、状態、拒否の理由、健康の状態） | `src/agent_core/types/supervisor.py` |
+| 規則（登録、開始の確認、開始の報告、回収、期限の強制、停止の要求と確認の区別、再起動の後の期限、FAIL_SAFE） | `src/agent_core_supervisor/supervisor.py` |
+| 記録（追記だけ、ハッシュの連鎖、HMAC、行ごとの fsync、0600） | `src/agent_core_supervisor/record.py` |
+| cgroup v2 の接続口（`cgroup.kill`、`cgroup.events`、名前と種類の検査、cgroup2 の mount の検査） | `src/agent_core_supervisor/cgroups.py` |
+| IPC（P2 の OS 利用者だけ、方向ごとの MAC）、クライアント | `src/agent_core_supervisor/server.py`、`client.py`、`ipc.py` |
+| サービス（systemd の下で、cgroup v2 のときだけ動く。ほかは終了の状態 2 で拒否） | `src/agent_core_supervisor/__main__.py` |
+| P2 の統合 | `Broker(supervisor=...)` は既定の値なし。開始の前に「健康の確認 → 登録 → 開始の確認」を行い、拒否はどれも `DEADLINE_UNAVAILABLE`（実行されていない）。開始の後は報告し、回収の後は解放する |
+| 設定のテンプレート | `deploy/deadline-supervisor/`（適用していない） |
+| import の契約 | DS は runtime、adapters、safety、cost、identity、tool、P2、CLI を import しない。P1 は DS を import しない |
+
+**開発の環境の扱い：**
+- この環境には cgroup v2 と systemd がないので、DS は動かない（サービスは拒否する）。
+- Docker のコンテナを DS の対象にするには、cgroup のパスがコンテナの ID で決まる。そのため、作成と開始を分けて、作成と開始の間で登録する必要がある。これは未実装で、E-5 の前の作業とする。
+- そのため Docker の試験だけは、明示の `diagnostics_without_supervisor`（D17 の固定の診断のプログラムだけ）で動かす。これは正式な経路ではなく、SG-1 でも使わない。
+- DS なしの Broker は、この指定がなければ、すべての開始を拒否する。
+
+**試験：** `tests/unit/test_sr01_deadline_supervisor.py`（22 件）。8章の6項目を、Fake で契約として確かめた。**試験の成功は、安全の条件を満たしたことではない**（E-6 で確かめるまで未達成）。

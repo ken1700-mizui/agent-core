@@ -1,0 +1,39 @@
+# TEMPLATE (D20; not applied). A1: a non-root user, no capabilities, a delegated
+# cgroup subtree. Unverified items: README.md.
+[Unit]
+Description=Agent Core Deadline Supervisor (S-R01)
+After=local-fs.target
+
+[Service]
+Type=notify
+User=agentcore-ds
+Group=agentcore-ds
+ExecStart=/opt/agent-core/.venv/bin/python -I -m agent_core_supervisor serve \
+    --socket /run/agentcore-ds/ds.sock \
+    --record /var/lib/agentcore-ds/deadline-supervisor.log \
+    --key-file /etc/agentcore-ds/ds.key \
+    --cgroup-root /sys/fs/cgroup/agentcore.slice/agentcore-sandbox.slice \
+    --p2-uid AGENTCORE_P2_UID
+Restart=always
+RestartSec=1
+WatchdogSec=5
+Delegate=yes
+NotifyAccess=main
+# No capabilities and no new privileges (A1; A2 is not approved).
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=/var/lib/agentcore-ds /run/agentcore-ds /sys/fs/cgroup/agentcore.slice/agentcore-sandbox.slice
+RuntimeDirectory=agentcore-ds
+RuntimeDirectoryMode=0750
+StateDirectory=agentcore-ds
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

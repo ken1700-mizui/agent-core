@@ -72,6 +72,10 @@ class FakeSandbox:
     refuse_next_program: bool = False
     start_delay_s: float = 0.0
 
+    def target_of(self, receipt_id: ReceiptId) -> str:
+        """The cgroup name the Deadline Supervisor registers for this start."""
+        return f"agentcore-{receipt_id}"
+
     def knows_program(self, ref: str) -> bool:
         if self.refuse_next_program:
             self.refuse_next_program = False

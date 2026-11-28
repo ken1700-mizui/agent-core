@@ -102,6 +102,8 @@ def _p2(world: dict[str, Path], *, docker: bool = False) -> Iterator[subprocess.
         str(_uid("agentcore-p1")),
         "--profile",
         bw.PROFILE,
+        # No cgroup v2 / systemd here: the dev fixed-diagnostics mode (D17, D20).
+        "--diagnostics-without-supervisor",
     ]
     if docker:
         args += [
