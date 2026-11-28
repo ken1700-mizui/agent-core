@@ -196,6 +196,27 @@ class Broker:
     def start_watchdog(self, cycle_s: float) -> Watchdog:
         return Watchdog(self, cycle_s)
 
+    def recover_backend(self) -> list[str]:
+        """After a restart: reap the backend's leftovers whose result is recorded
+        (or that the record does not know); keep the others, whose deadlines
+        ``tick`` enforces by wall clock. Returns what was done, for the log."""
+        adopt = getattr(self.sandbox, "adopt", None)
+        if adopt is None:
+            return []
+        done: list[str] = []
+        with self._lock:
+            record = self._usable_record()
+            for receipt, _cid, running, _deadline in adopt():
+                state = record.state(receipt)
+                if state is SandboxState.ACCEPTED:
+                    done.append(f"kept {receipt} ({'running' if running else 'exited'})")
+                    continue
+                if running:
+                    self.sandbox.stop(receipt, 0)
+                self.sandbox.reap(receipt)
+                done.append(f"reaped {receipt} ({state.value})")
+        return done
+
     # ------------------------------------------------------------ responses
 
     def _response(
@@ -294,10 +315,11 @@ class Broker:
 
     def _prepare(self, body: PrepareRequest, record: ExecutionRecord) -> PrepareResult:
         del record
+        ready = bool(getattr(self.sandbox, "ready", True))  # Docker: self-diagnosis passed
         return PrepareResult(
             request_id=body.request_id,
             attempt_id=body.attempt_id,
-            prepared=body.sandbox_profile_hash in self._profiles,
+            prepared=ready and body.sandbox_profile_hash in self._profiles,
         )
 
     @staticmethod
@@ -324,7 +346,12 @@ class Broker:
         if not self.sandbox.knows_program(body.program_ref):
             raise _RefusedError(ipc.RefusalCode.PROGRAM_REFUSED)
         record.raise_epoch(body.owner_epoch)
-        record.accept(body, started_ms=self._clock.monotonic_ms())  # synced before the run
+        record.accept(  # synced before the run
+            body,
+            started_ms=self._clock.monotonic_ms(),
+            accepted_by=str(self._instance),
+            deadline_unix_ms=int(time.time() * 1000) + body.deadline_ms,
+        )
         # From here on the backend may have run something: no failure may be
         # answered as "not run" (RECORD_UNAVAILABLE is for before this point).
         try:
@@ -454,7 +481,10 @@ class Broker:
             seen = self.sandbox.observe(receipt)
             if seen is None or seen.state is not SandboxState.RUNNING:
                 continue
-            expired = now - int(entry["started_ms"]) >= int(entry["deadline_ms"])
+            if entry.get("accepted_by", str(self._instance)) == str(self._instance):
+                expired = now - int(entry["started_ms"]) >= int(entry["deadline_ms"])
+            else:  # accepted before a restart: P2's monotonic clock restarted too
+                expired = time.time() * 1000 >= int(entry["deadline_unix_ms"])
             if expired and self.sandbox.stop(receipt, 0):
                 record.stopped(receipt, reason="deadline")
 

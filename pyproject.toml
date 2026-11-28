@@ -35,6 +35,7 @@ xfail_strict = true
 # (never skipped). Non-root runs deselect it with -m "not privileged".
 markers = [
     "privileged(reason): the setup needs a privilege only root has; runs only as root",
+    "sandbox: needs the environment of E-1/E-2 (Docker daemon, P1/P2 OS users, root). Deselected unless -m names it; fails as SANDBOX_NOT_RUN when its environment is missing",
 ]
 filterwarnings = ["error"]
 
@@ -178,6 +179,10 @@ type = "forbidden"
 # P2 never reads or writes the Journal or the ledger (sandbox design 7.6.1). Its
 # only socket use is its AF_UNIX server. No process is spawned (fake backend).
 source_modules = ["agent_core_broker"]
+# D17 (2026-11-28): the one exception. P2's Docker API module uses the standard
+# http.client over an AF_UNIX socket to the Docker daemon only (no TCP, no TLS,
+# no other host). No other broker module may import http.
+ignore_imports = ["agent_core_broker.docker_api -> http"]
 forbidden_modules = [
     "agent_core.adapters",
     "agent_core.runtime",

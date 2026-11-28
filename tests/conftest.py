@@ -51,11 +51,26 @@ def _guarded_socket_init(self: socket.socket, family: Any = -1, *args: Any, **kw
     _original_socket_init(self, family, *args, **kwargs)
 
 
+_DOCKER_SOCKET = "/var/run/docker.sock"
+_original_connect = socket.socket.connect
+
+
+def _docker_socket_only(self: socket.socket, address: Any) -> None:
+    """``sandbox`` tests (D17, E-1): an AF_UNIX connect to the Docker daemon's
+    socket only. Every other connect stays refused."""
+    if self.family == socket.AF_UNIX and address == _DOCKER_SOCKET:
+        _original_connect(self, address)
+        return
+    _refuse()
+
+
 @pytest.fixture(autouse=True)
-def _block_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _block_network(monkeypatch: pytest.MonkeyPatch, request: Any) -> None:
     monkeypatch.setattr(socket.socket, "__init__", _guarded_socket_init)
     for method in _REFUSED_SOCKET_METHODS:
         monkeypatch.setattr(socket.socket, method, _refuse)
+    if request.node.get_closest_marker("sandbox") is not None:
+        monkeypatch.setattr(socket.socket, "connect", _docker_socket_only)
     for function in _REFUSED_MODULE_FUNCTIONS:
         monkeypatch.setattr(socket, function, _refuse)
 
@@ -78,3 +93,61 @@ def pytest_runtest_setup(item: Any) -> None:
             "or deselect with -m 'not privileged'",
             pytrace=False,
         )
+
+
+# ---------------------------------------------------------------- sandbox tests (WP2-03, D17)
+
+SANDBOX_USERS = ("agentcore-p1", "agentcore-p2")
+
+
+def _sandbox_requested(config: Any) -> bool:
+    return "sandbox" in (config.getoption("-m") or "")
+
+
+def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
+    """``sandbox`` tests are a separate category: deselected unless ``-m`` names
+    them (so the existing CI command is unchanged), never counted as passed when
+    not run. The terminal summary reports how many were not run."""
+    if _sandbox_requested(config):
+        return
+    selected: list[Any] = []
+    deselected: list[Any] = []
+    for item in items:
+        (deselected if item.get_closest_marker("sandbox") else selected).append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
+        config._sandbox_not_run = len(deselected)
+
+
+def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: Any) -> None:
+    del exitstatus
+    count = getattr(config, "_sandbox_not_run", 0)
+    if count:
+        terminalreporter.write_line(
+            f"SANDBOX_NOT_RUN: {count} sandbox tests were not run (run them with -m sandbox)"
+        )
+
+
+def _sandbox_environment_problem() -> str | None:
+    import pwd
+
+    if os.geteuid() != 0:
+        return "not root"
+    if not os.path.exists("/var/run/docker.sock"):
+        return "no Docker daemon socket (E-1)"
+    for user in SANDBOX_USERS:
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            return f"OS user {user} missing (E-2)"
+    return None
+
+
+@pytest.fixture(autouse=True)
+def _sandbox_environment(request: Any) -> None:
+    if request.node.get_closest_marker("sandbox") is None:
+        return
+    problem = _sandbox_environment_problem()
+    if problem is not None:
+        pytest.fail(f"SANDBOX_NOT_RUN: {problem}", pytrace=False)

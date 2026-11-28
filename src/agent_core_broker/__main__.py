@@ -16,6 +16,8 @@ from pathlib import Path
 
 from agent_core.types.ids import BrokerInstanceId, SiteId
 from agent_core.types.safety import SecretKey
+from agent_core_broker.docker_api import DockerAPI
+from agent_core_broker.docker_backend import DockerProfile, DockerSandbox
 from agent_core_broker.fake import FakeSandbox
 from agent_core_broker.record import ExecutionRecord
 from agent_core_broker.server import Broker
@@ -52,6 +54,11 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--key-file", type=Path, required=True)
     serve.add_argument("--p1-uid", type=int, required=True)
     serve.add_argument("--profile", action="append", default=[])
+    serve.add_argument("--backend", choices=("fake", "docker"), default="fake")
+    serve.add_argument("--image-digest", default="")
+    serve.add_argument("--image-id", default="")
+    serve.add_argument("--staging", type=Path, default=None)
+    serve.add_argument("--docker-socket", type=Path, default=Path("/var/run/docker.sock"))
     args = parser.parse_args(argv)
     if args.command == "init":
         ExecutionRecord.create(args.record, _key(args.key_file)).close()
@@ -59,15 +66,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if not args.socket.is_absolute():
         raise SystemExit("the socket path must be absolute")
+    backend: object = FakeSandbox()
+    profiles = frozenset(args.profile)
+    if args.backend == "docker":
+        if not (args.image_digest and args.image_id and args.staging):
+            raise SystemExit("the docker backend needs --image-digest, --image-id, --staging")
+        profile = DockerProfile(image_digest=args.image_digest, image_id=args.image_id)
+        docker = DockerSandbox(DockerAPI(args.docker_socket), profile, args.staging)
+        diagnosis = docker.self_diagnose()
+        print(
+            f"self-diagnosis {sorted(k for k, v in diagnosis.checks.items() if not v)}", flush=True
+        )
+        backend, profiles = docker, frozenset({profile.profile_hash()})
     broker = Broker.open(
         record_path=args.record,
-        sandbox=FakeSandbox(),
+        sandbox=backend,
         key=_key(args.key_file),
         p1_uid=args.p1_uid,
         instance_id=_instance(),
         clock=SystemMonotonic(),
-        allowed_profiles=frozenset(args.profile),
+        allowed_profiles=profiles,
     )
+    if broker.record_error is None:
+        for line in broker.recover_backend():
+            print(f"recovered: {line}", flush=True)
     note = "" if broker.record_error is None else " (execution record unavailable)"
     broker.serve(args.socket, ready=lambda: print("serving" + note, flush=True))
     return 0

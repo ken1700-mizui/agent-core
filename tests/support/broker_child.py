@@ -10,6 +10,7 @@ result, or ``{"error": code, "sent": bool, "detail": text}``.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,16 +18,20 @@ from pydantic import BaseModel
 
 from agent_core.adapters.broker_client import BrokerClient, unix_connector
 from agent_core.types.errors import SandboxUnavailableError
+from agent_core.types.safety import SecretKey
 from agent_core.types.sandbox import StartRequest, StatusRequest
 from support import broker_world as bw
 
 
 def main() -> int:
     socket_path, epoch, request_text = Path(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+    # The OS-user tests (E-2) give the P2 user and P1's own key file.
+    key_file = os.environ.get("BROKER_CHILD_KEY_FILE")
+    key = SecretKey(bytes.fromhex(Path(key_file).read_text().strip())) if key_file else bw.KEY
     client = BrokerClient(
         connector=unix_connector(socket_path),
-        key=bw.KEY,
-        p2_uid=bw.UID,
+        key=key,
+        p2_uid=int(os.environ.get("BROKER_CHILD_P2_UID", bw.UID)),
         owner_epoch=lambda: epoch,
         timeout_s=10.0,
     )
