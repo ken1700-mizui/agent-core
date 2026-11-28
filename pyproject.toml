@@ -108,7 +108,8 @@ layers = [
     # Pure safety and cost rules (WP-09): no I/O. The SQLite ledger that runs them
     # inside the Journal transaction is an adapter. The Context Engine (WP-14) is
     # pure too and independent of both (B1 1.1, C16).
-    "agent_core.safety | agent_core.cost | agent_core.context",
+    # WP2-06: the Planning Engine is pure too and proposes only (no authority).
+    "agent_core.safety | agent_core.cost | agent_core.context | agent_core.planning",
     "agent_core.ports",
     "agent_core.types",
 ]
@@ -127,6 +128,7 @@ source_modules = [
     "agent_core.safety",
     "agent_core.cost",
     "agent_core.context",
+    "agent_core.planning",
 ]
 forbidden_modules = ["sqlite3", "fcntl", "agent_core.adapters"]
 
