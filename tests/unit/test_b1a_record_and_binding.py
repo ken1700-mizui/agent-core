@@ -410,8 +410,11 @@ def test_the_tick_delay_is_bounded_by_the_longest_request(tmp_path: Path) -> Non
         thread = threading.Thread(target=bw.make_client(broker).start, args=(bw.start_request(),))
         thread.start()
         thread.join(timeout=5)
-        assert watchdog.max_delay_s < 0.3 + 0.02 + 0.5
+        deadline = time.monotonic() + 2  # the tick waiting for the lock finishes after it
+        while watchdog.ticks == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert watchdog.ticks > 0
+        assert watchdog.max_delay_s < 0.3 + 0.02 + 0.5
     finally:
         watchdog.stop()
     broker.close()

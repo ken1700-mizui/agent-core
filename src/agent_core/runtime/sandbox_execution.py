@@ -43,7 +43,7 @@ from typing import NamedTuple
 
 from agent_core.ports.sandbox import SandboxPort
 from agent_core.runtime.execution_gate import SyntheticExecutionGate, SyntheticResult
-from agent_core.types.errors import SandboxUnavailableError
+from agent_core.types.errors import AgentCoreError, SandboxUnavailableError
 from agent_core.types.ids import RequestId
 from agent_core.types.model import CostStatus, Usage, UsageStatus
 from agent_core.types.provenance import OutcomeKind, OutcomeProvenanceFields
@@ -81,6 +81,7 @@ PRE_ACCEPTANCE_REFUSALS = frozenset(
         "PROFILE_REFUSED",
         "PROGRAM_REFUSED",
         "RECORD_UNAVAILABLE",
+        "DEADLINE_UNAVAILABLE",
     }
 )
 
@@ -155,6 +156,7 @@ def run_sandbox_operation(
     monotonic_ms: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000,
     stopped: Callable[[], bool] = lambda: False,
     p1_margin_ms: int = 5_000,
+    admission: Callable[[], None] | None = None,
 ) -> SandboxOperationResult:
     """P1's sandbox monitor (WP2-04) is the poll loop: one ``wait`` per sandbox
     cycle, until nothing runs, the owner stops (``stopped``), or P1's own limit
@@ -169,6 +171,12 @@ def run_sandbox_operation(
     if program is None or (expected is not None and expected != program):
         aborted = gate.abort_not_dispatched(attempt, AbortReason.ARTIFACT_MISMATCH)
         return SandboxOperationResult(aborted, None)
+    if admission is not None:
+        try:
+            admission()  # S-R03: the monitor's liveness, before any start
+        except AgentCoreError:
+            aborted = gate.abort_not_dispatched(attempt, AbortReason.SANDBOX_UNAVAILABLE)
+            return SandboxOperationResult(aborted, None)
     try:
         prepared = sandbox.prepare(
             PrepareRequest(

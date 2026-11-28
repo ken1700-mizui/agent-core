@@ -57,6 +57,8 @@ def make_broker(
     clock: ManualMonotonic | None = None,
     p1_uid: int | None = None,
     create: bool = True,
+    sandbox: FakeSandbox | None = None,
+    boot: Any = None,
 ) -> Broker:
     directory.mkdir(parents=True, exist_ok=True)
     path = record_path(directory)
@@ -65,12 +67,13 @@ def make_broker(
     clock = clock if clock is not None else ManualMonotonic()
     return Broker.open(
         record_path=path,
-        sandbox=FakeSandbox(),
+        sandbox=sandbox if sandbox is not None else FakeSandbox(),
         key=KEY,
         p1_uid=UID if p1_uid is None else p1_uid,
         instance_id=b.new_id(BrokerInstanceId),
         clock=clock,
         allowed_profiles=frozenset({PROFILE}),
+        **({} if boot is None else {"boot": boot}),
     )
 
 

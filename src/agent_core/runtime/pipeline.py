@@ -94,7 +94,10 @@ class AttemptPipeline:
         clock: Clock,
         pep_instance_id: PepInstanceId,
         new_id: Callable[[type[Any]], Any],
+        admission: Callable[[Attempt], None] | None = None,
     ) -> None:
+        # S-R03: checked before any intent or Permit is written (raises to refuse).
+        self._admission = admission
         self._sm = sm
         self._ledger = ledger
         self._clock = clock
@@ -190,6 +193,8 @@ class AttemptPipeline:
 
     def authorize(self, attempt: Attempt, consumer: Consumer) -> Attempt:
         """Intent, permit and its consumption (the receipt) for the execution gate."""
+        if self._admission is not None:
+            self._admission(attempt)
         assert attempt.action_hash is not None  # noqa: S101
         assert attempt.reservation_id is not None  # noqa: S101
         action = attempt.action_hash

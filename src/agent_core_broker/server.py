@@ -73,6 +73,16 @@ class Monotonic(Protocol):
     def monotonic_ms(self) -> int: ...
 
 
+BootClock = Callable[[], tuple[str, int]]
+
+
+def system_boot_clock() -> tuple[str, int]:
+    """(boot ID, ms since boot): the kernel's CLOCK_BOOTTIME, which wall-clock
+    changes do not move and which survives a restart of P2 (not of the host)."""
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    return boot_id, time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1_000_000
+
+
 class _RefusedError(Exception):
     def __init__(self, code: ipc.RefusalCode) -> None:
         super().__init__(code.value)
@@ -138,7 +148,9 @@ class Broker:
         instance_id: BrokerInstanceId,
         clock: Monotonic,
         allowed_profiles: frozenset[str],
+        boot: BootClock = system_boot_clock,
     ) -> None:
+        self._boot = boot
         self._record = record
         self._opened = record  # closed by ``close`` even after the record broke
         self.record_error = record_error
@@ -163,6 +175,7 @@ class Broker:
         instance_id: BrokerInstanceId,
         clock: Monotonic,
         allowed_profiles: frozenset[str],
+        boot: BootClock = system_boot_clock,
     ) -> Broker:
         """A broker whose record cannot be opened (missing, broken, held by another
         broker) still answers, refusing everything."""
@@ -180,7 +193,14 @@ class Broker:
             instance_id=instance_id,
             clock=clock,
             allowed_profiles=allowed_profiles,
+            boot=boot,
         )
+
+    def _boot_now(self) -> tuple[str, int] | None:
+        try:
+            return self._boot()
+        except (OSError, ValueError):
+            return None  # cannot restore deadlines across a restart: stop them (S-R02)
 
     def close(self) -> None:
         with self._lock:
@@ -322,6 +342,7 @@ class Broker:
     def _prepare(self, body: PrepareRequest, record: ExecutionRecord) -> PrepareResult:
         del record
         ready = bool(getattr(self.sandbox, "ready", True))  # Docker: self-diagnosis passed
+        ready = ready and self._boot_now() is not None  # S-R02: a restorable deadline
         return PrepareResult(
             request_id=body.request_id,
             attempt_id=body.attempt_id,
@@ -352,11 +373,15 @@ class Broker:
         if not self.sandbox.knows_program(body.program_ref):
             raise _RefusedError(ipc.RefusalCode.PROGRAM_REFUSED)
         record.raise_epoch(body.owner_epoch)
+        boot = self._boot_now()
+        if boot is None:
+            raise _RefusedError(ipc.RefusalCode.DEADLINE_UNAVAILABLE)  # before acceptance
         record.accept(  # synced before the run
             body,
             started_ms=self._clock.monotonic_ms(),
             accepted_by=str(self._instance),
-            deadline_unix_ms=int(time.time() * 1000) + body.deadline_ms,
+            boot_id=boot[0],
+            started_boot_ms=boot[1],
         )
         # From here on the backend may have run something: no failure may be
         # answered as "not run" (RECORD_UNAVAILABLE is for before this point).
@@ -480,6 +505,7 @@ class Broker:
 
     def _tick(self, record: ExecutionRecord) -> None:
         now = self._clock.monotonic_ms()
+        boot = self._boot_now()
         for entry in record.accepted():
             if entry["state"] != SandboxState.ACCEPTED.value:
                 continue
@@ -489,8 +515,11 @@ class Broker:
                 continue
             if entry.get("accepted_by", str(self._instance)) == str(self._instance):
                 expired = now - int(entry["started_ms"]) >= int(entry["deadline_ms"])
-            else:  # accepted before a restart: P2's monotonic clock restarted too
-                expired = time.time() * 1000 >= int(entry["deadline_unix_ms"])
+            elif boot is not None and entry.get("boot_id") == boot[0]:
+                # Accepted before a restart of P2: the boot clock still counts (S-R02).
+                expired = boot[1] - int(entry["started_boot_ms"]) >= int(entry["deadline_ms"])
+            else:
+                expired = True  # the deadline cannot be restored safely: stop now
             if expired and self.sandbox.stop(receipt, int(entry.get("grace_ms", 0))):
                 record.stopped(receipt, reason="deadline")
 

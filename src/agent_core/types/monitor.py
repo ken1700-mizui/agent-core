@@ -47,7 +47,9 @@ class Heartbeat(FrozenModel):
 class HeartbeatVerdict(StrEnum):
     TRUSTED = "TRUSTED"
     ABSENT = "ABSENT"
-    UNAUTHENTIC = "UNAUTHENTIC"
+    UNAUTHENTIC = "UNAUTHENTIC"  # bad MAC, unreadable, wrong owner or permissions
     OLDER_EPOCH = "OLDER_EPOCH"
     OTHER_MONITOR = "OTHER_MONITOR"
+    OTHER_BROKER = "OTHER_BROKER"
+    FUTURE = "FUTURE"  # a time ahead of the ledger's time: never trusted
     STALE = "STALE"

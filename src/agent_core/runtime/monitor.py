@@ -19,6 +19,7 @@ journal and ledger hold only the escalations already committed.
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -28,6 +29,7 @@ from agent_core.runtime.recovery import (
     escalate_overdue,
     overdue_runs,
 )
+from agent_core.types.errors import AgentCoreError
 from agent_core.types.ids import BrokerInstanceId, RunId
 from agent_core.types.monitor import Heartbeat, HeartbeatVerdict, MonitorConfig
 
@@ -59,6 +61,17 @@ class DeadlineMonitor:
         self._p2 = p2_instance
         self.instance = os.urandom(16).hex()
         self._cycle = 0
+        # S-R03: set when the liveness record could not be written; admission then
+        # refuses at once (it does not wait for the old record to go stale).
+        self.last_error: str | None = None
+
+    @property
+    def deps(self) -> RecoveryDeps:
+        return self._deps
+
+    @property
+    def config(self) -> MonitorConfig:
+        return self._config
 
     @property
     def deadlines(self) -> RecoveryDeadlines:
@@ -75,15 +88,19 @@ class DeadlineMonitor:
             escalate_overdue(self._deps, run_id)
             report.escalated.append(run_id)
         now = self._deps.ledger.observe_time(self._deps.clock.now_ms())
-        self._heartbeat.write(
-            Heartbeat(
-                owner_epoch=self._deps.sm.owner_epoch,
-                monitor_instance=self.instance,
-                cycle=self._cycle,
-                at_ms=now,
-                p2_instance=self._p2,
-            )
+        beat = Heartbeat(
+            owner_epoch=self._deps.sm.owner_epoch,
+            monitor_instance=self.instance,
+            cycle=self._cycle,
+            at_ms=now,
+            p2_instance=self._p2,
         )
+        try:
+            self._heartbeat.write(beat)
+        except OSError as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            raise
+        self.last_error = None
         return report
 
 
@@ -94,16 +111,56 @@ def assess(
     monitor_instance: str,
     now_ms: int,
     config: MonitorConfig,
+    p2_instance: BrokerInstanceId | None = None,
 ) -> HeartbeatVerdict:
-    beat, authentic = store.read()
+    """S-R03: trusted only when authentic, of the current owner epoch, monitor
+    and broker instance, not ahead of the ledger's time and not stale."""
+    try:
+        beat, authentic = store.read()
+    except OSError:
+        return HeartbeatVerdict.UNAUTHENTIC
     if not authentic:
         return HeartbeatVerdict.UNAUTHENTIC
     if beat is None:
         return HeartbeatVerdict.ABSENT
-    if beat.owner_epoch < owner_epoch:
-        return HeartbeatVerdict.OLDER_EPOCH
+    if beat.owner_epoch != owner_epoch:
+        return HeartbeatVerdict.OLDER_EPOCH  # older, or one this runtime never wrote
     if beat.monitor_instance != monitor_instance:
         return HeartbeatVerdict.OTHER_MONITOR
+    if p2_instance is not None and beat.p2_instance != p2_instance:
+        return HeartbeatVerdict.OTHER_BROKER
+    if beat.at_ms > now_ms:
+        return HeartbeatVerdict.FUTURE
     if now_ms - beat.at_ms > config.run_cycle_ms * config.stale_cycles:
         return HeartbeatVerdict.STALE
     return HeartbeatVerdict.TRUSTED
+
+
+class SandboxAdmissionError(AgentCoreError):
+    """S-R03: no trusted liveness record: no Permit and no sandbox start."""
+
+    code = "SANDBOX_ADMISSION_REFUSED"
+
+
+def sandbox_admission(
+    monitor: DeadlineMonitor, store: HeartbeatStore, *, p2_instance: BrokerInstanceId | None
+) -> Callable[[], None]:
+    """The check used before a sandbox Permit is issued and before P2 is asked
+    to start: raises unless this runtime's own monitor is alive and current."""
+
+    def check() -> None:
+        if monitor.last_error is not None:
+            raise SandboxAdmissionError(f"the liveness record failed: {monitor.last_error}")
+        deps = monitor.deps
+        verdict = assess(
+            store,
+            owner_epoch=deps.sm.owner_epoch,
+            monitor_instance=monitor.instance,
+            now_ms=deps.ledger.observe_time(deps.clock.now_ms()),
+            config=monitor.config,
+            p2_instance=p2_instance,
+        )
+        if verdict is not HeartbeatVerdict.TRUSTED:
+            raise SandboxAdmissionError(f"the monitor's liveness is not trusted: {verdict.value}")
+
+    return check

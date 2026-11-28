@@ -66,6 +66,8 @@ class RefusalCode(StrEnum):
     PROFILE_REFUSED = "PROFILE_REFUSED"
     PROGRAM_REFUSED = "PROGRAM_REFUSED"
     SANDBOX_FAILURE = "SANDBOX_FAILURE"
+    # S-R02: P2 cannot fix a deadline that survives its restart (before acceptance).
+    DEADLINE_UNAVAILABLE = "DEADLINE_UNAVAILABLE"
 
 
 class BrokerRequest(FrozenModel):
