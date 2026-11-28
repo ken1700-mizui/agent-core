@@ -80,3 +80,13 @@
 | その他 | — | 成功 | 開発の確認（MAC のない環境）。SG-1 ではない |
 
 **P-5 の全受入条件は満たしていない**（S-R01、MAC のある環境での確認、S-R04）。
+
+## D19 の追記（2026-11-28）
+
+| 項目 | 状態 |
+|---|---|
+| S-R01 | 案 B の基本の方針を受け入れた。仮称の「P3」は、Phase 3A の P3 Gateway と重なるので **Deadline Supervisor** に改めた。最終の設計案は `DEADLINE_SUPERVISOR_DESIGN.md`：権限の境界（委任した cgroup の部分木、CAP_KILL なし）、cgroup v2 での実現の可否（この環境では確かめられない）、登録の寿命、異常終了、記録の破損の時の FAIL_SAFE、systemd がないときの拒否、Phase 3A への引き継ぎ。**実装していない**（別の承認） |
+| S-R02 | 変えていない。同じ boot の中の期限の管理と、戻せないときの直ちの停止を保った |
+| S-R03 | admission を**必須**にした。`run_sandbox_operation` と `BrokerClient` で、既定の値はない。省略すると呼び出せない。クライアントは prepare と start を送る前に確かめる。拒否のときは `SANDBOX_ADMISSION_REFUSED`（送っていない）で、Attempt は FAILED_DEFINITE（実行されていない）。<br>`AttemptPipeline` の admission は、Permit の前の、さらに早い確認として任意のまま。Agent のループは Sandbox の接続口を持たないので、Sandbox を開始できない |
+| S-R04 | 実装の計画を確定した（`SG1_AND_SR04_PLAN.md` の1章）。**未実装** |
+| S-R05 | 変えていない。**P-5 の全受入条件は満たしていない** |
