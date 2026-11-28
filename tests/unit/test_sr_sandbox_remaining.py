@@ -300,3 +300,75 @@ def test_a_start_refused_by_the_client_is_definitely_not_run(tmp_path: Path) -> 
     assert done.attempt.state is A.FAILED_DEFINITE
     assert attempt.receipt_id not in broker.sandbox.runs
     broker.close()
+
+
+# ---------------------------------------------------------------- D20: the whole path with the Deadline Supervisor
+
+
+def _monitored(tmp_path: Path) -> tuple[Any, Any, Any]:
+    st, broker = sw.setup(tmp_path)  # the broker has the real supervisor (fake cgroups)
+    store = _store(tmp_path, st)
+    monitor = DeadlineMonitor(iw.deps(st), CONFIG, store)
+    monitor.cycle()
+    admission = sandbox_admission(monitor, store, p2_instance=None)
+    client = bw.make_client(broker, epoch=st.journal.owner_epoch, admission=admission)
+    return st, broker, (admission, client)
+
+
+def test_the_formal_path_checks_the_heartbeat_and_the_supervisor(tmp_path: Path) -> None:
+    from agent_core.types.supervisor import TargetState
+
+    st, broker, (admission, client) = _monitored(tmp_path)
+    attempt = sw.consumed(st)
+    done = sw.run_with(st, broker, attempt, client=client, admission=admission)
+    assert done.attempt.state is A.COMPLETED
+    # registered before the start, released after the reap
+    assert broker.ds.view(attempt.receipt_id).state is TargetState.RELEASED
+    broker.close()
+
+
+def test_a_supervisor_refusal_ends_the_attempt_not_run_and_it_is_not_retried(
+    tmp_path: Path,
+) -> None:
+    st, broker, (admission, client) = _monitored(tmp_path)
+    broker.ds_cgroups.reason = "no cgroup v2"
+    attempt = sw.consumed(st)
+    done = sw.run_with(st, broker, attempt, client=client, admission=admission)
+    assert done.attempt.state is A.FAILED_DEFINITE  # DEADLINE_UNAVAILABLE: before acceptance
+    assert attempt.receipt_id not in broker.sandbox.runs
+    broker.ds_cgroups.reason = None
+    with pytest.raises(Exception):  # noqa: B017,PT011 (the Receipt is used: never run again)
+        sw.run_with(st, broker, attempt, client=client, admission=admission)
+    assert attempt.receipt_id not in broker.sandbox.runs
+    broker.close()
+
+
+def test_without_a_trusted_heartbeat_nothing_reaches_p2_or_the_supervisor(tmp_path: Path) -> None:
+    st, broker = sw.setup(tmp_path)
+    store = _store(tmp_path, st)
+    monitor = DeadlineMonitor(iw.deps(st), CONFIG, store)  # never cycled
+    admission = sandbox_admission(monitor, store, p2_instance=None)
+    client = bw.make_client(broker, epoch=st.journal.owner_epoch, admission=admission)
+    attempt = sw.consumed(st)
+    done = sw.run_with(st, broker, attempt, client=client, admission=admission)
+    assert done.attempt.state is A.ABORTED_BEFORE_DISPATCH
+    assert broker.ds.status().active == 0
+    broker.close()
+
+
+def test_the_supervisor_stops_a_run_that_p1_and_p2_abandoned(tmp_path: Path) -> None:
+    from agent_core.types.supervisor import TargetState
+
+    broker = bw.make_broker(tmp_path)
+    start = bw.start_request(program="hang", deadline_ms=1_000, grace_ms=0)
+    assert bw.make_client(broker).start(start).status.value == "STARTED"
+    # P1 and P2 do nothing more; the supervisor alone, on its boot clock
+    ds = broker.ds
+    for _ in range(200):  # at most 10 s; the deadline is 1 s plus the 1 s margin
+        if ds.view(start.receipt_id).state is TargetState.KILLED:
+            break
+        ds.tick()
+        time.sleep(0.05)
+    assert ds.view(start.receipt_id).state is TargetState.KILLED
+    assert broker.sandbox.containers[start.receipt_id].state is SandboxState.STOPPED
+    broker.close()
