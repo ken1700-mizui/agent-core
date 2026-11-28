@@ -1,6 +1,6 @@
 # 進捗状況（進捗の正本）
 
-> 文書の状態：**DRAFT**　最終更新：2026-11-28（D19：WP2-07 の修正と事前登録した再検証、WP2-08、WP2-11、Deadline Supervisor の最終設計案、S-R04 の計画。Batch 2 の承認の範囲を完了）
+> 文書の状態：**DRAFT**　最終更新：2026-11-28（D20：Batch 2 の受入、Batch 2.5：Deadline Supervisor（A1）の実装、S-R04 の実装、S-R02・S-R03 との統合、dev タスクの採点の仕様、E-5・E-6 の計画）
 >
 > この文書は、**進捗の正本**である（CP-6）。次のセッションでは、まずこの文書を読む。
 > - 予定の正本は `docs/design/phase-0/ROADMAP.md`。
@@ -11,8 +11,8 @@
 
 | 項目 | 内容 |
 |---|---|
-| 今の段階 | **Phase 2：Batch 2 の承認の範囲を完了（D19、審査待ち）。** WP2-05・06 は受入済み（D19）。**WP2-07** は案 A（30 以上のクラスタはクラスタの t の区間、30 未満は符号の反転の逆転）に直し、事前登録（`2a22082`）の後の正式な再検証で D 16.1 の基準をすべて満たした（元の不合格は保存して再現できる）。**WP2-08**（実験の予算：各ホームの台帳の EXPERIMENT の上限と作業単位の上限、ホームの連鎖）と **WP2-11**（dev の Task Catalog、合成のタスクの候補 30 件。固定は別の承認）を実装した。S-R03 の admission を必須にした。Deadline Supervisor（S-R01）は最終設計案だけで、実装していない。S-R04 は計画だけ。**SG-1 の合格ではない。P-5 の全受入条件は満たしていない。信頼しないコードは実行していない。Phase 2 の正式な完了ではない** |
-| 次の作業 | 審査（ChatGPT）とオーナーの判断を待つ。対象は次のとおり。<br>- WP2-07・08・11、S-R03 の必須化、Deadline Supervisor の設計案、S-R04 の計画<br>- 分散が 0 の場合の扱い（`WP2-07_STATISTICS.md` の 5.7）<br>- dev のタスクの集合の固定（隠しテストと採点のプログラムが要る）<br>- Deadline Supervisor の実装（新しい OS の権限）<br>- E-5・E-6<br><br>報告：`docs/reviews/PHASE_2_BATCH_2_COMPLETION_REPORT.md`。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、M6 は必要が生じるまで |
+| 今の段階 | **Phase 2：Batch 2.5 の承認の範囲を完了（D20、審査待ち）。** Batch 2（WP2-05〜08・11）の基礎は受入済み（残る制約は解決済みとしない）。<br>- Deadline Supervisor（A1）：製品のコード、型、接続口、試験、テンプレートを実装した。P2 は DS なしでは開始しない（明示の開発の固定の診断のモードだけを除く）<br>- S-R04（入力の束と出力、WP-08 の経路だけで反映）を実装した<br>- S-R02・S-R03 との統合を試験で確かめた<br>- dev タスクの採点の仕様を作った<br>- E-5・E-6 の計画を作った<br><br>**この環境には cgroup v2 と systemd がないので、DS と P-5 の安全の条件は未達成。** SG-1 の合格ではない。信頼しないコードは実行していない。Phase 2 の正式な完了ではない |
+| 次の作業 | 審査（ChatGPT）とオーナーの判断を待つ。対象は次のとおり。<br>- E-5 の承認（`docs/design/phase-2/E5_E6_EXECUTION_PLAN.md`）<br>- E-5 の前の作業：Docker と DS の接続、取り出しと入力の展開、`e5` の試験<br>- dev のタスクの修正と固定（`WP2-11_GRADING_SPEC.md` の3章）<br>- E-6（SG-1）の担当と環境<br><br>報告：`docs/reviews/PHASE_2_BATCH_2_5_REPORT.md`。統計の Phase 3 の前の確認の項目は `WP2-07_STATISTICS.md` の6章、WP2-12 の予算の統合の条件は `WP2-08_COST_ENGINE.md` の6章 |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。Phase 1 の実装：`impl/phase-1-foundation`（Phase 1 の完了の時点は `92c18c4`。変えない）。**Phase 2：`impl/phase-2-evaluation`（`cfb31bf` から作成、2026-11-28、D15。WP2-01・02 を実装、D16。B1A の修正と WP2-03・04 を実装、D17）**。タグ `phase-1-complete`（注釈付き、`92c18c4`）：手元で作成済み。**リモートへの Push はセッションの proxy に HTTP 403 で拒否された（再試行していない）。オーナーによる Push か作成が要る**。`main` は `d0b8635`（変えていない） |
 | 禁止事項（変わらない） | Batch 3 以後の実装（WP2-09・10・12〜15）、SG-1 の合格の宣言、統計の合格の基準の緩和とシードの選別、不合格の記録の削除、E-5・E-6、CI の実行と設定の変更、信頼しないコードの実行、Deadline Supervisor の無断の実装と新しい OS の権限の追加、P1 から Docker を操作すること、承認されていない依存関係、有料 API と有料のサービス、実モデルと実データ、validation と holdout への接続、サブエージェント、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |
@@ -99,6 +99,9 @@
 | WP2-11 Task Catalog（dev） | 実装と試験（`e15afeb`、審査待ち）。記録は `docs/design/phase-2/WP2-11_TASK_CATALOG.md` | 型、始めの作業ツリー、版、採点の参照、汚染の記録、指紋だけでの分割の重複の確認、オーナーの MAC での固定と書き換えの拒否、DEV だけの読み込み。合成のタスクの候補 30 件（10 の種類 × S・M・L、6つの合成のリポジトリ）。試験 13 件 | 固定（別の承認）、dev の隠しテストと採点のプログラム、タスクの実行 |
 | S-R03 の admission の必須化 | 実装と試験（`8a057b1`、審査待ち） | `run_sandbox_operation` と `BrokerClient` で必須（既定の値なし）。クライアントは送る前に確かめ、拒否は実行されていない扱い | — |
 | Deadline Supervisor（S-R01）・S-R04・SG-1 の計画 | 設計と計画だけ（`f23259b`）。記録は `DEADLINE_SUPERVISOR_DESIGN.md`、`SG1_AND_SR04_PLAN.md` | 権限の境界、cgroup v2 での実現の可否、登録の寿命、異常終了、記録の破損、systemd がない場合、受入の条件、Phase 3A への引き継ぎ。S-R04 の入力と反映の経路。CI、環境、独立の審査の計画 | 実装（別の承認）。cgroup v2 と systemd の確認（この環境は v1、systemd なし） |
+| **D20：Deadline Supervisor（A1）** | 実装と契約の試験（`c4e820a`、審査待ち）。記録は `DEADLINE_SUPERVISOR_DESIGN.md` の 11章、`deploy/deadline-supervisor/` | 開始の前の登録と確認（開始の窓、別の boot、既存の対象は拒否）、登録からの期限（boot の時計）、停止の要求と確認の区別、KILL_UNCONFIRMED と FAIL_SAFE、記録の耐久性、P2 の OS 利用者だけの IPC、systemd と cgroup v2 がなければサービスは動かない、権限の import の契約。P2 は DS なしでは開始しない。試験 22 件（Fake） | 本物の cgroup v2・systemd・別の OS 利用者での確認、Docker との接続。**安全の条件は未達成** |
+| **D20：S-R04** | 実装と試験（`c4c48d7`、審査待ち）。記録は `SG1_AND_SR04_PLAN.md` の 1.5 | 完了した WP-08 の読み取りだけからの入力の束と、`workspace_ref` との照合。P2 の束の確認。P2 と P1 の取り出しの上限。信頼しない出力（D4）。WP-08 の書き込みの提案だけで、承認、内容の一致、REPLACE の照合、途中の障害は OUTCOME_UNKNOWN と保留。試験 24 件 | Docker への受け渡しと取り出し |
+| **D20：S-R02・S-R03 の統合、採点の仕様、E-5・E-6** | 試験（`7c51a46` ほか）と文書 | 心拍、BrokerClient、Broker、DS の全経路の試験 4 件。30 件の採点の仕様、フィクスチャの設計、見つけた点。E-5 の承認の案、E-6 の条件 | — |
 
 ## 3. オーナーの方針（2026-11-26）
 
@@ -135,6 +138,6 @@
 - `main`：`d0b8635`（空の初期コミット `aa089ae` に、オーナーの例外の承認で `.github/workflows/ci.yml` の1ファイルだけを加えた。2026-11-27）。GitHub の既定のブランチ。
 - `docs/phase-0-design`：設計資料の作業ブランチ。Draft PR #1 で、`main` への変更として提案している。マージはしない。
 - `impl/phase-1-foundation`：Phase 1 の実装のブランチ。Phase 1 の承認の記録を含む、設計のコミットから作る。Phase 1 の正式な完了の時点は `92c18c4`。
-- `impl/phase-2-evaluation`：Phase 2 のブランチ（`cfb31bf` から作成、2026-11-28）。Phase 2 の変更はこのブランチだけに入れる。WP2-01（`9578626`）、WP2-02（`dd332c8`）、B1A の修正（`b0094a5`）、WP2-03（`b9c0552`）、WP2-04（`f73bdf5`）、S-R02・S-R03（`37d4d6d`）、WP2-05（`aa5d75e`）、WP2-06（`9610dcb`）、WP2-07（`9b2663c`、元の不合格。修正 `2a22082`、結果 `bbbd77e`）、WP2-08（`717c3e2`）、WP2-11（`e15afeb`）、S-R03 の必須化（`8a057b1`）、設計と計画（`f23259b`）を実装した。
+- `impl/phase-2-evaluation`：Phase 2 のブランチ（`cfb31bf` から作成、2026-11-28）。Phase 2 の変更はこのブランチだけに入れる。WP2-01（`9578626`）、WP2-02（`dd332c8`）、B1A の修正（`b0094a5`）、WP2-03（`b9c0552`）、WP2-04（`f73bdf5`）、S-R02・S-R03（`37d4d6d`）、WP2-05（`aa5d75e`）、WP2-06（`9610dcb`）、WP2-07（`9b2663c`、元の不合格。修正 `2a22082`、結果 `bbbd77e`）、WP2-08（`717c3e2`）、WP2-11（`e15afeb`）、S-R03 の必須化（`8a057b1`）、設計と計画（`f23259b`）、D20 の Deadline Supervisor（`c4e820a`）、S-R04（`c4c48d7`）、統合の試験（`7c51a46`）を実装した。
 - タグ `phase-1-complete`：注釈付き、`92c18c4` を指す。手元だけ（リモートへの Push は proxy の HTTP 403 で拒否）。
 - holdout のリポジトリ `ken1700-mizui/agent-core-holdout`：作っておらず、接続もしていない。

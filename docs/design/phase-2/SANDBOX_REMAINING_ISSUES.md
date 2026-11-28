@@ -90,3 +90,12 @@
 | S-R03 | admission を**必須**にした。`run_sandbox_operation` と `BrokerClient` で、既定の値はない。省略すると呼び出せない。クライアントは prepare と start を送る前に確かめる。拒否のときは `SANDBOX_ADMISSION_REFUSED`（送っていない）で、Attempt は FAILED_DEFINITE（実行されていない）。<br>`AttemptPipeline` の admission は、Permit の前の、さらに早い確認として任意のまま。Agent のループは Sandbox の接続口を持たないので、Sandbox を開始できない |
 | S-R04 | 実装の計画を確定した（`SG1_AND_SR04_PLAN.md` の1章）。**未実装** |
 | S-R05 | 変えていない。**P-5 の全受入条件は満たしていない** |
+
+## D20 の追記（2026-11-28）
+
+| 項目 | 状態 |
+|---|---|
+| S-R01 | Deadline Supervisor（A1）の製品のコード、型、接続口、試験、設定のテンプレートを実装した（`DEADLINE_SUPERVISOR_DESIGN.md` の 11章）。P2 は DS なしでは開始しない（明示の開発の固定の診断のモードだけを除く）。**本物の cgroup v2 と systemd で確かめていない。安全の条件は未達成** |
+| S-R02・S-R03 | 変えていない。DS、BrokerClient、AttemptPipeline、Sandbox の実行の経路の結び付きを、試験で確かめた（`test_sr_sandbox_remaining.py` の D20 の節）。正式な経路から監視の確認は省略できない。失敗のときは新しい実行を拒否し、結果不明のものを再実行しない |
+| S-R04 | P1 の側と P2 の確認を実装した（`SG1_AND_SR04_PLAN.md` の 1.5）。Docker への受け渡しと取り出しは未実装 |
+| S-R05 | **P-5 の全受入条件は満たしていない。** 残る項目は次のとおり（`E5_E6_EXECUTION_PLAN.md` の3章）。<br>- 時間の上限 3、8、H、A（P1 と P2 の両方の停止）。本物の DS で確かめるまで未達成<br>- 6：同じ boot の中だけ<br>- B：止められることの確認だけ<br>- E：P2 が動いている間だけ<br>- MAC のある環境での全項目 |
