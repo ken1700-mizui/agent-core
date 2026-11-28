@@ -34,6 +34,7 @@ from support import broker_world as bw
 from support import builders as b
 from support import identity_world as iw
 from support import ledger_world as lw
+from support import privileged
 from support import sandbox_world as sw
 
 CONFIG = MonitorConfig()
@@ -149,7 +150,16 @@ def test_another_broker_instance_and_a_future_time_are_not_trusted(tmp_path: Pat
     assert _verdict(store, st, monitor, p2_instance=p2) is HeartbeatVerdict.FUTURE
 
 
-@pytest.mark.parametrize("damage", ["mode", "owner", "symlink", "garbage"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "mode",
+        # As nobody, chown to 65534 would be a no-op: this case needs root.
+        pytest.param("owner", marks=privileged.CHOWN),
+        "symlink",
+        "garbage",
+    ],
+)
 def test_a_record_with_the_wrong_owner_mode_or_content_is_not_trusted(
     tmp_path: Path, damage: str
 ) -> None:
@@ -161,6 +171,7 @@ def test_a_record_with_the_wrong_owner_mode_or_content_is_not_trusted(
     if damage == "mode":
         path.chmod(0o644)
     elif damage == "owner":
+        assert os.geteuid() != 65534, "the owner case runs as root (privileged)"
         os.chown(path, 65534, 65534)
     elif damage == "symlink":
         real = tmp_path / "real"
