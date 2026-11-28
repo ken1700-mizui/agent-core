@@ -302,7 +302,7 @@ def test_a_start_refused_by_the_client_is_definitely_not_run(tmp_path: Path) -> 
     broker.close()
 
 
-# ---------------------------------------------------------- D20: the whole path (heartbeat + supervisor)
+# ------------------------------------------- D20: the whole path (heartbeat + supervisor)
 
 
 def _monitored(tmp_path: Path) -> tuple[Any, Any, Any]:
