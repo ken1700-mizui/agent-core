@@ -1,6 +1,6 @@
 # 進捗状況（進捗の正本）
 
-> 文書の状態：**DRAFT**　最終更新：2026-11-28
+> 文書の状態：**DRAFT**　最終更新：2026-11-28（Phase 2 の設計の案）
 >
 > この文書は、**進捗の正本**である（CP-6）。次のセッションでは、まずこの文書を読む。
 > - 予定の正本は `docs/design/phase-0/ROADMAP.md`。
@@ -12,7 +12,7 @@
 | 項目 | 内容 |
 |---|---|
 | 今の段階 | **Phase 1：正式に完了（オーナーの最終承認、2026-11-28。D12〜D14）**。記録は `docs/decisions/PHASE_1_COMPLETION.md`。Technical Gate：PASS。Safety Gate：定められた保証の範囲の内で PASS。最終の CI で検証した SHA は `93435c82e06a168794cf68c6ecf1fc598815d426`（run `46082898611`、2340 件がすべて成功）。Codex の独立品質レビュー（`aae033a`）の判定は CONDITIONAL_PASS（別の結果として保持）。暫定の運用の上限を維持（D13）。包括的なセキュリティ監査は Phase 3A の終わり、Phase 3B の実 API の接続の前（D14）。**Phase 2 の開始は承認されていない** |
-| 次の作業 | オーナーの判断を待つ。**Phase 2 には進まない**（開始の承認が別に要る）。Phase 2 の開始の前の未承認・未決定：P-4 の設計、D.V19 の記録の形式、A.I11 の Step の記録の項目、Docker の Sandbox の自己診断の方針、holdout の独立の管理、並行実行なら FINAL-R05。P-5 は信頼しないコードの実行の前に実装・検証。Phase 2 で信頼しないコードを実行する前に、Sandbox の独立した安全性の確認。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、A.I17 は明示的な Recovery に限る、M6 は必要が生じるまで、費用の台帳の集計の高速化は上限を上げる前。Phase 3A の Gate を省略しない |
+| 次の作業 | オーナーの判断を待つ。**Phase 2 の開始は承認されていない。** Phase 2 の設計と開始の準備の案（DRAFT、2026-11-28）：`docs/design/phase-2/PHASE_2_START_READINESS.md`（開始の前の6つの事項への推奨、オーナーの判断の事項 O-1〜O-11）、`PHASE_2_IMPLEMENTATION_PLAN.md`（WP2-01〜15、信頼しないコードの実行の前の SG-1）、`PHASE_2_EVALUATION_CONTRACT.md`（D.V19 の記録の形式、A.I11 の Step の記録）、`PHASE_2_SANDBOX_DESIGN.md`（Docker の Sandbox、自己診断、P-4 の確定案と矛盾の修正）、`PHASE_2_AGENT_INSTRUCTIONS.md`（AI 向け、英語）。延期（実装済みとは扱わない）：A.I6・A.I12 は Phase 4、P-3 は Phase 4 までに対応、A.I17 は明示的な Recovery に限る（Phase 2 で P-5）、M6 は必要が生じるまで、費用の台帳の集計の高速化は上限を上げる前。Phase 3A の Gate を省略しない |
 | Phase 1 の開始の条件 | **満たした**。Codex の監査（CONDITIONAL_PASS のまま）と、修正の後の ChatGPT の審査を、オーナーが受け入れた。承認の時点の設計の SHA は `0d930d6` |
 | 作業ブランチ | 設計：`docs/phase-0-design`（Draft PR #1。マージしない）。実装：`impl/phase-1-foundation`（承認の記録を含むコミットから作る）。`main` は、空の初期コミットだけ |
 | 禁止事項（変わらない） | 承認されていない WP の実装、承認されていない依存関係、有料 API と有料のサービス、サブエージェント、holdout のリポジトリの作成と接続、`OWNER_DECISIONS.md` を無断で変えること、`main` への直接の Push、Force Push、マージ（全文は `AGENTS.md`） |

@@ -5,6 +5,7 @@
 > - 根拠：オーナーの決定 D11（Phase 1 は明示的な Recovery による期限の確認に限る。Phase 2 の開始の前に再評価する。信頼しないコードを実行する前に必要な実装と安全性の試験を完了させる。Phase 3A までの一括の延期は禁止）。
 > - 正本：`docs/design/phase-0/ROADMAP.md`（Phase 2、0.2）、`A_RUNTIME.md`（A.I17）、`C1_SAFETY.md`（S9、S10、S22、S26、8章）、`E_INTEGRATION.md`（30.1 の Process Supervisor は 3A）。
 > - この文書の数値（周期、期限）は**提案の値**で、承認も計測もされていない。
+> - **追記（2026-11-28）：** この文書の中の矛盾の修正の案と、確定の案は `docs/design/phase-2/PHASE_2_SANDBOX_DESIGN.md` の7章（この文書の本文は変えていない。承認の前）。
 
 ## 1. 今の動作（Phase 1、`impl/phase-1-foundation`）
 
