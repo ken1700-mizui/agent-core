@@ -100,33 +100,36 @@ def pytest_runtest_setup(item: Any) -> None:
 SANDBOX_USERS = ("agentcore-p1", "agentcore-p2")
 
 
-def _sandbox_requested(config: Any) -> bool:
-    return "sandbox" in (config.getoption("-m") or "")
+# Separate categories (deselected unless ``-m`` names them, so the existing CI
+# command is unchanged; never counted as passed when not run): ``sandbox``
+# (D17, needs E-1/E-2) and ``simulation`` (WP2-07, D 16.1: long).
+SEPARATE_CATEGORIES = ("sandbox", "simulation")
 
 
 def pytest_collection_modifyitems(config: Any, items: list[Any]) -> None:
-    """``sandbox`` tests are a separate category: deselected unless ``-m`` names
-    them (so the existing CI command is unchanged), never counted as passed when
-    not run. The terminal summary reports how many were not run."""
-    if _sandbox_requested(config):
-        return
-    selected: list[Any] = []
-    deselected: list[Any] = []
-    for item in items:
-        (deselected if item.get_closest_marker("sandbox") else selected).append(item)
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-        items[:] = selected
-        config._sandbox_not_run = len(deselected)
+    expression = config.getoption("-m") or ""
+    for category in SEPARATE_CATEGORIES:
+        if category in expression:
+            continue
+        selected: list[Any] = []
+        deselected: list[Any] = []
+        for item in items:
+            (deselected if item.get_closest_marker(category) else selected).append(item)
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = selected
+            setattr(config, f"_{category}_not_run", len(deselected))
 
 
 def pytest_terminal_summary(terminalreporter: Any, exitstatus: int, config: Any) -> None:
     del exitstatus
-    count = getattr(config, "_sandbox_not_run", 0)
-    if count:
-        terminalreporter.write_line(
-            f"SANDBOX_NOT_RUN: {count} sandbox tests were not run (run them with -m sandbox)"
-        )
+    for category in SEPARATE_CATEGORIES:
+        count = getattr(config, f"_{category}_not_run", 0)
+        if count:
+            terminalreporter.write_line(
+                f"{category.upper()}_NOT_RUN: {count} {category} tests were not run"
+                f" (run them with -m {category})"
+            )
 
 
 def _sandbox_environment_problem() -> str | None:

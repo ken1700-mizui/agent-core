@@ -36,6 +36,7 @@ xfail_strict = true
 markers = [
     "privileged(reason): the setup needs a privilege only root has; runs only as root",
     "sandbox: needs the environment of E-1/E-2 (Docker daemon, P1/P2 OS users, root). Deselected unless -m names it; fails as SANDBOX_NOT_RUN when its environment is missing",
+    "simulation: the D 16.1 statistical simulation (2,000 runs per scenario; minutes). Deselected unless -m names it",
 ]
 filterwarnings = ["error"]
 
@@ -68,6 +69,10 @@ select = [
 "tests/**" = ["S101", "S603", "S607"]
 # The secret scanner runs `git ls-files` with a fixed argument list and no shell.
 "tools/secret_scan.py" = ["S603", "S607"]
+# The statistics engine and its tests use seeded random.Random on purpose: the
+# analysis must be reproducible from its recorded seed; nothing here is a secret.
+"src/agent_core/stats/**" = ["S311"]
+"tests/unit/test_wp2_07_*.py" = ["S101", "S311", "S603", "S607"]
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
