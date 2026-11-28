@@ -1,0 +1,96 @@
+[
+ {
+  "repo_key": "calc",
+  "version": "0.1.0",
+  "description": "Synthetic arithmetic helpers with a small test suite.",
+  "files": [
+   {
+    "path": "calc/__init__.py",
+    "content": "from calc.ops import add, divide, mean\n"
+   },
+   {
+    "path": "calc/ops.py",
+    "content": "def add(a, b):\n    return a + b\n\n\ndef divide(a, b):\n    return a / b\n\n\ndef mean(values):\n    return sum(values) / len(values)\n"
+   },
+   {
+    "path": "tests/test_ops.py",
+    "content": "from calc.ops import add, divide\n\n\ndef test_add():\n    assert add(2, 3) == 5\n\n\ndef test_divide():\n    assert divide(6, 3) == 2\n"
+   }
+  ]
+ },
+ {
+  "repo_key": "inventory",
+  "version": "0.1.0",
+  "description": "Synthetic stock records kept in memory.",
+  "files": [
+   {
+    "path": "inventory/stock.py",
+    "content": "class Stock:\n    def __init__(self):\n        self.items = {}\n\n    def add(self, sku, qty):\n        self.items[sku] = self.items.get(sku, 0) + qty\n\n    def remove(self, sku, qty):\n        self.items[sku] = self.items.get(sku, 0) - qty\n\n    def count(self, sku):\n        return self.items.get(sku, 0)\n"
+   },
+   {
+    "path": "tests/test_stock.py",
+    "content": "from inventory.stock import Stock\n\n\ndef test_add_and_count():\n    s = Stock()\n    s.add('a', 2)\n    assert s.count('a') == 2\n"
+   }
+  ]
+ },
+ {
+  "repo_key": "textstats",
+  "version": "0.1.0",
+  "description": "Synthetic text statistics over plain strings.",
+  "files": [
+   {
+    "path": "tests/test_count.py",
+    "content": "from textstats.count import word_count\n\n\ndef test_simple():\n    assert word_count('a b c') == 3\n"
+   },
+   {
+    "path": "textstats/count.py",
+    "content": "def words(text):\n    return text.split(' ')\n\n\ndef word_count(text):\n    return len(words(text))\n\n\ndef longest(text):\n    return max(words(text), key=len)\n"
+   }
+  ]
+ },
+ {
+  "repo_key": "confparse",
+  "version": "0.1.0",
+  "description": "Synthetic key=value configuration parser.",
+  "files": [
+   {
+    "path": "confparse/parse.py",
+    "content": "def parse(text):\n    result = {}\n    for line in text.splitlines():\n        key, value = line.split('=')\n        result[key] = value\n    return result\n"
+   },
+   {
+    "path": "tests/test_parse.py",
+    "content": "from confparse.parse import parse\n\n\ndef test_pairs():\n    assert parse('a=1\\nb=2') == {'a': '1', 'b': '2'}\n"
+   }
+  ]
+ },
+ {
+  "repo_key": "taskqueue",
+  "version": "0.1.0",
+  "description": "Synthetic in-memory priority queue of jobs.",
+  "files": [
+   {
+    "path": "taskqueue/queue.py",
+    "content": "class JobQueue:\n    def __init__(self):\n        self.jobs = []\n\n    def push(self, name, priority):\n        self.jobs.append((priority, name))\n\n    def pop(self):\n        self.jobs.sort()\n        return self.jobs.pop(0)[1]\n\n    def __len__(self):\n        return len(self.jobs)\n"
+   },
+   {
+    "path": "tests/test_queue.py",
+    "content": "from taskqueue.queue import JobQueue\n\n\ndef test_push_pop():\n    q = JobQueue()\n    q.push('x', 1)\n    assert q.pop() == 'x'\n"
+   }
+  ]
+ },
+ {
+  "repo_key": "ledgerlite",
+  "version": "0.1.0",
+  "description": "Synthetic double-entry book of integer amounts.",
+  "files": [
+   {
+    "path": "ledgerlite/book.py",
+    "content": "class Book:\n    def __init__(self):\n        self.entries = []\n\n    def post(self, debit, credit, amount):\n        self.entries.append((debit, credit, amount))\n\n    def balance(self, account):\n        total = 0\n        for debit, credit, amount in self.entries:\n            if debit == account:\n                total += amount\n            if credit == account:\n                total -= amount\n        return total\n"
+   },
+   {
+    "path": "tests/test_book.py",
+    "content": "from ledgerlite.book import Book\n\n\ndef test_post():\n    b = Book()\n    b.post('cash', 'sales', 5)\n    assert b.balance('cash') == 5\n"
+   }
+  ]
+ }
+]
