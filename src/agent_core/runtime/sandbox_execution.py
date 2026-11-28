@@ -1,25 +1,37 @@
-"""One sandbox operation through the execution gate and the P2 broker (WP2-02).
+"""One sandbox operation through the execution gate and the P2 broker (WP2-02;
+B1A-03, B1A-04).
 
 Order (Phase 1 gate path, unchanged; C1 2.1, sandbox design 7.6):
 
+0. The program is read from the approved content (B1A-04): the input of the
+   ``sandbox_run`` tool, which the gate's claim checks against the approved
+   ActionDescriptor (and so the Permit and Receipt). A caller's expectation
+   (``expected``) that differs, or content that is not a sandbox program, ends
+   the attempt before dispatch (``ARTIFACT_MISMATCH``).
 1. ``prepare`` through P2 before the claim. If P2 cannot be used or refuses,
    the attempt ends ABORTED_BEFORE_DISPATCH (``SANDBOX_UNAVAILABLE``) through
    the live gate's not-dispatched report, which releases the hold. Nothing ran.
 2. The gate claims and starts (the Receipt is used once). In the callback, P2
    is asked to start with that Receipt, then polled until nothing runs; at the
-   end of the wait it is asked to stop. The result is collected. Anything else
-   (P2 lost, a refused or duplicate start, an unconfirmed stop, a mismatched
-   answer) raises: the gate records the outcome as unknown and keeps the hold.
-   Nothing is retried.
-3. A finished execution: exit 0 is COMPLETED, any other exit FAILED_DEFINITE.
-   A confirmed stop (deadline or end of wait) is FAILED_DEFINITE. The result
-   carries a measured ``wall_ms`` (Journal v4): P2's for a finished execution,
-   otherwise P1's own monotonic time from the start request to the confirmed
-   stop. No time is made up.
-4. P2 is asked to reap. A failure there does not change the recorded outcome;
+   end of the wait it is asked to stop. The result is collected.
+3. What makes a result definite (B1A-03):
+
+   - P2 refused the start, authenticated, before recording it (a refusal of
+     ``PRE_ACCEPTANCE_REFUSALS``): nothing ran: FAILED_DEFINITE;
+   - finished, and P2's evidence is ``CONTAINED``: exit 0 COMPLETED, other
+     exits FAILED_DEFINITE;
+   - stopped and confirmed, and ``CONTAINED``: FAILED_DEFINITE.
+
+   Anything else (P2 lost, a duplicate start, a failure after the start, an
+   unconfirmed stop, no containment evidence, a mismatched answer) raises: the
+   gate records OUTCOME_UNKNOWN and keeps the hold. Nothing is retried. A
+   confirmed stop alone is never a definite result.
+4. The result carries a measured ``wall_ms`` (Journal v4): P2's for a finished
+   execution, otherwise P1's own monotonic time. No time is made up.
+5. P2 is asked to reap. A failure there does not change the recorded outcome;
    it is returned (``reap_error``) for the caller to report.
 
-The fake backend runs nothing; no untrusted code is run by this module.
+No untrusted code is run by this module.
 """
 
 from __future__ import annotations
@@ -36,10 +48,13 @@ from agent_core.types.ids import RequestId
 from agent_core.types.model import CostStatus, Usage, UsageStatus
 from agent_core.types.provenance import OutcomeKind, OutcomeProvenanceFields
 from agent_core.types.records import Attempt
-from agent_core.types.safety import ActionContent, DispatchAuthorization
+from agent_core.types.safety import ActionContent, DispatchAuthorization, ToolContent
 from agent_core.types.sandbox import (
+    MAX_DEADLINE_MS,
+    MAX_GRACE_MS,
     NOTHING_RUNS,
     CollectRequest,
+    Containment,
     PrepareRequest,
     ReapRequest,
     SandboxState,
@@ -48,9 +63,26 @@ from agent_core.types.sandbox import (
     StatusRequest,
     StopRequest,
 )
+from agent_core.types.serialization import StrictJsonError, parse_strict_json
 from agent_core.types.tools import ToolRegistration
 from agent_core.types.transitions import AbortReason
 from agent_core.types.values import sha256_digest
+
+SANDBOX_TOOL_ID = "sandbox_run"
+_TEXT_FIELDS = ("image_digest", "program_ref", "sandbox_profile_hash", "workspace_ref")
+_LIMITS = {"deadline_ms": (1, MAX_DEADLINE_MS), "grace_ms": (0, MAX_GRACE_MS)}
+# Authenticated refusals P2 gives before it records a start: nothing ran.
+PRE_ACCEPTANCE_REFUSALS = frozenset(
+    {
+        "MALFORMED",
+        "AUTHENTICATION",
+        "PEER",
+        "STALE_EPOCH",
+        "PROFILE_REFUSED",
+        "PROGRAM_REFUSED",
+        "RECORD_UNAVAILABLE",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +105,30 @@ class SandboxOutcomeUnknownError(SandboxUnavailableError):
     """The execution's outcome cannot be confirmed (the gate keeps the hold)."""
 
 
+def sandbox_program_of(
+    content: ActionContent, registration: ToolRegistration | None
+) -> SandboxProgram:
+    """The program the approved content names. Raises ValueError otherwise."""
+    if registration is None or registration.manifest.tool_id != SANDBOX_TOOL_ID:
+        raise ValueError("not the sandbox tool")
+    if not isinstance(content, ToolContent):
+        raise ValueError("a sandbox program is tool content")
+    try:
+        data = parse_strict_json(content.canonical_input)
+    except StrictJsonError as exc:
+        raise ValueError("the sandbox program is not strict JSON") from exc
+    if not isinstance(data, dict) or set(data) != {*_TEXT_FIELDS, *_LIMITS}:
+        raise ValueError("the sandbox program has other fields")
+    for name in _TEXT_FIELDS:
+        if not isinstance(data[name], str) or not data[name].startswith("sha256:"):
+            raise ValueError(f"{name} is not a digest")
+    for name, (low, high) in _LIMITS.items():
+        value = data[name]
+        if type(value) is not int or not low <= value <= high:
+            raise ValueError(f"{name} is out of range")
+    return SandboxProgram(**data)
+
+
 def _no_usage() -> Usage:
     return Usage(
         status=UsageStatus.FINAL,
@@ -92,14 +148,21 @@ def run_sandbox_operation(
     attempt: Attempt,
     content: ActionContent,
     registration: ToolRegistration | None,
-    program: SandboxProgram,
     new_request_id: Callable[[], RequestId],
+    expected: SandboxProgram | None = None,
     max_polls: int = 50,
     wait: Callable[[], None] = lambda: None,
     monotonic_ms: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000,
 ) -> SandboxOperationResult:
     if attempt.receipt_id is None:
         raise ValueError("a sandbox operation starts from a consumed permit")
+    try:
+        program = sandbox_program_of(content, registration)
+    except ValueError:
+        program = None  # recorded as the abort reason below
+    if program is None or (expected is not None and expected != program):
+        aborted = gate.abort_not_dispatched(attempt, AbortReason.ARTIFACT_MISMATCH)
+        return SandboxOperationResult(aborted, None)
     try:
         prepared = sandbox.prepare(
             PrepareRequest(
@@ -121,34 +184,43 @@ def run_sandbox_operation(
     def run(authorization: DispatchAuthorization) -> SyntheticResult:
         receipt = authorization.receipt
         began = monotonic_ms()
-        started = sandbox.start(
-            StartRequest(
-                request_id=new_request_id(),
-                attempt_id=attempt.attempt_id,
-                permit_id=receipt.permit_id,
-                receipt_id=receipt.receipt_id,
-                owner_epoch=receipt.owner_epoch,
-                sandbox_profile_hash=program.sandbox_profile_hash,
-                program_ref=program.program_ref,
-                deadline_ms=program.deadline_ms,
+        try:
+            started = sandbox.start(
+                StartRequest(
+                    request_id=new_request_id(),
+                    attempt_id=attempt.attempt_id,
+                    permit_id=receipt.permit_id,
+                    receipt_id=receipt.receipt_id,
+                    owner_epoch=receipt.owner_epoch,
+                    sandbox_profile_hash=program.sandbox_profile_hash,
+                    program_ref=program.program_ref,
+                    deadline_ms=program.deadline_ms,
+                )
             )
-        )
+        except SandboxUnavailableError as exc:
+            if exc.refusal in PRE_ACCEPTANCE_REFUSALS:
+                measured["wall_ms"] = max(0, monotonic_ms() - began)
+                measured["exit_ref"] = sha256_digest(f"not_started:{exc.refusal}".encode())
+                return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
+            raise
         if started.status is not StartStatus.STARTED:
             raise SandboxOutcomeUnknownError(
                 "P2 did not start this Receipt now", sent=True, refusal=started.status.value
             )
         state = started.state
+        containment = Containment.UNKNOWN
         polls = 0
         while state not in NOTHING_RUNS and polls < max_polls:
             wait()
             polls += 1
-            state = sandbox.status(
+            status = sandbox.status(
                 StatusRequest(
                     request_id=new_request_id(),
                     attempt_id=attempt.attempt_id,
                     receipt_id=receipt.receipt_id,
                 )
-            ).state
+            )
+            state, containment = status.state, status.containment
         if state not in NOTHING_RUNS:
             stopped = sandbox.stop(
                 StopRequest(
@@ -160,8 +232,7 @@ def run_sandbox_operation(
             )
             if not stopped.stop_confirmed:
                 raise SandboxOutcomeUnknownError("the stop was not confirmed", sent=True)
-            state = stopped.state
-        measured["receipt_id"] = receipt.receipt_id
+            state, containment = stopped.state, stopped.containment
         if state is SandboxState.FINISHED:
             collected = sandbox.collect(
                 CollectRequest(
@@ -170,6 +241,10 @@ def run_sandbox_operation(
                     receipt_id=receipt.receipt_id,
                 )
             )
+            if collected.containment is not Containment.CONTAINED:
+                raise SandboxOutcomeUnknownError(
+                    "no evidence that effects stayed inside", sent=True
+                )
             measured["wall_ms"] = collected.wall_ms
             measured["exit_ref"] = sha256_digest(
                 f"exit:{collected.exit_code}:{collected.output_ref}".encode()
@@ -180,11 +255,13 @@ def run_sandbox_operation(
                 final=True,
                 result_digest=collected.output_ref,
             )
-        if state is SandboxState.STOPPED:
+        if state is SandboxState.STOPPED and containment is Containment.CONTAINED:
             measured["wall_ms"] = max(0, monotonic_ms() - began)  # P1's measurement
             measured["exit_ref"] = sha256_digest(f"stopped:{receipt.receipt_id}".encode())
             return SyntheticResult(outcome="FAILED_DEFINITE", usage=_no_usage(), final=True)
-        raise SandboxOutcomeUnknownError(f"P2 reports {state.value}", sent=True)
+        raise SandboxOutcomeUnknownError(
+            f"P2 reports {state.value} with containment {containment.value}", sent=True
+        )
 
     def outcome(result: SyntheticResult) -> OutcomeProvenanceFields:
         kind = (
@@ -210,5 +287,5 @@ def run_sandbox_operation(
             )
         )
     except SandboxUnavailableError as exc:
-        reap_error = f"{exc.code}: {exc}"
+        reap_error = f"{exc.code}: {exc}"  # a never-started Receipt cannot be reaped
     return SandboxOperationResult(done, reap_error)

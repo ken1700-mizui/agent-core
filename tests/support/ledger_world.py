@@ -107,6 +107,9 @@ class Setup:
     grants: dict[Any, RunGrant] = field(default_factory=dict)
     # The owner's batch counter; shared across restarts like the owner's own record.
     owner_seq: list[int] = field(default_factory=lambda: [0])
+    # Tool pins granted to new Runs (empty: the default pins). B1A-04 tests add
+    # the sandbox tool.
+    grant_tools: tuple[Any, ...] = ()
 
     def signed(self, *ops: LedgerOp) -> tuple[LedgerBatch, str]:
         self.owner_seq[0] += 1
@@ -134,6 +137,7 @@ class Setup:
             registrations=self.registrations,
             grants=self.grants,
             owner_seq=self.owner_seq,
+            grant_tools=self.grant_tools,
         )
 
 
@@ -234,7 +238,8 @@ def caps(
             step_id=scopes.step_id,
             attempt_id=b.new_id(AttemptId),
         )
-        st.grants[scopes.run_id] = s.grant(at, experiment_id=scopes.experiment_id)
+        tools = {"tools": st.grant_tools} if st.grant_tools else {}
+        st.grants[scopes.run_id] = s.grant(at, experiment_id=scopes.experiment_id, **tools)
         ops.append(InstallRunGrant(op="install_run_grant", grant=st.grants[scopes.run_id]))
     st.owner(*ops)
 

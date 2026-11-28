@@ -6,15 +6,21 @@ nothing changed:
 1. the peer is the P1 user (``SO_PEERCRED``, checked before reading);
 2. one frame within the size limit; strict JSON; a MAC that verifies;
    the schema, the fixed kinds, the typed body; envelope and body agree;
-3. the execution record is usable;
+3. the execution record is usable (opened, locked, not broken);
 4. the owner epoch is not older than the highest one recorded;
 5. the kind's own rules (profile and program allowed; at most one start per
    Receipt; collect only when finished; reap only when nothing runs).
 
 Then the epoch high-water mark is raised (an authenticated request only) and,
-for a start, ``ACCEPTED`` is recorded and synced before the sandbox is asked to
-run. Deadlines are P2's: an execution past its ``deadline_ms`` (P2's own
-monotonic clock) is stopped, independently of P1.
+for a start, ``ACCEPTED`` is recorded and synced before the backend is asked
+to run. Deadlines are P2's: an execution past its ``deadline_ms`` (P2's own
+monotonic clock) is stopped, independently of P1, by ``tick``. ``tick`` also
+runs on its own cycle (``start_watchdog``); requests and ticks share one lock,
+so a tick waits at most for the request being handled, whose backend calls
+and socket operations all have timeouts (B1A-05).
+
+Containment (B1A-03) is decided at the start from what the backend verified
+and kept in the record; every answer about a Receipt carries it.
 
 P2 never reads or writes the Journal or the ledger.
 """
@@ -28,6 +34,8 @@ import os
 import socket
 import stat
 import struct
+import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -41,6 +49,7 @@ from agent_core.types.sandbox import (
     NOTHING_RUNS,
     CollectRequest,
     CollectResult,
+    Containment,
     PrepareRequest,
     PrepareResult,
     ReapRequest,
@@ -54,7 +63,6 @@ from agent_core.types.sandbox import (
     StopRequest,
     StopResult,
 )
-from agent_core_broker.fake import FakeSandbox
 from agent_core_broker.record import ExecutionRecord, ExecutionRecordError
 
 _PEERCRED = struct.Struct("3i")
@@ -82,11 +90,40 @@ _BODIES: dict[ipc.RequestKind, type[BaseModel]] = {
 
 
 def peer_uid(sock: socket.socket) -> int:
-    pid, uid, gid = _PEERCRED.unpack(
+    _pid, uid, _gid = _PEERCRED.unpack(
         sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, _PEERCRED.size)
     )
-    del pid, gid
     return int(uid)
+
+
+class Watchdog:
+    """Runs ``tick`` every ``cycle_s``; records how late each tick started."""
+
+    def __init__(self, broker: Broker, cycle_s: float) -> None:
+        self._broker = broker
+        self._cycle = cycle_s
+        self._stop = threading.Event()
+        self.ticks = 0
+        self.max_delay_s = 0.0
+        self.errors: list[str] = []
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            scheduled = time.monotonic() + self._cycle
+            if self._stop.wait(self._cycle):
+                return
+            try:
+                self._broker.tick()
+            except ExecutionRecordError as exc:
+                self.errors.append(str(exc))  # the record is then unusable: starts refused
+            self.ticks += 1
+            self.max_delay_s = max(self.max_delay_s, time.monotonic() - scheduled)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
 
 
 class Broker:
@@ -95,7 +132,7 @@ class Broker:
         *,
         record: ExecutionRecord | None,
         record_error: str | None,
-        sandbox: FakeSandbox,
+        sandbox: Any,
         key: SecretKey,
         p1_uid: int,
         instance_id: BrokerInstanceId,
@@ -103,13 +140,15 @@ class Broker:
         allowed_profiles: frozenset[str],
     ) -> None:
         self._record = record
+        self._opened = record  # closed by ``close`` even after the record broke
         self.record_error = record_error
-        self.sandbox = sandbox
+        self.sandbox: Any = sandbox  # a SandboxBackend (fake or Docker)
         self._key = key
         self._p1_uid = p1_uid
         self._instance = instance_id
         self._clock = clock
         self._profiles = allowed_profiles
+        self._lock = threading.Lock()
         # Connections that ended before the answer was sent (last 100 kinds).
         self.connection_errors: list[str] = []
 
@@ -118,19 +157,20 @@ class Broker:
         cls,
         *,
         record_path: Path,
-        sandbox: FakeSandbox,
+        sandbox: Any,
         key: SecretKey,
         p1_uid: int,
         instance_id: BrokerInstanceId,
         clock: Monotonic,
         allowed_profiles: frozenset[str],
     ) -> Broker:
-        """A broker whose record cannot be opened still answers, refusing everything."""
+        """A broker whose record cannot be opened (missing, broken, held by another
+        broker) still answers, refusing everything."""
         try:
-            record: ExecutionRecord | None = ExecutionRecord.open(record_path)
+            record: ExecutionRecord | None = ExecutionRecord.open(record_path, key)
             error = None
         except ExecutionRecordError as exc:
-            record, error = None, str(exc)
+            record, error = None, f"{exc.code}: {exc}"
         return cls(
             record=record,
             record_error=error,
@@ -141,6 +181,20 @@ class Broker:
             clock=clock,
             allowed_profiles=allowed_profiles,
         )
+
+    def close(self) -> None:
+        with self._lock:
+            if self._opened is not None:
+                self._opened.close()
+            self._record = None
+
+    def record_state(self, receipt_id: ReceiptId) -> SandboxState:
+        with self._lock:
+            record = self._opened
+            return SandboxState.NOT_SEEN if record is None else record.state(receipt_id)
+
+    def start_watchdog(self, cycle_s: float) -> Watchdog:
+        return Watchdog(self, cycle_s)
 
     # ------------------------------------------------------------ responses
 
@@ -153,13 +207,12 @@ class Broker:
     ) -> bytes:
         if isinstance(body, BaseModel):
             body = body.model_dump(mode="json")
+        attempt = None if request is None or request.attempt_id is None else request.attempt_id
         data: dict[str, Any] = {
             "version": ipc.PROTOCOL_VERSION,
             "kind": None if request is None else request.kind.value,
             "request_id": None if request is None else str(request.request_id),
-            "attempt_id": None
-            if request is None or request.attempt_id is None
-            else str(request.attempt_id),
+            "attempt_id": None if attempt is None else str(attempt),
             "broker_instance_id": str(self._instance),
             "ok": refusal is None,
             "refusal": None if refusal is None else refusal.value,
@@ -178,22 +231,23 @@ class Broker:
             return self._response(None, refusal=ipc.RefusalCode.AUTHENTICATION)
         except ipc.IpcFormatError:
             return self._response(None, refusal=ipc.RefusalCode.MALFORMED)
-        try:
-            body = self._body(request)
-            record = self._usable_record()
-            if request.owner_epoch < record.epoch:
-                raise _RefusedError(ipc.RefusalCode.STALE_EPOCH)
-            self.tick()
-            result = self._dispatch(request, body, record)
-        except _RefusedError as refused:
-            return self._response(request, refusal=refused.code)
-        except ExecutionRecordError as exc:
-            self._record, self.record_error = None, str(exc)
-            return self._response(request, refusal=ipc.RefusalCode.RECORD_UNAVAILABLE)
+        with self._lock:
+            try:
+                body = self._body(request)
+                record = self._usable_record()
+                if request.owner_epoch < record.epoch:
+                    raise _RefusedError(ipc.RefusalCode.STALE_EPOCH)
+                self._tick(record)
+                result = self._dispatch(request, body, record)
+            except _RefusedError as refused:
+                return self._response(request, refusal=refused.code)
+            except ExecutionRecordError as exc:
+                self._record, self.record_error = None, f"{exc.code}: {exc}"
+                return self._response(request, refusal=ipc.RefusalCode.RECORD_UNAVAILABLE)
         return self._response(request, body=result)
 
     def _usable_record(self) -> ExecutionRecord:
-        if self._record is None:
+        if self._record is None or self._record.broken is not None:
             raise _RefusedError(ipc.RefusalCode.RECORD_UNAVAILABLE)
         return self._record
 
@@ -220,19 +274,18 @@ class Broker:
     def _dispatch(
         self, request: ipc.BrokerRequest, body: BaseModel | None, record: ExecutionRecord
     ) -> BaseModel | dict[str, Any]:
+        if body is None:
+            record.raise_epoch(request.owner_epoch)
+            return {"record_usable": True}
+        if isinstance(body, StartRequest):
+            return self._start(body, record)  # raises the epoch itself, before ACCEPTED
         handlers: dict[ipc.RequestKind, Callable[[Any, ExecutionRecord], BaseModel]] = {
             ipc.RequestKind.PREPARE: self._prepare,
-            ipc.RequestKind.START: self._start,
             ipc.RequestKind.STATUS: self._status,
             ipc.RequestKind.STOP: self._stop,
             ipc.RequestKind.COLLECT: self._collect,
             ipc.RequestKind.REAP: self._reap,
         }
-        if body is None:
-            record.raise_epoch(request.owner_epoch)
-            return {"record_usable": True, "backend": "fake"}
-        if isinstance(body, StartRequest):
-            return self._start(body, record)  # raises the epoch itself, before ACCEPTED
         result = handlers[request.kind](body, record)
         record.raise_epoch(request.owner_epoch)
         return result
@@ -246,6 +299,13 @@ class Broker:
             attempt_id=body.attempt_id,
             prepared=body.sandbox_profile_hash in self._profiles,
         )
+
+    @staticmethod
+    def _containment(receipt_id: ReceiptId, record: ExecutionRecord) -> Containment:
+        found = record.latest(receipt_id)
+        if found is None:
+            return Containment.UNKNOWN
+        return Containment(found.get("containment", Containment.UNKNOWN.value))
 
     def _start(self, body: StartRequest, record: ExecutionRecord) -> StartResult:
         known = record.latest(body.receipt_id)
@@ -265,31 +325,45 @@ class Broker:
             raise _RefusedError(ipc.RefusalCode.PROGRAM_REFUSED)
         record.raise_epoch(body.owner_epoch)
         record.accept(body, started_ms=self._clock.monotonic_ms())  # synced before the run
-        self.sandbox.start(body.receipt_id, body.program_ref)
+        # From here on the backend may have run something: no failure may be
+        # answered as "not run" (RECORD_UNAVAILABLE is for before this point).
+        try:
+            containment = self.sandbox.start(body.receipt_id, body.program_ref, body.deadline_ms)
+            record.update(body.receipt_id, containment=containment.value)
+            state = self._observe(body.receipt_id, record)
+        except Exception as exc:
+            with contextlib.suppress(ExecutionRecordError):  # best effort; the reply says it
+                record.update(body.receipt_id, start_error=type(exc).__name__)
+            if record.broken is not None:
+                self._record, self.record_error = None, record.broken
+            raise _RefusedError(ipc.RefusalCode.SANDBOX_FAILURE) from exc
         return StartResult(
             request_id=body.request_id,
             attempt_id=body.attempt_id,
             receipt_id=body.receipt_id,
             status=StartStatus.STARTED,
-            state=self._observe(body.receipt_id, record),
+            state=state,
         )
 
     def _observe(self, receipt_id: ReceiptId, record: ExecutionRecord) -> SandboxState:
-        """The record's state, completed with what the live sandbox reports."""
+        """The record's state, completed with what the live backend reports."""
         state = record.state(receipt_id)
-        container = self.sandbox.containers.get(receipt_id)
-        if state is not SandboxState.ACCEPTED or container is None:
+        if state is not SandboxState.ACCEPTED:
             return state
-        if container.state is SandboxState.FINISHED:
-            assert container.program.exit_code is not None  # noqa: S101 (finished)
+        seen = self.sandbox.observe(receipt_id)
+        if seen is None:
+            return state  # nothing live (e.g. after a restart): stays ACCEPTED (unknown)
+        if seen.state is SandboxState.FINISHED:
+            if seen.exit_code is None or seen.output_ref is None or seen.wall_ms is None:
+                return SandboxState.RUNNING  # not complete yet: not reported as finished
             record.finished(
                 receipt_id,
-                exit_code=container.program.exit_code,
-                output_ref=container.output_ref,
-                wall_ms=container.program.wall_ms,
+                exit_code=seen.exit_code,
+                output_ref=seen.output_ref,
+                wall_ms=seen.wall_ms,
             )
             return SandboxState.FINISHED
-        if container.state is SandboxState.STOPPED:
+        if seen.state is SandboxState.STOPPED:
             record.stopped(receipt_id, reason="stop")
             return SandboxState.STOPPED
         return SandboxState.RUNNING
@@ -313,20 +387,25 @@ class Broker:
             receipt_id=body.receipt_id,
             state=state,
             exit_code=exit_code,
+            containment=self._containment(body.receipt_id, record),
         )
 
     def _stop(self, body: StopRequest, record: ExecutionRecord) -> StopResult:
         self._known(body.receipt_id, body.attempt_id, record)
         state = self._observe(body.receipt_id, record)
-        container = self.sandbox.containers.get(body.receipt_id)
-        running = state is SandboxState.RUNNING and container is not None
-        if running and self.sandbox.stop(body.receipt_id, body.grace_ms):
+        live = self.sandbox.observe(body.receipt_id) is not None
+        if (
+            state is SandboxState.RUNNING
+            and live
+            and self.sandbox.stop(body.receipt_id, body.grace_ms)
+        ):
             state = self._observe(body.receipt_id, record)
         return StopResult(
             request_id=body.request_id,
             attempt_id=body.attempt_id,
             state=state,
             stop_confirmed=state in NOTHING_RUNS,
+            containment=self._containment(body.receipt_id, record),
         )
 
     def _collect(self, body: CollectRequest, record: ExecutionRecord) -> CollectResult:
@@ -342,6 +421,7 @@ class Broker:
             exit_code=found["exit_code"],
             output_ref=found["output_ref"],
             wall_ms=found["wall_ms"],
+            containment=self._containment(body.receipt_id, record),
         )
 
     def _reap(self, body: ReapRequest, record: ExecutionRecord) -> ReapResult:
@@ -360,16 +440,19 @@ class Broker:
 
     def tick(self) -> None:
         """Stop every live execution past its deadline (P2's own clock)."""
-        record = self._record
-        if record is None:
-            return
+        with self._lock:
+            record = self._record
+            if record is not None and record.broken is None:
+                self._tick(record)
+
+    def _tick(self, record: ExecutionRecord) -> None:
         now = self._clock.monotonic_ms()
         for entry in record.accepted():
-            receipt = ReceiptId(entry["receipt_id"])
-            container = self.sandbox.containers.get(receipt)
-            if entry["state"] != SandboxState.ACCEPTED.value or container is None:
+            if entry["state"] != SandboxState.ACCEPTED.value:
                 continue
-            if container.state is not SandboxState.RUNNING:
+            receipt = ReceiptId(entry["receipt_id"])
+            seen = self.sandbox.observe(receipt)
+            if seen is None or seen.state is not SandboxState.RUNNING:
                 continue
             expired = now - int(entry["started_ms"]) >= int(entry["deadline_ms"])
             if expired and self.sandbox.stop(receipt, 0):
@@ -399,12 +482,19 @@ class Broker:
         finally:
             sock.close()
 
-    def serve(self, path: Path, *, ready: Callable[[], None] | None = None) -> None:
+    def serve(
+        self,
+        path: Path,
+        *,
+        ready: Callable[[], None] | None = None,
+        tick_cycle_s: float = 1.0,
+    ) -> None:
         """Serve on a socket path that only the P1 and P2 users can use.
 
         One broker per socket: an exclusive lock on ``<socket>.lock`` is held while
         serving (released by the OS when the process dies). Only the lock holder
-        removes a socket file left by a broker that was killed."""
+        removes a socket file left by a broker that was killed. The record has its
+        own lock (B1A-02)."""
         lock = os.open(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -422,6 +512,7 @@ class Broker:
             server.bind(str(path))
         finally:
             os.umask(previous)
+        watchdog = self.start_watchdog(tick_cycle_s)
         try:
             server.listen(8)
             server.settimeout(0.2)
@@ -431,10 +522,10 @@ class Broker:
                 try:
                     conn, _ = server.accept()
                 except TimeoutError:
-                    self.tick()
                     continue
                 self.serve_connection(conn)
         finally:
+            watchdog.stop()
             server.close()
             with contextlib.suppress(FileNotFoundError):
                 path.unlink()

@@ -43,6 +43,19 @@ class SandboxState(StrEnum):
 NOTHING_RUNS = frozenset({SandboxState.FINISHED, SandboxState.STOPPED, SandboxState.REAPED})
 
 
+class Containment(StrEnum):
+    """P2's evidence about effects outside the sandbox (B1A-03).
+
+    ``CONTAINED``: the execution ran under a profile P2 verified before the start
+    (no network, no writable host path except P2's own staging, discarded unless
+    collected), so nothing left the sandbox except what ``collect`` returns.
+    ``UNKNOWN``: no such evidence. A stop or an exit is then not a definite result.
+    """
+
+    CONTAINED = "CONTAINED"
+    UNKNOWN = "UNKNOWN"
+
+
 class StartStatus(StrEnum):
     STARTED = "STARTED"
     DUPLICATE = "DUPLICATE"  # the Receipt was already used: nothing new ran
@@ -96,6 +109,7 @@ class StatusResult(FrozenModel):
     receipt_id: ReceiptId
     state: SandboxState
     exit_code: ExitCode | None
+    containment: Containment
 
     @model_validator(mode="after")
     def _exit(self) -> Self:
@@ -119,6 +133,7 @@ class StopResult(FrozenModel):
     attempt_id: AttemptId
     state: SandboxState
     stop_confirmed: bool
+    containment: Containment
 
     @model_validator(mode="after")
     def _confirmed(self) -> Self:
@@ -142,6 +157,7 @@ class CollectResult(FrozenModel):
     exit_code: ExitCode
     output_ref: Digest
     wall_ms: Count
+    containment: Containment
 
 
 class ReapRequest(FrozenModel):

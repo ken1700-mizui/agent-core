@@ -38,7 +38,7 @@ from agent_core.types.sandbox import (
     StatusRequest,
     StopRequest,
 )
-from agent_core_broker.record import ExecutionRecord, ExecutionRecordError
+from agent_core_broker.record import ExecutionRecord, ExecutionRecordError, read_entries
 from support import broker_world as bw
 from support import builders as b
 
@@ -142,7 +142,7 @@ def test_a_start_with_an_unknown_profile_or_program_is_refused(tmp_path: Path) -
         with pytest.raises(SandboxUnavailableError):
             client.start(start)
         assert start.receipt_id not in broker.sandbox.runs
-    assert len(ExecutionRecord.open(bw.record_path(tmp_path)).entries) == 1  # genesis only
+    assert len(read_entries(bw.record_path(tmp_path))) == 1  # genesis only
 
 
 # ---------------------------------------------------------------- malformed and unauthenticated
@@ -279,6 +279,7 @@ def test_an_older_owner_epoch_is_refused_and_stays_refused_after_a_restart(tmp_p
     old = bw.start_request(epoch=2)
     response = _handle(broker, _frame(ipc.RequestKind.START, _start_body(old), epoch=2))
     assert response.refusal is ipc.RefusalCode.STALE_EPOCH
+    broker.close()  # a restart: the old broker is gone (it held the record's lock)
     restarted = bw.make_broker(tmp_path)
     response = _handle(restarted, _frame(ipc.RequestKind.START, _start_body(old), epoch=2))
     assert response.refusal is ipc.RefusalCode.STALE_EPOCH
@@ -372,6 +373,7 @@ def test_a_restarted_broker_remembers_every_receipt(tmp_path: Path) -> None:
     broker = bw.make_broker(tmp_path)
     start = bw.start_request()
     bw.make_client(broker).start(start)
+    broker.close()  # a restart: the old broker is gone (it held the record's lock)
     restarted = bw.make_broker(tmp_path)  # same record, empty fake sandbox
     client = bw.make_client(restarted)
     again = client.start(start.model_copy(update={"request_id": b.new_id(RequestId)}))
@@ -389,10 +391,10 @@ def test_an_accepted_start_without_a_result_stays_unknown_after_a_restart(tmp_pa
     """The record says ACCEPTED (written before the run); the run may or may not
     have happened. After a restart it is never run again and never reported done."""
     path = bw.record_path(tmp_path)
-    ExecutionRecord.create(path)
-    record = ExecutionRecord.open(path)
+    record = ExecutionRecord.create(path, bw.KEY)
     start = bw.start_request()
     record.accept(start)
+    record.close()  # the broker that accepted it is gone
     restarted = bw.make_broker(tmp_path)
     client = bw.make_client(restarted)
     assert _status(client, start).state is SandboxState.ACCEPTED
@@ -412,6 +414,7 @@ def test_an_unusable_record_refuses_every_start(tmp_path: Path, damage: str) -> 
     broker = bw.make_broker(tmp_path)
     bw.make_client(broker).start(bw.start_request())
     bw.make_client(broker).start(bw.start_request())
+    broker.close()
     path = bw.record_path(tmp_path)
     lines = path.read_bytes().splitlines(keepends=True)
     if damage == "missing":
@@ -423,7 +426,7 @@ def test_an_unusable_record_refuses_every_start(tmp_path: Path, damage: str) -> 
     else:
         path.write_bytes(b"".join([lines[0], lines[2], lines[1], *lines[3:]]))
     with pytest.raises(ExecutionRecordError):
-        ExecutionRecord.open(path)
+        ExecutionRecord.open(path, bw.KEY)
     restarted = bw.make_broker(tmp_path, create=False)
     start = bw.start_request()
     response = _handle(restarted, _frame(ipc.RequestKind.START, _start_body(start)))
@@ -443,9 +446,9 @@ def test_the_record_is_synced_before_the_run(
         order.append("fsync")
         real_fsync(fd)
 
-    def start(*args: Any, **kwargs: Any) -> None:
+    def start(*args: Any, **kwargs: Any) -> Any:
         order.append("run")
-        original(*args, **kwargs)
+        return original(*args, **kwargs)
 
     monkeypatch.setattr(os, "fsync", fsync)
     monkeypatch.setattr(broker.sandbox, "start", start)
@@ -497,7 +500,7 @@ def test_p2_stops_an_execution_past_its_deadline(tmp_path: Path) -> None:
     clock.now += 2
     broker.tick()
     assert _status(client, hang).state is SandboxState.STOPPED
-    last = ExecutionRecord.open(bw.record_path(tmp_path)).entries[-1]
+    last = read_entries(bw.record_path(tmp_path))[-1]
     assert (last["state"], last["stop_reason"]) == ("STOPPED", "deadline")
 
 

@@ -19,6 +19,7 @@ from agent_core.adapters.broker_client import BrokerClient
 from agent_core.types.ids import AttemptId, BrokerInstanceId, PermitId, ReceiptId, RequestId
 from agent_core.types.safety import SecretKey
 from agent_core.types.sandbox import StartRequest
+from agent_core_broker import record as rec
 from agent_core_broker.fake import FakeSandbox, program_ref
 from agent_core_broker.record import ExecutionRecord
 from agent_core_broker.server import Broker
@@ -42,6 +43,14 @@ def record_path(directory: Path) -> Path:
     return directory / "execution.log"
 
 
+def head_path(directory: Path) -> Path:
+    return rec.head_path(record_path(directory))
+
+
+def fake_ref(name: str) -> str:
+    return program_ref(name)
+
+
 def make_broker(
     directory: Path,
     *,
@@ -49,9 +58,10 @@ def make_broker(
     p1_uid: int | None = None,
     create: bool = True,
 ) -> Broker:
+    directory.mkdir(parents=True, exist_ok=True)
     path = record_path(directory)
     if create and not path.exists():
-        ExecutionRecord.create(path)
+        ExecutionRecord.create(path, KEY).close()
     clock = clock if clock is not None else ManualMonotonic()
     return Broker.open(
         record_path=path,

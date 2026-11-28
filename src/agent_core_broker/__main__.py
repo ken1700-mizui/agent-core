@@ -45,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
     init.add_argument("--record", type=Path, required=True)
+    init.add_argument("--key-file", type=Path, required=True)
     serve = commands.add_parser("serve")
     serve.add_argument("--socket", type=Path, required=True)
     serve.add_argument("--record", type=Path, required=True)
@@ -53,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument("--profile", action="append", default=[])
     args = parser.parse_args(argv)
     if args.command == "init":
-        ExecutionRecord.create(args.record)
+        ExecutionRecord.create(args.record, _key(args.key_file)).close()
         print("record created")
         return 0
     if not args.socket.is_absolute():

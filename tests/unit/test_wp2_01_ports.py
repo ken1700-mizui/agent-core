@@ -68,6 +68,7 @@ def test_a_stop_request_is_not_a_confirmed_stop() -> None:
         attempt_id=b.new_id(AttemptId),
         state=sx.SandboxState.RUNNING,
         stop_confirmed=False,
+        containment=sx.Containment.CONTAINED,
     )
     with pytest.raises(ValidationError):
         sx.StopResult(
@@ -75,6 +76,7 @@ def test_a_stop_request_is_not_a_confirmed_stop() -> None:
             attempt_id=b.new_id(AttemptId),
             state=sx.SandboxState.RUNNING,
             stop_confirmed=True,
+            containment=sx.Containment.CONTAINED,
         )
 
 
@@ -86,6 +88,7 @@ def test_an_exit_exists_only_when_finished() -> None:
             receipt_id=b.new_id(ReceiptId),
             state=state,
             exit_code=exit_code,
+            containment=sx.Containment.UNKNOWN,
         )
 
     status(sx.SandboxState.FINISHED, 0)

@@ -58,6 +58,8 @@ def _init(directory: Path) -> None:
             "init",
             "--record",
             str(directory / "exec.log"),
+            "--key-file",
+            str(key),
         ],
         check=True,
         env=_env(),
