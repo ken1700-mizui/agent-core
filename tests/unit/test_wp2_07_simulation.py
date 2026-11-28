@@ -1,4 +1,12 @@
-"""WP2-07: the D 16.1 simulation (``simulation`` category; minutes).
+"""WP2-07: the D 16.1 simulation on the ORIGINAL scenarios and seeds
+(``simulation`` category).
+
+Since D19 this runs the fixed method through ``engine.analyse`` on data from
+the separated generator (so the datasets differ from the original run; the
+exact original datasets are re-analysed in ``test_wp2_07_legacy.py``). The
+scenarios, seeds and criteria are the original ones, unchanged. The original
+result (at_delta_imp failed) is kept in ``WP2-07_STATISTICS.md`` and is
+reproduced by ``test_wp2_07_legacy.py``.
 
 Criteria fixed before running (D 16.1; values PROVISIONAL in D):
 - false positive rate (adoption = BETTER, i.e. L > 0, with no effect; and

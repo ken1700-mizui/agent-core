@@ -73,6 +73,7 @@ select = [
 # analysis must be reproducible from its recorded seed; nothing here is a secret.
 "src/agent_core/stats/**" = ["S311"]
 "tests/unit/test_wp2_07_*.py" = ["S101", "S311", "S603", "S607"]
+"tests/support/wp2_07_legacy.py" = ["S311"]  # the original simulation, kept unchanged
 
 # ---------------------------------------------------------------- mypy
 [tool.mypy]
