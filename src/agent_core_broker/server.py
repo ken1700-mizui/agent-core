@@ -197,9 +197,10 @@ class Broker:
         return Watchdog(self, cycle_s)
 
     def recover_backend(self) -> list[str]:
-        """After a restart: reap the backend's leftovers whose result is recorded
-        (or that the record does not know); keep the others, whose deadlines
-        ``tick`` enforces by wall clock. Returns what was done, for the log."""
+        """After a restart: record the result of leftovers that ended while P2 was
+        down, then reap every leftover whose result is recorded (or that the record
+        does not know); keep the running ones, whose deadlines ``tick`` enforces by
+        wall clock. Returns what was done, for the log."""
         adopt = getattr(self.sandbox, "adopt", None)
         if adopt is None:
             return []
@@ -208,9 +209,14 @@ class Broker:
             record = self._usable_record()
             for receipt, _cid, running, _deadline in adopt():
                 state = record.state(receipt)
-                if state is SandboxState.ACCEPTED:
-                    done.append(f"kept {receipt} ({'running' if running else 'exited'})")
+                if state is SandboxState.ACCEPTED and running:
+                    done.append(f"kept {receipt} (running; its deadline is enforced)")
                     continue
+                if state is SandboxState.ACCEPTED:
+                    state = self._observe(receipt, record)  # records the result first
+                    if state not in NOTHING_RUNS:
+                        done.append(f"kept {receipt} ({state.value})")
+                        continue
                 if running:
                     self.sandbox.stop(receipt, 0)
                 self.sandbox.reap(receipt)
@@ -485,7 +491,7 @@ class Broker:
                 expired = now - int(entry["started_ms"]) >= int(entry["deadline_ms"])
             else:  # accepted before a restart: P2's monotonic clock restarted too
                 expired = time.time() * 1000 >= int(entry["deadline_unix_ms"])
-            if expired and self.sandbox.stop(receipt, 0):
+            if expired and self.sandbox.stop(receipt, int(entry.get("grace_ms", 0))):
                 record.stopped(receipt, reason="deadline")
 
     # ------------------------------------------------------------ sockets

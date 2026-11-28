@@ -87,6 +87,8 @@ class StartRequest(FrozenModel):
     program_ref: Digest
     # Wall-clock limit kept by P2 (its own monotonic clock), sandbox design 7.4.1.
     deadline_ms: DeadlineMs
+    # WP2-04: the stop grace P2 gives at its deadline (SIGTERM, then SIGKILL).
+    grace_ms: GraceMs
 
 
 class StartResult(FrozenModel):

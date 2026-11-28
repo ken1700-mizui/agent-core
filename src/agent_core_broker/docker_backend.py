@@ -138,6 +138,12 @@ DIAGNOSTIC_PROGRAMS: dict[str, str] = {
         " else echo MEMORY_UNLIMITED=$n; exit 3; fi"
     ),
     "diag.status": "grep -E '^(CapEff|NoNewPrivs|Seccomp):' /proc/self/status",
+    # P-5 B: can the code inside stop the in-container supervisor? (A check only;
+    # the supervisor is never a protection basis.) Then it sleeps.
+    "diag.kill_supervisor": (
+        "for p in $(ps -o pid,comm | awk '$2==\"timeout\"{print $1}'); do kill -9 $p; done;"
+        " echo supervisor-killed; sleep 3600"
+    ),
     "diag.input": (
         "ls /in && cat /in/* && if touch /in/x 2>/dev/null; then echo IN_WRITABLE; exit 3; fi"
     ),
@@ -410,6 +416,11 @@ class DockerSandbox:
         if cid is not None:
             self.api.call("DELETE", f"/containers/{cid}?force=true&v=true", ok=(204, 404))
         self._ids.pop(receipt_id, None)
+        staged = self.staging / f"in-{_hex(receipt_id)}"
+        if staged.is_dir():  # P-5 item 9: temporary data goes with the container
+            for item in staged.iterdir():
+                item.unlink()
+            staged.rmdir()
 
     def adopt(self) -> list[tuple[ReceiptId, str, bool, int]]:
         """Containers created by a broker (by label): receipt, id, running, deadline."""

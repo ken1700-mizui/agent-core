@@ -47,6 +47,7 @@ def _start(**overrides: Any) -> sx.StartRequest:
         "sandbox_profile_hash": b.digest("profile"),
         "program_ref": b.digest("fixed diagnostic"),
         "deadline_ms": 300_000,
+        "grace_ms": 10_000,
     }
     values.update(overrides)
     return sx.StartRequest(**values)

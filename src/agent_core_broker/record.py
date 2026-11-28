@@ -326,6 +326,7 @@ class ExecutionRecord:
                 "owner_epoch": start.owner_epoch,
                 "program_ref": start.program_ref,
                 "deadline_ms": start.deadline_ms,
+                "grace_ms": start.grace_ms,
                 "started_ms": started_ms,
                 **extra,
             }

@@ -17,7 +17,7 @@ from agent_core.runtime.sandbox_execution import (
     run_sandbox_operation,
 )
 from agent_core.safety.descriptor import pin_of
-from agent_core.types.ids import RequestId
+from agent_core.types.ids import ReceiptId, RequestId
 from agent_core.types.records import Attempt
 from agent_core.types.tools import (
     FieldSpec,
@@ -123,3 +123,21 @@ def run(
         max_polls=max_polls,
         **lw.actual(st, attempt),
     )
+
+
+def run_with(st: lw.Setup, broker: Broker, attempt: Attempt, **kw: Any) -> SandboxOperationResult:
+    """``run`` with any of the runner's monitor arguments (WP2-04)."""
+    return run_sandbox_operation(
+        gate=lw.gate(st),
+        sandbox=kw.pop("client", None) or bw.make_client(broker, epoch=st.journal.owner_epoch),
+        attempt=attempt,
+        new_request_id=lambda: b.new_id(RequestId),
+        **lw.actual(st, attempt),
+        **kw,
+    )
+
+
+def receipt_of(attempt: Attempt) -> ReceiptId:
+    if attempt.receipt_id is None:
+        raise AssertionError("the attempt has no receipt yet")
+    return attempt.receipt_id

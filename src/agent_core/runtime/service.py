@@ -263,6 +263,11 @@ class RuntimeStateMachine:
         )
 
     @property
+    def owner_epoch(self) -> int:
+        """The journal's owner epoch this runtime writes under (WP2-04 heartbeat)."""
+        return self._journal.owner_epoch
+
+    @property
     def provenance(self) -> ProvenanceIndex:
         """WP2-01: the provenance index of this runtime's journal (read only)."""
         return self._provenance

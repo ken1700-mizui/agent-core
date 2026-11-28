@@ -153,7 +153,13 @@ def run_sandbox_operation(
     max_polls: int = 50,
     wait: Callable[[], None] = lambda: None,
     monotonic_ms: Callable[[], int] = lambda: time.monotonic_ns() // 1_000_000,
+    stopped: Callable[[], bool] = lambda: False,
+    p1_margin_ms: int = 5_000,
 ) -> SandboxOperationResult:
+    """P1's sandbox monitor (WP2-04) is the poll loop: one ``wait`` per sandbox
+    cycle, until nothing runs, the owner stops (``stopped``), or P1's own limit
+    (deadline + grace + ``p1_margin_ms``, P1's monotonic clock) passes; P2's
+    deadline stop comes first. ``max_polls`` bounds the loop for tests."""
     if attempt.receipt_id is None:
         raise ValueError("a sandbox operation starts from a consumed permit")
     try:
@@ -195,6 +201,7 @@ def run_sandbox_operation(
                     sandbox_profile_hash=program.sandbox_profile_hash,
                     program_ref=program.program_ref,
                     deadline_ms=program.deadline_ms,
+                    grace_ms=program.grace_ms,
                 )
             )
         except SandboxUnavailableError as exc:
@@ -210,7 +217,13 @@ def run_sandbox_operation(
         state = started.state
         containment = Containment.UNKNOWN
         polls = 0
-        while state not in NOTHING_RUNS and polls < max_polls:
+        limit = program.deadline_ms + program.grace_ms + p1_margin_ms
+
+        def watching() -> bool:
+            within = polls < max_polls and monotonic_ms() - began < limit
+            return state not in NOTHING_RUNS and within and not stopped()
+
+        while watching():
             wait()
             polls += 1
             status = sandbox.status(
@@ -221,8 +234,9 @@ def run_sandbox_operation(
                 )
             )
             state, containment = status.state, status.containment
-        if state not in NOTHING_RUNS:
-            stopped = sandbox.stop(
+        owner_stop = stopped()
+        if state not in NOTHING_RUNS or owner_stop:
+            answer = sandbox.stop(
                 StopRequest(
                     request_id=new_request_id(),
                     attempt_id=attempt.attempt_id,
@@ -230,9 +244,12 @@ def run_sandbox_operation(
                     grace_ms=program.grace_ms,
                 )
             )
-            if not stopped.stop_confirmed:
+            if owner_stop:
+                # P-4 item 4: after an owner stop the attempt stays unknown, with its hold.
+                raise SandboxOutcomeUnknownError("stopped by the owner", sent=True)
+            if not answer.stop_confirmed:
                 raise SandboxOutcomeUnknownError("the stop was not confirmed", sent=True)
-            state, containment = stopped.state, stopped.containment
+            state, containment = answer.state, answer.containment
         if state is SandboxState.FINISHED:
             collected = sandbox.collect(
                 CollectRequest(

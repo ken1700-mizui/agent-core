@@ -118,6 +118,7 @@ def start_request(
         "sandbox_profile_hash": PROFILE,
         "program_ref": program_ref(program),
         "deadline_ms": 60_000,
+        "grace_ms": 100,
     }
     values.update(overrides)
     return StartRequest(**values)

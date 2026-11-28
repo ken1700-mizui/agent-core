@@ -633,6 +633,33 @@ def _recover_run(
     return changed, escalated
 
 
+def overdue_runs(deps: RecoveryDeps, deadlines: RecoveryDeadlines) -> list[RunId]:
+    """Runs past their RECOVERING or CANCELLING deadline, in the ledger's time
+    (a wall clock that goes back cannot extend a deadline). Reads only."""
+    now = _now(deps)
+    found = []
+    for run in deps.sm.state.runs.values():
+        if run.status in (R.RECOVERING, R.CANCELLING):
+            limit = (
+                deadlines.recovering_ms if run.status is R.RECOVERING else deadlines.cancelling_ms
+            )
+            if now - _entered(deps, run) > limit:
+                found.append(run.run_id)
+    return found
+
+
+def escalate_overdue(deps: RecoveryDeps, run_id: RunId) -> None:
+    """The one transition the P-5 monitor makes: an overdue Run becomes
+    RECONCILIATION_REQUIRED (DEADLINE_EXCEEDED). Nothing else (no approval, no
+    release, no result, no completion, no retry)."""
+    _set_run(
+        deps,
+        run_id,
+        R.RECONCILIATION_REQUIRED,
+        _trigger(run_id, ReconciliationTriggerReason.DEADLINE_EXCEEDED),
+    )
+
+
 def recover(
     deps: RecoveryDeps, *, deadlines: RecoveryDeadlines, run_ids: Collection[RunId]
 ) -> RecoveryReport:
